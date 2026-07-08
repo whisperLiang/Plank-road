@@ -226,7 +226,6 @@ class EkyaUnifiedLogger:
         teacher_model: str,
         window_size: int,
         num_frames: int,
-        result_schema_version: int = 1,
     ) -> None:
         self.output_dir = Path(output_dir)
         self.run_id = str(run_id)
@@ -235,7 +234,6 @@ class EkyaUnifiedLogger:
         self.teacher_model = str(teacher_model)
         self.window_size = int(window_size)
         self.num_frames = int(num_frames)
-        self.result_schema_version = int(result_schema_version)
         self.teacher_labels_dir = self.output_dir / "teacher_labels"
         self.prediction_json_dir = self.output_dir / "prediction_json"
         self.checkpoint_dir = self.output_dir / "checkpoints"
@@ -547,7 +545,6 @@ class EkyaUnifiedLogger:
                 "num_model_updates": sum(
                     1 for row in model_updates if str(row.get("adopted", "")).lower() == "true"
                 ),
-                "result_schema_version": int(self.result_schema_version),
                 "evaluated_frame_count": len(expected),
                 "missing_result_count": len(expected - observed),
                 "dropped_display_count": int(dropped_display_count),

@@ -720,7 +720,7 @@ class _SubmitRequestSnapshot:
     @classmethod
     def from_request(cls, request) -> "_SubmitRequestSnapshot":
         return cls(
-            protocol_version=str(request.protocol_version or ""),
+            protocol_version=str(getattr(request, "protocol_version", "") or ""),
             edge_id=int(request.edge_id),
             request_id=str(request.request_id or ""),
             job_type=int(request.job_type),

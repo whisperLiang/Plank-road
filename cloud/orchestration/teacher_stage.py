@@ -9,7 +9,6 @@ import torch
 from loguru import logger
 
 from cloud.annotation import TeacherAnnotationRequest, TeacherAnnotationService
-from cloud.contracts import POOL_LABEL_RUNTIME_VERSION
 from cloud.orchestration.fixed_split_dependencies import (
     POOL_LABEL_COORDINATE_SPACE,
     _file_sha1,
@@ -474,7 +473,6 @@ class TeacherAnnotationMixin:
             teacher_num_classes=self._teacher_num_classes(),
             teacher_annotation_threshold=float(self.teacher_annotation_threshold),
             label_coordinate_space=POOL_LABEL_COORDINATE_SPACE,
-            label_runtime_version=POOL_LABEL_RUNTIME_VERSION,
             metadata={
                 "target_model_metadata": dict(target_model_metadata or {}),
                 "include_empty": bool(include_empty),

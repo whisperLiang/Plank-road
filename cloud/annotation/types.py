@@ -75,7 +75,6 @@ class TeacherLabelCacheKey:
     teacher_num_classes: int
     teacher_annotation_threshold: float
     label_coordinate_space: str
-    label_runtime_version: str
     target_label_mapping: Mapping[str, Any] = field(default_factory=dict)
 
     def payload(self) -> dict[str, object]:
@@ -87,7 +86,6 @@ class TeacherLabelCacheKey:
             "teacher_num_classes": int(self.teacher_num_classes),
             "teacher_annotation_threshold": float(self.teacher_annotation_threshold),
             "label_coordinate_space": str(self.label_coordinate_space),
-            "label_runtime_version": str(self.label_runtime_version),
             "target_label_mapping": _normalise_cache_value(self.target_label_mapping),
         }
 
@@ -113,7 +111,6 @@ class TeacherAnnotationRequest:
     teacher_num_classes: int
     teacher_annotation_threshold: float
     label_coordinate_space: str
-    label_runtime_version: str
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def cache_key(self) -> TeacherLabelCacheKey:
@@ -125,7 +122,6 @@ class TeacherAnnotationRequest:
             teacher_num_classes=int(self.teacher_num_classes),
             teacher_annotation_threshold=float(self.teacher_annotation_threshold),
             label_coordinate_space=str(self.label_coordinate_space),
-            label_runtime_version=str(self.label_runtime_version),
             target_label_mapping=_target_label_mapping_payload(
                 self.model_id,
                 self.metadata,

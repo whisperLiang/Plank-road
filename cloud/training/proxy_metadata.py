@@ -5,10 +5,6 @@ from collections.abc import Mapping
 
 import torch
 
-from cloud.contracts import (
-    LOW_QUALITY_TRIGGER_PROTOCOL_VERSION,
-    POOL_LABEL_RUNTIME_VERSION,
-)
 from model_management.detection_box_projection import ORIGINAL_XYXY
 from model_management.model_info import COCO_INSTANCE_CATEGORY_NAMES
 
@@ -142,8 +138,6 @@ def is_low_quality_trigger_sample(
 ) -> bool:
     if str(sample.get("quality_bucket", "")).strip() == "low_quality":
         return True
-    if str(manifest.get("protocol_version", "")).strip() == LOW_QUALITY_TRIGGER_PROTOCOL_VERSION:
-        return sample.get("raw_relpath") is not None
     trigger_context = manifest.get("trigger_manifest")
     if isinstance(trigger_context, Mapping):
         return sample.get("raw_relpath") is not None
@@ -212,7 +206,6 @@ def pool_label_metadata_from_record(
     metadata: dict[str, object] = {
         "label_coordinate_space": POOL_LABEL_COORDINATE_SPACE,
         "label_resize_mode": str(resize_mode or "direct_resize"),
-        "label_runtime_version": POOL_LABEL_RUNTIME_VERSION,
     }
     if original_size is not None:
         metadata["label_image_size"] = [

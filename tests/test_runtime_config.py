@@ -54,13 +54,9 @@ def test_experiment_results_config_is_shared_and_validated(tmp_path) -> None:
     path.write_text(
         """
 experiment_results:
-  comparison_id: comparison-a
   root_dir: cloud-results
   local_root_dir: edge-results
   max_artifact_bytes: 1024
-  pure_edge_remote_sync:
-    target: user@example.com:/srv/plank-road
-    timeout_sec: 15
 """,
         encoding="utf-8",
     )
@@ -68,24 +64,24 @@ experiment_results:
     assert config.client.experiment_results is config.experiment_results
     assert config.server.experiment_results is config.experiment_results
     assert config.experiment_results.local_root_dir == "edge-results"
-    assert config.experiment_results.pure_edge_remote_sync.target == (
-        "user@example.com:/srv/plank-road"
-    )
-    assert config.experiment_results.pure_edge_remote_sync.timeout_sec == 15
 
 
-def test_experiment_results_upload_requires_edge_summary(tmp_path) -> None:
+def test_removed_experiment_result_config_fields_are_rejected(tmp_path) -> None:
     path = tmp_path / "config.yaml"
     path.write_text(
         """
 experiment_results:
-  enabled: true
+  comparison_id: comparison-a
   upload_to_cloud: true
-  include_edge_summary: false
+baseline:
+  run_id: old-run
+server:
+  edge_affine_workers:
+    run_id: old-main
 """,
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="include_edge_summary"):
+    with pytest.raises(ValueError, match="removed by the current experiment layout"):
         load_runtime_config(path)
 
 
@@ -100,7 +96,6 @@ experiment_results:
         "microprofile:\n        candidate_hyperparameters: []",
         "retraining:\n        save_checkpoints: true",
         "retraining:\n        optimizer_name: adamw",
-        "logging:\n        result_schema_version: 1",
     ],
 )
 def test_removed_ekya_fixed_behavior_fields_are_rejected(tmp_path, ekya_yaml: str) -> None:

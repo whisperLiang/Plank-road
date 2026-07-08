@@ -35,7 +35,6 @@ from .template import (
     get_fixed_split_runtime_template_cache,
 )
 from .torchlens_native_runtime import (
-    TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION,
     BoundaryPayload,
     SplitCandidateMetadata,
     SplitRuntime,
@@ -138,7 +137,6 @@ __all__ = [
     "SplitRuntimeError",
     "SplitSpec",
     "SplitTailTrainingError",
-    "TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION",
     "UnsupportedModelAdapterError",
     "bind_request_runtime_from_template",
     "build_replay_runtime",

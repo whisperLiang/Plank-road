@@ -2,7 +2,7 @@
 
 Plank-Road is a multi-edge edge-cloud video analytics system for drift-aware continual learning under resource constraints. It targets low-latency edge inference and on-demand cloud adaptation when bandwidth, edge compute, and privacy-constrained cloud training resources are limited.
 
-The implementation combines startup-time fixed split planning, structured edge sample caching, a Lyapunov resource-aware trigger, versioned gRPC training bundles, shard-backed feature cache, split-tail cloud retraining, and optional dynamic activation sparsity.
+The implementation combines startup-time fixed split planning, structured edge sample caching, a Lyapunov resource-aware trigger, gRPC training bundles, shard-backed feature cache, split-tail cloud retraining, and optional dynamic activation sparsity.
 
 ## Overview
 
@@ -16,7 +16,7 @@ During online execution, video frames pass through differencing/filtering before
 
 The continual-learning trigger combines teacher-needed sample rate, drift signals, cloud resource pressure, upload volume, and link bandwidth. Its Lyapunov controller decides whether to skip training, upload teacher-needed raw samples only, or upload teacher-needed raw samples together with intermediate features.
 
-When training is triggered, the edge sends a versioned gRPC bundle with cached features/results, teacher-needed raw samples, optional teacher-needed features, drift tags, and split metadata. The cloud annotates teacher-needed raw samples with the large model, reconstructs missing features when needed, retrains the split-tail network, optionally applies dynamic activation sparsity, and returns updated lightweight weights to the originating edge.
+When training is triggered, the edge sends a gRPC bundle with cached features/results, teacher-needed raw samples, optional teacher-needed features, drift tags, and split metadata. The cloud annotates teacher-needed raw samples with the large model, reconstructs missing features when needed, retrains the split-tail network, optionally applies dynamic activation sparsity, and returns updated lightweight weights to the originating edge.
 
 ## Quick Start
 
@@ -50,28 +50,26 @@ Runtime defaults come from [config/config.yaml](./config/config.yaml), including
 Formal experiment runs are archived through a shutdown-only side channel under:
 
 ```text
-results/experiments/{comparison_id}/
+results/experiments/{experiment_id}/
   manifest.yaml
-  experiment_index.json
   raw_logs/
-    plank_road/{cloud,edge_*}/{run_id}/
-    pure_edge_local_updating/edge_*/{run_id}/
-    accuracy_trigger_cloud_retraining/{cloud,edge_*}/{run_id}/
-    ekya_style_cloud_scheduling/{cloud,edge_*}/{run_id}/
+    scenario={scenario_slug}/edges=n{edge_count}/repeat=r{repeat}/method={method}/
+      cloud/
+      edge_{edge_id}/
   normalized/
   figures/
 ```
 
 `experiment_results.root_dir` is the cloud repository and
 `experiment_results.local_root_dir` is the edge staging directory. Use the same
-`--comparison_id` and `--run_id` on participating processes. Edge overrides use
-`--experiment_results_root` for the local staging root; cloud overrides use it
-for the final repository root.
+`--experiment_id`, `--scenario`, `--edge_count`, and `--repeat` on participating
+cloud and edge processes. `--run_id` is optional; if omitted it is generated from
+those dimensions and the method.
 
 ```shell
-python cloud_server.py --run_id main-road-r1 --comparison_id comparison-001
+python cloud_server.py --experiment_id suwon5a_weather --scenario sunny --edge_count 2 --repeat 1
 python edge_client.py --headless --mode main \
-  --run_id main-road-r1 --comparison_id comparison-001
+  --experiment_id suwon5a_weather --scenario sunny --edge_count 2 --repeat 1 --edge_id 1
 ```
 
 After the required methods for a scenario have produced their staged result
@@ -79,7 +77,7 @@ files, run the video-aware offline teacher replay evaluation:
 
 ```shell
 python tools/experiments/evaluate_plank_road_baseline_teacher_accuracy.py \
-  --comparison_dir results/experiments/comparison-001 \
+  --comparison_dir results/experiments/suwon5a_weather \
   --teacher_model rtdetr_x \
   --device cuda:0 \
   --update_manifest
@@ -129,7 +127,7 @@ Core areas: [edge/resource_aware_trigger.py](./edge/resource_aware_trigger.py), 
 
 ### Cloud Training Pipeline
 
-The cloud receives versioned bundles, expands the working cache, annotates selected raw samples, rebuilds missing features, creates direct-reference training views, and retrains the server-side tail behind the selected split boundary.
+The cloud receives training bundles, expands the working cache, annotates selected raw samples, rebuilds missing features, creates direct-reference training views, and retrains the server-side tail behind the selected split boundary.
 
 Core areas: [cloud/orchestration/](./cloud/orchestration/), [cloud/annotation/](./cloud/annotation/), [cloud/feature_cache/](./cloud/feature_cache/), [cloud/sample_pool/](./cloud/sample_pool/).
 
@@ -340,7 +338,7 @@ Real deployment checklist:
 6. Edge cache directories are not shared through NFS unless intentionally configured.
 7. Cloud workspace_root has enough disk space for uploaded bundles and feature caches.
 8. GPU concurrency is controlled by GpuLeaseManager.
-9. Formal experiments should use an explicit run_id so worker assignments are not reused accidentally.
+9. Formal experiments should use explicit `experiment_id`, `scenario`, `edge_count`, and `repeat` values.
 ```
 
 Shut MPS down with:
@@ -351,7 +349,7 @@ echo quit | nvidia-cuda-mps-control
 
 ### Distributed Baseline Deployment
 
-Baselines are deployed using the same physical edge-cloud topology as Plank-Road, but they are separate comparison methods. Plank-Road itself is not registered as a `baseline_method`. For cloud-backed baselines, the cloud and every edge device must use the same explicit `run_id`.
+Baselines are deployed using the same physical edge-cloud topology as Plank-Road, but they are separate comparison methods. Plank-Road itself is not registered as a `baseline_method`. For cloud-backed baselines, the cloud and every edge device must use the same experiment identity; `run_id` is generated unless explicitly overridden.
 
 The supported baseline methods are:
 
@@ -397,19 +395,19 @@ an explicit ablation opts into edge targets.
 Cloud:
 
 ```shell
-python cloud_server.py --yaml_path ./config/config.yaml --mode baseline --baseline_method accuracy_trigger_cloud_retraining --listen_address "[::]:50051" --run_id baseline_acc_trigger_001
+python cloud_server.py --yaml_path ./config/config.yaml --mode baseline --baseline_method accuracy_trigger_cloud_retraining --listen_address "[::]:50051" --experiment_id road_baselines --scenario road --edge_count 2 --repeat 1
 ```
 
 Accuracy-Trigger edge device 1:
 
 ```shell
-python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method accuracy_trigger_cloud_retraining --run_id baseline_acc_trigger_001 --edge_id 1 --server_ip 192.168.66.205:50051 --cache_path ./cache/edge_1 --video_path ./video_data/road.mp4 --headless
+python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method accuracy_trigger_cloud_retraining --experiment_id road_baselines --scenario road --edge_count 2 --repeat 1 --edge_id 1 --server_ip 192.168.66.205:50051 --cache_path ./cache/edge_1 --video_path ./video_data/road.mp4 --headless
 ```
 
 Accuracy-Trigger edge device 2:
 
 ```shell
-python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method accuracy_trigger_cloud_retraining --run_id baseline_acc_trigger_001 --edge_id 2 --server_ip 192.168.66.205:50051 --cache_path ./cache/edge_2 --video_path ./video_data/cam1-rin.mp4 --headless
+python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method accuracy_trigger_cloud_retraining --experiment_id road_baselines --scenario road --edge_count 2 --repeat 1 --edge_id 2 --server_ip 192.168.66.205:50051 --cache_path ./cache/edge_2 --video_path ./video_data/cam1-rin.mp4 --headless
 ```
 
 #### Pure Edge Local Updating
@@ -437,13 +435,13 @@ implemented under
 Cloud:
 
 ```shell
-python cloud_server.py --yaml_path ./config/config.yaml --mode baseline --baseline_method ekya_style_cloud_scheduling --listen_address "[::]:50051" --run_id ekya_style_001
+python cloud_server.py --yaml_path ./config/config.yaml --mode baseline --baseline_method ekya_style_cloud_scheduling --listen_address "[::]:50051" --experiment_id road_baselines --scenario road --edge_count 1 --repeat 1
 ```
 
 Ekya-style edge:
 
 ```shell
-python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method ekya_style_cloud_scheduling --run_id ekya_style_001 --edge_id 1 --server_ip 192.168.66.205:50051 --video_path ./video_data/road.mp4 --headless
+python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method ekya_style_cloud_scheduling --experiment_id road_baselines --scenario road --edge_count 1 --repeat 1 --edge_id 1 --server_ip 192.168.66.205:50051 --video_path ./video_data/road.mp4 --headless
 ```
 
 Cloud-side raw logs are written under
@@ -456,7 +454,7 @@ under `results/edge/{run_id}/baselines/ekya_style_cloud_scheduling/`.
 Convert one Ekya-style run into the existing plot schema with:
 
 ```shell
-python tools/convert_ekya_style_results_to_plot_schema.py --run_id ekya_style_001 --result_dir results/cloud --comparison_id comparison-001 --scenario_name road --video_slug road --append_to_normalized_dir results/experiments/comparison-001/normalized
+python tools/convert_ekya_style_results_to_plot_schema.py --run_id road_n1_r01_ekya_style_cloud_scheduling --result_dir results/cloud --experiment_id road_baselines --scenario_name road --video_slug road --append_to_normalized_dir results/experiments/road_baselines/normalized
 ```
 
 ## Experiment Post-processing and Figures
@@ -471,13 +469,10 @@ The formal setup is Sunny/Rainy/Snowy, all four methods, and 3 to 5 repeats with
 matching frame ranges per scenario.
 
 ```text
-results/experiments/{comparison_id}/
+results/experiments/{experiment_id}/
   manifest.yaml
   raw_logs/
-    plank_road/
-    pure_edge_local_updating/
-    accuracy_trigger_cloud_retraining/
-    ekya_style_cloud_scheduling/
+    scenario={scenario_slug}/edges=n{edge_count}/repeat=r{repeat}/method={method}/
   normalized/
   figures/
 ```
@@ -485,9 +480,9 @@ results/experiments/{comparison_id}/
 Build teacher-supervised F1, normalize logs, and plot:
 
 ```shell
-python tools/experiments/evaluate_plank_road_baseline_teacher_accuracy.py --comparison_dir results/experiments/{comparison_id} --manifest results/experiments/{comparison_id}/manifest.yaml --teacher_model rtdetr_x --device cuda:0 --update_manifest
-python tools/experiments/normalize_plank_road_baseline_logs.py --comparison_dir results/experiments/{comparison_id} --manifest results/experiments/{comparison_id}/manifest.yaml
-python tools/experiments/plot_plank_road_baseline_figures.py --normalized_dir results/experiments/{comparison_id}/normalized --figure_dir results/experiments/{comparison_id}/figures
+python tools/experiments/evaluate_plank_road_baseline_teacher_accuracy.py --comparison_dir results/experiments/{experiment_id} --manifest results/experiments/{experiment_id}/manifest.yaml --teacher_model rtdetr_x --device cuda:0 --update_manifest
+python tools/experiments/normalize_plank_road_baseline_logs.py --comparison_dir results/experiments/{experiment_id} --manifest results/experiments/{experiment_id}/manifest.yaml
+python tools/experiments/plot_plank_road_baseline_figures.py --normalized_dir results/experiments/{experiment_id}/normalized --figure_dir results/experiments/{experiment_id}/figures
 ```
 
 After replacing files under `raw_logs/`, rerun the same three commands. Add
@@ -504,10 +499,10 @@ Teacher replay reports Teacher-supervised F1, not ground-truth accuracy, and is
 excluded from online latency and communication metrics. Missing values stay
 empty and skipped or partial figures are reported in `figures/plot_report.json`.
 
-Ekya-style raw logs can be consumed directly by the normalizer when the manifest
-uses method `ekya_style_cloud_scheduling` and `raw_logs.cloud` points to
-the Ekya raw directory, or to a run directory containing
-`baselines/ekya_style_cloud_scheduling/summary.json`. For ad hoc conversion, use
+Ekya-style raw logs can be consumed directly by the normalizer when the matrix
+manifest includes method `ekya_style_cloud_scheduling` and the raw files are in
+the generated `method=ekya_style_cloud_scheduling` directory. For ad hoc
+conversion, use
 `tools/convert_ekya_style_results_to_plot_schema.py`; it writes the same
 canonical method identity.
 
@@ -517,7 +512,7 @@ and is excluded from default plots. Use this only for measurements generated
 outside this repository. Import it explicitly with:
 
 ```shell
-python tools/experiments/merge_external_ekya_results.py --plank_road_summary results/experiments/{comparison_id}/normalized/summary.csv --ekya_csv path/to/external_ekya_results.csv --output results/experiments/{comparison_id}/normalized/summary_with_external_ekya.csv
+python tools/experiments/merge_external_ekya_results.py --plank_road_summary results/experiments/{experiment_id}/normalized/summary.csv --ekya_csv path/to/external_ekya_results.csv --output results/experiments/{experiment_id}/normalized/summary_with_external_ekya.csv
 ```
 
 Detailed specifications:

@@ -1,8 +1,4 @@
-comparison_id: exp_suwon5a_weather_plankroad_vs_baselines_001
-
-# Loguru text logs do not contain an offset. Declare the timezone used by the
-# machines that produced those logs so text timestamps can be correlated with
-# epoch-based JSONL timestamps independently of the post-processing host.
+experiment_id: suwon5a_weather
 log_timezone: Asia/Shanghai
 
 methods:
@@ -14,176 +10,32 @@ methods:
 student_model: rfdetr_nano
 teacher_model: rtdetr_x
 
-edge_ids:
-  - 1
-  - 2
-
-# The plotting pipeline does not infer weather labels from filenames.
 scenarios:
   - scenario_name: Sunny
+    scenario_slug: sunny
     video_path: video_data/sunny.mp4
-    video_slug: sunny
     frame_range: [0, 1999]
   - scenario_name: Rainy
+    scenario_slug: rainy
     video_path: video_data/rainy.mp4
-    video_slug: rainy
     frame_range: [0, 1999]
   - scenario_name: Snowy
+    scenario_slug: snowy
     video_path: video_data/snowy.mp4
-    video_slug: snowy
     frame_range: [0, 1999]
 
-# This example lists repeat r1. Duplicate the twelve run entries for r2-r5,
-# keeping the same scenario frame ranges across all four methods.
-runs:
-  - run_id: plank_road_sunny_n2_r1
-    method: plank_road
-    scenario_name: Sunny
-    edge_ids: [1, 2]
-    raw_logs:
-      cloud: raw_logs/plank_road/cloud/plank_road_sunny_n2_r1
-      edges:
-        "1": raw_logs/plank_road/edge_1/plank_road_sunny_n2_r1
-        "2": raw_logs/plank_road/edge_2/plank_road_sunny_n2_r1
-
-  - run_id: pure_edge_sunny_n2_r1
-    method: pure_edge_local_updating
-    scenario_name: Sunny
-    edge_ids: [1, 2]
-    raw_logs:
-      edges:
-        "1": raw_logs/pure_edge_local_updating/edge_1/pure_edge_sunny_n2_r1
-        "2": raw_logs/pure_edge_local_updating/edge_2/pure_edge_sunny_n2_r1
-
-  - run_id: accuracy_trigger_sunny_n2_r1
-    method: accuracy_trigger_cloud_retraining
-    scenario_name: Sunny
-    edge_ids: [1, 2]
-    raw_logs:
-      cloud: raw_logs/accuracy_trigger_cloud_retraining/cloud/accuracy_trigger_sunny_n2_r1
-      edges:
-        "1": raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy_trigger_sunny_n2_r1
-        "2": raw_logs/accuracy_trigger_cloud_retraining/edge_2/accuracy_trigger_sunny_n2_r1
-
-  - run_id: ekya_style_sunny_n2_r1
-    method: ekya_style_cloud_scheduling
-    scenario_name: Sunny
-    edge_ids: [1, 2]
-    raw_logs:
-      cloud: raw_logs/ekya_style_cloud_scheduling/cloud/ekya_style_sunny_n2_r1
-      edges:
-        "1": raw_logs/ekya_style_cloud_scheduling/edge_1/ekya_style_sunny_n2_r1
-        "2": raw_logs/ekya_style_cloud_scheduling/edge_2/ekya_style_sunny_n2_r1
-
-  - run_id: plank_road_rainy_n2_r1
-    method: plank_road
-    scenario_name: Rainy
-    edge_ids: [1, 2]
-    raw_logs:
-      cloud: raw_logs/plank_road/cloud/plank_road_rainy_n2_r1
-      edges:
-        "1": raw_logs/plank_road/edge_1/plank_road_rainy_n2_r1
-        "2": raw_logs/plank_road/edge_2/plank_road_rainy_n2_r1
-
-  - run_id: pure_edge_rainy_n2_r1
-    method: pure_edge_local_updating
-    scenario_name: Rainy
-    edge_ids: [1, 2]
-    raw_logs:
-      edges:
-        "1": raw_logs/pure_edge_local_updating/edge_1/pure_edge_rainy_n2_r1
-        "2": raw_logs/pure_edge_local_updating/edge_2/pure_edge_rainy_n2_r1
-
-  - run_id: accuracy_trigger_rainy_n2_r1
-    method: accuracy_trigger_cloud_retraining
-    scenario_name: Rainy
-    edge_ids: [1, 2]
-    raw_logs:
-      cloud: raw_logs/accuracy_trigger_cloud_retraining/cloud/accuracy_trigger_rainy_n2_r1
-      edges:
-        "1": raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy_trigger_rainy_n2_r1
-        "2": raw_logs/accuracy_trigger_cloud_retraining/edge_2/accuracy_trigger_rainy_n2_r1
-
-  - run_id: ekya_style_rainy_n2_r1
-    method: ekya_style_cloud_scheduling
-    scenario_name: Rainy
-    edge_ids: [1, 2]
-    raw_logs:
-      cloud: raw_logs/ekya_style_cloud_scheduling/cloud/ekya_style_rainy_n2_r1
-      edges:
-        "1": raw_logs/ekya_style_cloud_scheduling/edge_1/ekya_style_rainy_n2_r1
-        "2": raw_logs/ekya_style_cloud_scheduling/edge_2/ekya_style_rainy_n2_r1
-
-  - run_id: plank_road_snowy_n2_r1
-    method: plank_road
-    scenario_name: Snowy
-    edge_ids: [1, 2]
-    raw_logs:
-      cloud: raw_logs/plank_road/cloud/plank_road_snowy_n2_r1
-      edges:
-        "1": raw_logs/plank_road/edge_1/plank_road_snowy_n2_r1
-        "2": raw_logs/plank_road/edge_2/plank_road_snowy_n2_r1
-
-  - run_id: pure_edge_snowy_n2_r1
-    method: pure_edge_local_updating
-    scenario_name: Snowy
-    edge_ids: [1, 2]
-    raw_logs:
-      edges:
-        "1": raw_logs/pure_edge_local_updating/edge_1/pure_edge_snowy_n2_r1
-        "2": raw_logs/pure_edge_local_updating/edge_2/pure_edge_snowy_n2_r1
-
-  - run_id: accuracy_trigger_snowy_n2_r1
-    method: accuracy_trigger_cloud_retraining
-    scenario_name: Snowy
-    edge_ids: [1, 2]
-    raw_logs:
-      cloud: raw_logs/accuracy_trigger_cloud_retraining/cloud/accuracy_trigger_snowy_n2_r1
-      edges:
-        "1": raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy_trigger_snowy_n2_r1
-        "2": raw_logs/accuracy_trigger_cloud_retraining/edge_2/accuracy_trigger_snowy_n2_r1
-
-  - run_id: ekya_style_snowy_n2_r1
-    method: ekya_style_cloud_scheduling
-    scenario_name: Snowy
-    edge_ids: [1, 2]
-    raw_logs:
-      cloud: raw_logs/ekya_style_cloud_scheduling/cloud/ekya_style_snowy_n2_r1
-      edges:
-        "1": raw_logs/ekya_style_cloud_scheduling/edge_1/ekya_style_snowy_n2_r1
-        "2": raw_logs/ekya_style_cloud_scheduling/edge_2/ekya_style_snowy_n2_r1
-
-hardware:
-  cloud:
-    gpu: RTX_A6000
-    gpu_count: 1
-    mps_enabled: true
-  edge:
-    device_type: cpu_edge
-
-runtime:
-  plank_road:
-    mode: main
-    split_learning_enabled: true
-    resource_aware_trigger_enabled: true
-    sample_quality_enabled: true
-  pure_edge_local_updating:
-    mode: baseline
-    baseline_method: pure_edge_local_updating
-  accuracy_trigger_cloud_retraining:
-    mode: baseline
-    baseline_method: accuracy_trigger_cloud_retraining
-  ekya_style_cloud_scheduling:
-    mode: baseline
-    baseline_method: ekya_style_cloud_scheduling
+edge_counts: [1, 2, 4]
+repeats: [1, 2, 3]
+edge_ids_by_count:
+  "1": [1]
+  "2": [1, 2]
+  "4": [1, 2, 3, 4]
 
 metrics:
+  accuracy_definition: teacher_supervised_f1
   accuracy_file: null
   ground_truth_file: null
-  allow_missing_accuracy: true
-  accuracy_definition: teacher_supervised_f1
 
 notes:
-  - Formal paper figures require all four methods for Sunny, Rainy, and Snowy.
-  - Use 3 to 5 repeats; 5 repeats are recommended.
-  - Do not mix frame ranges across methods within a scenario.
+  - Raw logs are resolved from the matrix; do not add explicit runs.
+  - Different repeats must use different repeat values.

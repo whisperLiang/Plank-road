@@ -64,7 +64,10 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
         continual_backend=None,
         log_internal_ids: bool = False,
         experiment_result_repository=None,
-        experiment_comparison_id: str = "",
+        experiment_id: str = "",
+        experiment_scenario_slug: str = "",
+        experiment_edge_count: int = 1,
+        experiment_repeat: int = 1,
         experiment_method: str = "",
         experiment_run_id: str = "",
     ):
@@ -75,7 +78,10 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
         self.continual_backend = continual_backend or DisabledContinualLearningBackend()
         self.log_internal_ids = bool(log_internal_ids)
         self.experiment_result_repository = experiment_result_repository
-        self.experiment_comparison_id = str(experiment_comparison_id or "")
+        self.experiment_id = str(experiment_id or "")
+        self.experiment_scenario_slug = str(experiment_scenario_slug or "")
+        self.experiment_edge_count = int(experiment_edge_count or 1)
+        self.experiment_repeat = int(experiment_repeat or 1)
         self.experiment_method = str(experiment_method or "")
         self.experiment_run_id = str(experiment_run_id or "")
 
@@ -85,7 +91,10 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             return
         try:
             repository.record_cloud_event(
-                comparison_id=self.experiment_comparison_id,
+                experiment_id=self.experiment_id,
+                scenario_slug=self.experiment_scenario_slug,
+                edge_count=self.experiment_edge_count,
+                repeat=self.experiment_repeat,
                 method=self.experiment_method,
                 run_id=self.experiment_run_id,
                 event=event,

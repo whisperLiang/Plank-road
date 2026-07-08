@@ -15,10 +15,7 @@ import pytest
 import torch
 
 import cloud.training.strategies.baseline_freeze as freeze_strategy_module
-from baselines.runtime.upload_client import (
-    BASELINE_TRAINING_PROTOCOL_VERSION,
-    build_baseline_training_bundle,
-)
+from baselines.runtime.upload_client import build_baseline_training_bundle
 from cloud.training.parameter_freeze import (
     RawFrameTrainingSample,
     apply_parameter_ratio_freeze,
@@ -39,12 +36,11 @@ def test_baseline_bundle_is_raw_frame_protocol_without_split_artifacts() -> None
         manifest = json.loads(archive.read("baseline_trigger_manifest.json").decode("utf-8"))
 
     serialized = json.dumps(manifest, sort_keys=True)
-    assert manifest["protocol_version"] == BASELINE_TRAINING_PROTOCOL_VERSION
+    assert "protocol_version" not in manifest
     assert manifest["training_strategy"] == "freeze"
     assert manifest["training_config"]["trainable_param_ratio"] == pytest.approx(0.3)
     assert "split_plan" not in serialized
     assert "runtime_contract" not in serialized
-    assert "low-quality-trigger-shard.v1" not in serialized
     assert "feature_shard" not in serialized
 
 
@@ -338,7 +334,6 @@ def test_baseline_jobs_parallelize_across_edges_and_serialize_same_edge(tmp_path
             job_type=message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_TRAINING,
             workspace="",
             workspace_root=str(tmp_path),
-            protocol_version=BASELINE_TRAINING_PROTOCOL_VERSION,
             payload_zip=_bundle(edge_id=1),
         )
         second, _ = manager.submit(
@@ -347,7 +342,6 @@ def test_baseline_jobs_parallelize_across_edges_and_serialize_same_edge(tmp_path
             job_type=message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_TRAINING,
             workspace="",
             workspace_root=str(tmp_path),
-            protocol_version=BASELINE_TRAINING_PROTOCOL_VERSION,
             payload_zip=_bundle(edge_id=2),
         )
         third, _ = manager.submit(
@@ -356,7 +350,6 @@ def test_baseline_jobs_parallelize_across_edges_and_serialize_same_edge(tmp_path
             job_type=message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_TRAINING,
             workspace="",
             workspace_root=str(tmp_path),
-            protocol_version=BASELINE_TRAINING_PROTOCOL_VERSION,
             payload_zip=_bundle(edge_id=1, frame_ids=(3, 4)),
         )
 
@@ -385,7 +378,6 @@ def test_baseline_manager_dedupes_exact_request_id_only(tmp_path: Path) -> None:
             job_type=message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_TRAINING,
             workspace="",
             workspace_root=str(tmp_path),
-            protocol_version=BASELINE_TRAINING_PROTOCOL_VERSION,
             payload_zip=_bundle(edge_id=1),
             base_model_version="0",
         )
@@ -395,7 +387,6 @@ def test_baseline_manager_dedupes_exact_request_id_only(tmp_path: Path) -> None:
             job_type=message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_TRAINING,
             workspace="",
             workspace_root=str(tmp_path),
-            protocol_version=BASELINE_TRAINING_PROTOCOL_VERSION,
             payload_zip=_bundle(edge_id=1),
             base_model_version="0",
         )
@@ -405,7 +396,6 @@ def test_baseline_manager_dedupes_exact_request_id_only(tmp_path: Path) -> None:
             job_type=message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_TRAINING,
             workspace="",
             workspace_root=str(tmp_path),
-            protocol_version=BASELINE_TRAINING_PROTOCOL_VERSION,
             payload_zip=_bundle(edge_id=1, frame_ids=(3, 4)),
             base_model_version="0",
         )

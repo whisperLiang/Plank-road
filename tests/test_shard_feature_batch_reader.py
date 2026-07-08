@@ -77,7 +77,6 @@ def test_shard_feature_batch_reader_restores_legacy_flat_folded_rows(tmp_path) -
     index_path = shard_dir / f"{shard_id}.index.json"
     meta_path = shard_dir / f"{shard_id}.meta.json"
     metadata = FeatureShardMetadata(
-        format_version="feature-shard.v1",
         storage_format=NPY_MEMMAP_SHARD,
         model_id="unit",
         model_family="unit",

@@ -9,26 +9,13 @@ sample_pool:
 
 experiment_results:
  enabled: true
- comparison_id: exp_1
  root_dir: results/experiments
  local_root_dir: cache/experiment_results
- upload_to_cloud: true
- upload_on_shutdown: true
- include_inference_results: true
- include_baseline_metrics: true
- include_edge_summary: true
- include_trigger_manifest: true
- include_runtime_logs: false
  max_artifact_bytes: 268435456
- pure_edge_remote_sync:
-  target: whisperliang@192.168.66.205:/home/whisperliang/Plank-road
-  timeout_sec: 300
 
 baseline:
  enabled: false
  method: accuracy_trigger_cloud_retraining
- run_id: null
- results_root: results/baselines_distributed
  training:
   batch_size: 32
   num_epoch: 50
@@ -258,7 +245,6 @@ server:
     training_admission_scope: edge_camera
  edge_affine_workers:
   enabled: true
-  run_id: null
   mode: edge_affine_single_gpu_mps
   edge_workers:
    assignment: one_worker_per_edge

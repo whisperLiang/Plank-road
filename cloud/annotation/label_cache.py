@@ -18,9 +18,6 @@ from cloud.annotation.types import (
 )
 from common.logging_sanitizer import log_diagnostic_debug, safe_error_summary
 
-_CACHE_VERSION = "teacher-label-cache.v1"
-
-
 def _sanitize_segment(value: object) -> str:
     text = str(value or "").strip()
     cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", text)
@@ -83,14 +80,13 @@ class TeacherLabelCache:
         self.root_dir = os.path.abspath(str(root_dir))
         self.enabled = bool(enabled)
         self.log_internal_ids = bool(log_internal_ids)
-        self.cache_version = _CACHE_VERSION
         self._lock = threading.Lock()
         if self.enabled:
             os.makedirs(self.version_root, exist_ok=True)
 
     @property
     def version_root(self) -> str:
-        return os.path.join(self.root_dir, self.cache_version)
+        return self.root_dir
 
     def cache_key_for_request(self, request: TeacherAnnotationRequest) -> TeacherLabelCacheKey:
         return request.cache_key()
@@ -122,8 +118,6 @@ class TeacherLabelCache:
         metadata: Mapping[str, Any],
     ) -> bool:
         key = self.cache_key_for_request(request)
-        if str(metadata.get("cache_version") or "") != self.cache_version:
-            return False
         if str(metadata.get("cache_key") or "") != key.digest:
             return False
         key_payload = metadata.get("key_payload")
@@ -184,7 +178,6 @@ class TeacherLabelCache:
         meta_path = self.metadata_path(key)
         payload = _normalise_label_payload(labels)
         metadata = {
-            "cache_version": self.cache_version,
             "cache_key": key.digest,
             "key_payload": key.payload(),
             "sample_id": str(request.sample_id),

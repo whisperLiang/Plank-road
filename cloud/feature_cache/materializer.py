@@ -497,7 +497,6 @@ class FeatureCacheMaterializer:
         _atomic_json_dump(
             os.path.join(view_dir, "cache_manifest.json"),
             {
-                "cache_version": "feature-shard-training-view.v1",
                 "view_id": view_id,
                 "generation": generation,
                 **view_contract,
@@ -513,8 +512,6 @@ class FeatureCacheMaterializer:
         _atomic_json_dump(
             metadata_index_path,
             {
-                "version": 2,
-                "schema_version": "feature-shard-metadata-index.v1",
                 "view_id": view_id,
                 "generation": generation,
                 **view_contract,

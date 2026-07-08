@@ -613,7 +613,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run_id", required=True)
     parser.add_argument("--result_dir", default="./results/cloud", type=Path)
     parser.add_argument("--output_dir", type=Path, default=None)
-    parser.add_argument("--comparison_id", default="ekya_style_cloud_scheduling")
+    parser.add_argument("--experiment_id", default=None)
+    parser.add_argument("--comparison_id", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--scenario_name", default="road")
     parser.add_argument("--video_slug", default="road")
     parser.add_argument("--append_to_normalized_dir", type=Path, default=None)
@@ -629,7 +630,7 @@ def main(argv: list[str] | None = None) -> int:
     report = convert_ekya_style_results(
         raw_dir=raw_dir,
         output_dir=output_dir,
-        comparison_id=args.comparison_id,
+        comparison_id=args.experiment_id or args.comparison_id or "ekya_style_cloud_scheduling",
         scenario_name=args.scenario_name,
         video_slug=args.video_slug,
     )

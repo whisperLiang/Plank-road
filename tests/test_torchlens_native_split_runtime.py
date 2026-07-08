@@ -103,7 +103,6 @@ def test_template_cache_key_excludes_validation_version_and_dynamic_batch_fields
         "validated_batch_max",
         "runtime_batch_validation_signature",
         "runtime_version",
-        "adapter_version",
         "dynamic_batch",
         "version",
         "mode",
@@ -345,7 +344,7 @@ def test_fixed_split_contract_is_torchlens_native() -> None:
         sample_input=example,
         model_name="tiny",
     )
-    assert plan.plan_version == "fixed-split.v10"
+    assert "plan_version" not in plan.to_dict()
     assert plan.runtime_contract["runtime_backend"] == "torchlens_native"
 
     required = {

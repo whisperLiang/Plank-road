@@ -17,7 +17,10 @@ from tools.experiments.normalize_plank_road_baseline_logs import normalize
 
 def _request(
     *,
-    comparison_id: str = "comparison",
+    experiment_id: str = "comparison",
+    scenario_slug: str = "road",
+    edge_count: int = 1,
+    repeat: int = 1,
     run_id: str = "run-1",
     method: str = "plank_road",
     edge_id: int = 1,
@@ -25,7 +28,10 @@ def _request(
     content: bytes = b'{"frame_index": 1}\n',
 ):
     artifact = message_transmission_pb2.ExperimentResultArtifact(
-        comparison_id=comparison_id,
+        experiment_id=experiment_id,
+        scenario_slug=scenario_slug,
+        edge_count=edge_count,
+        repeat=repeat,
         run_id=run_id,
         method=method,
         edge_id=edge_id,
@@ -37,7 +43,10 @@ def _request(
         is_final=True,
     )
     return message_transmission_pb2.UploadExperimentResultRequest(
-        comparison_id=comparison_id,
+        experiment_id=experiment_id,
+        scenario_slug=scenario_slug,
+        edge_count=edge_count,
+        repeat=repeat,
         run_id=run_id,
         method=method,
         edge_id=edge_id,
@@ -61,9 +70,11 @@ def test_repository_stores_all_supported_methods(tmp_path: Path, method: str) ->
         tmp_path
         / "comparison"
         / "raw_logs"
-        / method
+        / "scenario=road"
+        / "edges=n1"
+        / "repeat=r01"
+        / f"method={method}"
         / "edge_1"
-        / "run-1"
         / "latest_inference_results.jsonl"
     ]
     assert stored[0].read_bytes() == b'{"frame_index": 1}\n'
@@ -120,9 +131,11 @@ def test_repository_preserves_skipped_metadata_from_client_manifest(
         tmp_path
         / "comparison"
         / "raw_logs"
-        / "plank_road"
+        / "scenario=road"
+        / "edges=n1"
+        / "repeat=r01"
+        / "method=plank_road"
         / "edge_1"
-        / "run-1"
         / "uploaded_artifacts_manifest.json"
     )
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -172,7 +185,7 @@ def test_repository_is_idempotent_and_overwrites_conflicting_artifact(
 def test_repository_uses_edge_summary_to_update_manifest(tmp_path: Path) -> None:
     writer = CloudExperimentManifestWriter(
         root_dir=str(tmp_path),
-        comparison_id="comparison",
+        experiment_id="comparison",
         student_model="student",
         teacher_model="teacher",
         log_timezone="UTC",
@@ -193,7 +206,8 @@ def test_repository_uses_edge_summary_to_update_manifest(tmp_path: Path) -> None
     )
     manifest = writer.manifest_path.read_text(encoding="utf-8")
     assert "scenario_name: road" in manifest
-    assert "raw_logs/plank_road/edge_1/run-1" in manifest
+    assert "edge_ids_by_count:" in manifest
+    assert "method=plank_road" not in manifest
 
 
 def test_auto_repository_layout_normalizes_without_manual_log_copy(
@@ -201,7 +215,7 @@ def test_auto_repository_layout_normalizes_without_manual_log_copy(
 ) -> None:
     writer = CloudExperimentManifestWriter(
         root_dir=str(tmp_path),
-        comparison_id="comparison",
+        experiment_id="comparison",
         student_model="student",
         teacher_model="teacher",
         log_timezone="UTC",

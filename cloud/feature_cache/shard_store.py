@@ -11,7 +11,7 @@ from loguru import logger
 
 from cloud.feature_cache.path_utils import fs_path
 from cloud.feature_cache.shard_reader import FeatureShardPayloadCache, ShardFeatureBatchReader
-from cloud.feature_cache.shard_writer import SHARD_FORMAT_VERSION, FeatureShardWriter
+from cloud.feature_cache.shard_writer import FeatureShardWriter
 from cloud.feature_cache.types import (
     NPY_MEMMAP_SHARD,
     SAFETENSORS_SHARD,
@@ -155,7 +155,6 @@ class FeatureShardStore:
         generation = str(manifest.get("request_id") or manifest.get("generation") or "edge_upload")
         target_dir = os.path.join(
             self.root_dir,
-            SHARD_FORMAT_VERSION,
             model_id or "unknown",
             feature_layout_id or "unknown",
             generation,

@@ -37,7 +37,6 @@ class CloudBatchTeacherAnnotator:
         teacher_num_classes: int = 91,
         teacher_annotation_threshold: float = 0.5,
         label_coordinate_space: str = "original_xyxy",
-        label_runtime_version: str = "fixed-split-pool-labels.v1",
         wait_timeout_sec: float | None = None,
         staging_root_dir: str | Path | None = None,
         owned_worker: object | None = None,
@@ -58,7 +57,6 @@ class CloudBatchTeacherAnnotator:
         self.teacher_num_classes = int(teacher_num_classes or 91)
         self.teacher_annotation_threshold = float(teacher_annotation_threshold)
         self.label_coordinate_space = str(label_coordinate_space or "original_xyxy")
-        self.label_runtime_version = str(label_runtime_version or "fixed-split-pool-labels.v1")
         self.wait_timeout_sec = wait_timeout_sec
         cache_root = getattr(getattr(service, "label_cache", None), "root_dir", "")
         self.staging_root_dir = Path(
@@ -156,7 +154,6 @@ class CloudBatchTeacherAnnotator:
                     teacher_num_classes=self.teacher_num_classes,
                     teacher_annotation_threshold=float(threshold),
                     label_coordinate_space=self.label_coordinate_space,
-                    label_runtime_version=self.label_runtime_version,
                     metadata=metadata,
                 )
             )

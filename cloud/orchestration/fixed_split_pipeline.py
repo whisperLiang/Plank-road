@@ -5,7 +5,6 @@ import time
 
 from loguru import logger
 
-from cloud.contracts import LOW_QUALITY_TRIGGER_PROTOCOL_VERSION
 from cloud.ingest import materialize_low_quality_trigger_bundle
 from cloud.orchestration.checkpoint_stage import CheckpointStageMixin
 from cloud.orchestration.fixed_split_dependencies import (
@@ -94,10 +93,6 @@ class FixedSplitPipeline(
                     )
                 manifest = materialized_manifest
                 self._log_stage_duration("loading bundle manifest", stage_started)
-                if manifest.get("protocol_version") != LOW_QUALITY_TRIGGER_PROTOCOL_VERSION:
-                    raise RuntimeError(
-                        f"Unexpected bundle protocol version: {manifest.get('protocol_version')!r}"
-                    )
                 current_model_name = self._resolve_fixed_split_model_name(manifest)
                 manifest_model_metadata = _manifest_model_metadata(manifest)
                 manifest_runtime_input_shape = _runtime_input_tensor_shape_from_metadata(manifest)

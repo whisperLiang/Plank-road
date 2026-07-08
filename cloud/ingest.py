@@ -10,11 +10,7 @@ from collections.abc import Mapping
 import cv2
 from loguru import logger
 
-from cloud.contracts import (
-    LOW_QUALITY_TRIGGER_PROTOCOL_VERSION,
-    validate_fixed_split_plan,
-    validate_low_quality_manifest,
-)
+from cloud.contracts import validate_fixed_split_plan, validate_low_quality_manifest
 from cloud.feature_cache import FeatureShardRef, FeatureShardStore
 from common.logging_sanitizer import log_diagnostic_debug, safe_error_summary
 
@@ -171,7 +167,6 @@ def materialize_low_quality_trigger_bundle(
     normalized_manifest = dict(trigger_manifest)
     normalized_manifest.update(
         {
-            "protocol_version": LOW_QUALITY_TRIGGER_PROTOCOL_VERSION,
             "edge_id": trigger_manifest.get("edge_id"),
             "model_id": str(trigger_manifest.get("model_id", "") or ""),
             "front_version": str(trigger_manifest.get("front_version", "0") or "0"),
@@ -199,7 +194,6 @@ def materialize_low_quality_trigger_bundle(
             },
             "samples": samples,
             "trigger_manifest": {
-                "protocol_version": trigger_manifest.get("protocol_version"),
                 "shard_size": trigger_manifest.get("shard_size"),
                 "raw_shard_count": len(trigger_manifest.get("raw_shards", []) or []),
                 "feature_shard_count": len(trigger_manifest.get("feature_shards", []) or []),

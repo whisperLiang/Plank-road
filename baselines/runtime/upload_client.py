@@ -20,7 +20,6 @@ from baselines.distributed.messages import (
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
 from tools.grpc_options import grpc_message_options
 
-BASELINE_TRAINING_PROTOCOL_VERSION = "baseline-training-trigger.v1"
 ALLOWED_BASELINE_TRAINING_STRATEGIES = {"freeze"}
 
 
@@ -119,7 +118,6 @@ def build_baseline_training_bundle(
         if str(baseline_method) == "accuracy_trigger_cloud_retraining":
             normalized_training_config.setdefault("trainable_param_ratio", 0.3)
         manifest: dict[str, Any] = {
-            "protocol_version": BASELINE_TRAINING_PROTOCOL_VERSION,
             "run_id": str(run_id),
             "baseline_method": str(baseline_method),
             "edge_id": int(edge_id),

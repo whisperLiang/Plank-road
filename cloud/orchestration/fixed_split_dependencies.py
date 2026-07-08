@@ -21,7 +21,6 @@ POOL_LABEL_METADATA_FIELDS = (
     "label_image_size",
     "label_input_size",
     "label_resize_mode",
-    "label_runtime_version",
 )
 _CACHED_SPLIT_PROXY_EVAL_MODEL_FAMILIES = frozenset({"yolo", "rfdetr", "tinynext"})
 

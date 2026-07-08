@@ -46,7 +46,6 @@ def _request(tmp_path, sample_id: str = "sample-1", **overrides) -> TeacherAnnot
         "teacher_num_classes": 91,
         "teacher_annotation_threshold": 0.5,
         "label_coordinate_space": "original_xyxy",
-        "label_runtime_version": "fixed-split-pool-labels.v1",
         "metadata": {"include_empty": True},
     }
     payload.update(overrides)
@@ -266,7 +265,6 @@ def test_invalid_cache_metadata_is_resubmitted_to_worker(tmp_path) -> None:
     with open(meta_path, "w", encoding="utf-8") as handle:
         json.dump(
             {
-                "cache_version": cache.cache_version,
                 "cache_key": "stale",
                 "key_payload": {},
             },

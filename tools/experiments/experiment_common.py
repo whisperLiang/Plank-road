@@ -11,6 +11,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 
+from common.experiment_results import (
+    PURE_EDGE_METHOD,
+    ExperimentIdentity,
+    normalize_edge_count,
+    normalize_edge_id_for_count,
+    normalize_repeat,
+    normalize_scenario_slug,
+)
 from common.video_identity import resolve_video_identity
 
 METHODS = (
@@ -35,13 +43,17 @@ METHOD_LABELS = {
 }
 
 FRAME_FIELDS = [
+    "experiment_id",
     "comparison_id",
     "run_id",
     "method",
     "edge_id",
     "scenario_name",
+    "scenario_slug",
     "video_slug",
     "video_source",
+    "edge_count",
+    "repeat",
     "frame_id",
     "timestamp_ms",
     "model_name",
@@ -61,12 +73,16 @@ FRAME_FIELDS = [
     "is_drift_window",
 ]
 WINDOW_FIELDS = [
+    "experiment_id",
     "comparison_id",
     "run_id",
     "method",
     "edge_id",
     "scenario_name",
+    "scenario_slug",
     "video_slug",
+    "edge_count",
+    "repeat",
     "window_id",
     "window_start_frame",
     "window_end_frame",
@@ -91,12 +107,16 @@ WINDOW_FIELDS = [
     "send_low_conf_features",
 ]
 ADAPTATION_FIELDS = [
+    "experiment_id",
     "comparison_id",
     "run_id",
     "method",
     "edge_id",
     "scenario_name",
+    "scenario_slug",
     "video_slug",
+    "edge_count",
+    "repeat",
     "event_name",
     "event_time_ms",
     "frame_id",
@@ -107,12 +127,16 @@ ADAPTATION_FIELDS = [
     "message",
 ]
 UPLOAD_FIELDS = [
+    "experiment_id",
     "comparison_id",
     "run_id",
     "method",
     "edge_id",
     "scenario_name",
+    "scenario_slug",
     "video_slug",
+    "edge_count",
+    "repeat",
     "window_id",
     "raw_frame_bytes",
     "feature_bytes",
@@ -126,12 +150,16 @@ UPLOAD_FIELDS = [
     "low_quality_count",
 ]
 LATENCY_FIELDS = [
+    "experiment_id",
     "comparison_id",
     "run_id",
     "method",
     "edge_id",
     "scenario_name",
+    "scenario_slug",
     "video_slug",
+    "edge_count",
+    "repeat",
     "window_id",
     "upload_ms",
     "teacher_annotation_ms",
@@ -143,12 +171,16 @@ LATENCY_FIELDS = [
     "total_adaptation_ms",
 ]
 RESOURCE_FIELDS = [
+    "experiment_id",
     "comparison_id",
     "run_id",
     "method",
     "edge_id",
     "scenario_name",
+    "scenario_slug",
     "video_slug",
+    "edge_count",
+    "repeat",
     "timestamp_ms",
     "gpu_utilization",
     "memory_utilization",
@@ -159,12 +191,15 @@ RESOURCE_FIELDS = [
     "stage",
 ]
 SUMMARY_FIELDS = [
+    "experiment_id",
     "comparison_id",
     "run_id",
     "method",
     "scenario_name",
+    "scenario_slug",
     "video_slug",
     "edge_count",
+    "repeat",
     "student_model",
     "teacher_model",
     "mean_f1",
@@ -276,9 +311,21 @@ def load_manifest(path: Path) -> dict[str, Any]:
     if not isinstance(payload, Mapping):
         raise ManifestError("Manifest root must be a mapping")
     manifest = dict(payload)
-    comparison_id = str(manifest.get("comparison_id", "") or "").strip()
-    if not comparison_id:
-        raise ManifestError("comparison_id must be non-empty")
+    if "runs" in manifest:
+        raise ManifestError("manifest must not define explicit runs; use matrix fields")
+    experiment_id = str(manifest.get("experiment_id", "") or "").strip()
+    if not experiment_id:
+        raise ManifestError("experiment_id must be non-empty")
+    try:
+        experiment_id = ExperimentIdentity.create(
+            experiment_id=experiment_id,
+            scenario_slug="default",
+            edge_count=1,
+            repeat=1,
+            method=METHODS[0],
+        ).experiment_id
+    except ValueError as exc:
+        raise ManifestError(str(exc)) from exc
     raw_log_timezone = manifest.get("log_timezone")
     if not isinstance(raw_log_timezone, str) or not raw_log_timezone.strip():
         raise ManifestError("log_timezone must be a non-empty IANA timezone name")
@@ -287,136 +334,175 @@ def load_manifest(path: Path) -> dict[str, Any]:
         ZoneInfo(log_timezone)
     except (ValueError, ZoneInfoNotFoundError) as exc:
         raise ManifestError(f"unknown log_timezone: {log_timezone!r}") from exc
+    manifest["experiment_id"] = experiment_id
+    manifest["comparison_id"] = experiment_id
     manifest["log_timezone"] = log_timezone
     methods = list(manifest.get("methods") or [])
-    if (
-        methods[: len(METHODS)] != list(METHODS)
-        or len(set(methods)) != len(methods)
-        or any(method not in SUPPORTED_METHODS for method in methods)
+    if not methods or len(set(methods)) != len(methods) or any(
+        method not in SUPPORTED_METHODS for method in methods
     ):
-        raise ManifestError(
-            "methods must start with "
-            f"{', '.join(METHODS)} and may append: {', '.join(OPTIONAL_METHODS)}"
-        )
+        raise ManifestError(f"methods must be unique and within: {', '.join(SUPPORTED_METHODS)}")
+    manifest["methods"] = methods
     scenarios = manifest.get("scenarios")
     if not isinstance(scenarios, list) or not scenarios:
         raise ManifestError("scenarios must be a non-empty list")
-    scenario_names: set[str] = set()
-    video_slugs: set[str] = set()
+    scenario_slugs: set[str] = set()
     normalized_scenarios: list[dict[str, Any]] = []
     for scenario in scenarios:
         if not isinstance(scenario, Mapping):
             raise ManifestError("every scenario must be a mapping")
-        name = str(scenario.get("name") or scenario.get("scenario_name") or "").strip()
-        if not name or name in scenario_names:
-            raise ManifestError("scenario names must be non-empty and unique")
+        name = str(scenario.get("scenario_name") or scenario.get("name") or "").strip()
+        raw_slug = str(scenario.get("scenario_slug") or scenario.get("video_slug") or name).strip()
+        try:
+            scenario_slug = normalize_scenario_slug(raw_slug)
+        except ValueError as exc:
+            raise ManifestError(str(exc)) from exc
+        if not name:
+            name = scenario_slug
+        if scenario_slug in scenario_slugs:
+            raise ManifestError("scenario_slug values must be non-empty and unique")
         video_source = str(
             scenario.get("video_source") or scenario.get("video_path") or ""
         ).strip()
-        try:
-            identity = resolve_video_identity(
-                video_source,
-                configured_video_slug=scenario.get("video_slug", ""),
-                configured_scenario_name=name,
-            )
-        except ValueError as exc:
-            raise ManifestError(str(exc)) from exc
+        video_slug_value = str(scenario.get("video_slug") or scenario_slug)
+        if video_source:
+            try:
+                identity = resolve_video_identity(
+                    video_source,
+                    configured_video_slug=video_slug_value,
+                    configured_scenario_name=name,
+                )
+                video_slug_value = identity.video_slug
+            except ValueError as exc:
+                raise ManifestError(str(exc)) from exc
         normalized = dict(scenario)
-        normalized["name"] = name
         normalized["scenario_name"] = name
+        normalized["name"] = name
+        normalized["scenario_slug"] = scenario_slug
         normalized["video_source"] = video_source
         normalized["video_path"] = video_source
-        normalized["video_slug"] = identity.video_slug
-        if identity.video_slug in video_slugs:
-            raise ManifestError("scenario video_slug values must be unique")
+        normalized["video_slug"] = video_slug_value
         normalized_scenarios.append(normalized)
-        scenario_names.add(name)
-        video_slugs.add(identity.video_slug)
+        scenario_slugs.add(scenario_slug)
     manifest["scenarios"] = normalized_scenarios
-    scenario_slugs = {str(item["name"]): str(item["video_slug"]) for item in normalized_scenarios}
-    runs = manifest.get("runs")
-    if not isinstance(runs, list) or not runs:
-        raise ManifestError("runs must be a non-empty list")
-    run_ids: set[str] = set()
-    seen_method_scenarios: set[tuple[str, str]] = set()
-    normalized_runs: list[dict[str, Any]] = []
-    for run in runs:
-        if not isinstance(run, Mapping):
-            raise ManifestError("every run must be a mapping")
-        run_id = str(run.get("run_id", "") or "").strip()
-        method = str(run.get("method", "") or "").strip()
-        scenario_name = str(run.get("scenario_name", "") or "").strip()
-        edge_ids = run.get("edge_ids")
-        raw_logs = run.get("raw_logs")
-        if not run_id or run_id in run_ids:
-            raise ManifestError("run_id values must be non-empty and unique")
-        if method not in methods:
-            raise ManifestError(f"unsupported run method: {method!r}")
-        if scenario_name not in scenario_names:
-            raise ManifestError(f"unknown scenario_name for run {run_id}: {scenario_name!r}")
-        if not isinstance(edge_ids, list) or not edge_ids:
-            raise ManifestError(f"run {run_id} must define non-empty edge_ids")
+
+    edge_counts_raw = manifest.get("edge_counts")
+    repeats_raw = manifest.get("repeats")
+    if not isinstance(edge_counts_raw, list) or not edge_counts_raw:
+        raise ManifestError("edge_counts must be a non-empty list")
+    if not isinstance(repeats_raw, list) or not repeats_raw:
+        raise ManifestError("repeats must be a non-empty list")
+    try:
+        edge_counts = sorted({normalize_edge_count(value) for value in edge_counts_raw})
+        repeats = sorted({normalize_repeat(value) for value in repeats_raw})
+    except (TypeError, ValueError) as exc:
+        raise ManifestError(str(exc)) from exc
+    if len(edge_counts) != len(edge_counts_raw):
+        raise ManifestError("edge_counts must contain unique positive integers")
+    if len(repeats) != len(repeats_raw):
+        raise ManifestError("repeats must contain unique positive integers")
+    manifest["edge_counts"] = edge_counts
+    manifest["repeats"] = repeats
+
+    raw_edge_ids_by_count = manifest.get("edge_ids_by_count")
+    if not isinstance(raw_edge_ids_by_count, Mapping):
+        raise ManifestError("edge_ids_by_count must be a mapping")
+    edge_ids_by_count: dict[str, list[int]] = {}
+    for edge_count in edge_counts:
+        raw_ids = raw_edge_ids_by_count.get(str(edge_count), raw_edge_ids_by_count.get(edge_count))
+        if not isinstance(raw_ids, list) or not raw_ids:
+            raise ManifestError(f"edge_ids_by_count.{edge_count} must be a non-empty list")
         try:
-            normalized_edges = [int(value) for value in edge_ids]
+            edge_ids = [int(value) for value in raw_ids]
         except (TypeError, ValueError) as exc:
-            raise ManifestError(f"run {run_id} edge_ids must be integers") from exc
-        if any(value <= 0 for value in normalized_edges) or len(set(normalized_edges)) != len(
-            normalized_edges
-        ):
-            raise ManifestError(f"run {run_id} edge_ids must be unique positive integers")
-        if not isinstance(raw_logs, Mapping):
-            raise ManifestError(f"run {run_id} must define raw_logs")
+            raise ManifestError(f"edge_ids_by_count.{edge_count} must contain integers") from exc
+        if any(value <= 0 for value in edge_ids) or len(set(edge_ids)) != len(edge_ids):
+            raise ManifestError(
+                f"edge_ids_by_count.{edge_count} must contain unique positive integers"
+            )
+        try:
+            edge_ids = [
+                normalize_edge_id_for_count(edge_id, edge_count)
+                for edge_id in edge_ids
+            ]
+        except ValueError as exc:
+            raise ManifestError(f"edge_ids_by_count.{edge_count}: {exc}") from exc
+        edge_ids_by_count[str(edge_count)] = sorted(edge_ids)
+    manifest["edge_ids_by_count"] = edge_ids_by_count
+
+    run_ids: set[str] = set()
+    normalized_runs: list[dict[str, Any]] = []
+    for scenario in normalized_scenarios:
+        for edge_count in edge_counts:
+            edge_ids = edge_ids_by_count[str(edge_count)]
+            for repeat in repeats:
+                for method in methods:
+                    try:
+                        identity = ExperimentIdentity.create(
+                            experiment_id=experiment_id,
+                            scenario_slug=str(scenario["scenario_slug"]),
+                            edge_count=edge_count,
+                            repeat=repeat,
+                            method=method,
+                        )
+                    except ValueError as exc:
+                        raise ManifestError(str(exc)) from exc
+                    if identity.run_id in run_ids:
+                        raise ManifestError(
+                            f"generated run_id is not unique: {identity.run_id!r}"
+                        )
+                    raw_base = identity.raw_logs_relative_dir().as_posix()
+                    edge_paths = {
+                        str(edge_id): f"{raw_base}/edge_{edge_id}" for edge_id in edge_ids
+                    }
+                    raw_logs: dict[str, Any] = {"edges": edge_paths}
+                    if method != PURE_EDGE_METHOD:
+                        raw_logs["cloud"] = f"{raw_base}/cloud"
+                    normalized_runs.append(
+                        {
+                            "experiment_id": identity.experiment_id,
+                            "run_id": identity.run_id,
+                            "method": method,
+                            "scenario_name": str(scenario["scenario_name"]),
+                            "scenario_slug": str(scenario["scenario_slug"]),
+                            "video_slug": str(scenario["video_slug"]),
+                            "edge_count": edge_count,
+                            "repeat": repeat,
+                            "edge_ids": list(edge_ids),
+                            "raw_logs": raw_logs,
+                        }
+                    )
+                    run_ids.add(identity.run_id)
+
+    for run in normalized_runs:
+        raw_logs = run["raw_logs"]
         declared_paths = [raw_logs.get("cloud")]
-        edge_paths = raw_logs.get("edges")
-        if not isinstance(edge_paths, Mapping):
-            raise ManifestError(f"run {run_id} raw_logs.edges must be a mapping")
-        declared_paths.extend(edge_paths.values())
+        declared_paths.extend(dict(raw_logs["edges"]).values())
         absolute_paths = [
             str(value)
             for value in declared_paths
             if value not in (None, "") and Path(str(value)).expanduser().is_absolute()
         ]
         if absolute_paths:
-            raise ManifestError(f"run {run_id} raw-log paths must be relative to comparison_dir")
+            raise ManifestError(
+                f"run {run['run_id']} raw-log paths must be relative to experiment dir"
+            )
         escaping_paths = [
             str(value)
             for value in declared_paths
             if value not in (None, "") and ".." in Path(str(value)).parts
         ]
         if escaping_paths:
-            raise ManifestError(f"run {run_id} raw-log paths must remain inside comparison_dir")
-        missing_edges = [
-            edge_id
-            for edge_id in normalized_edges
-            if str(edge_id) not in edge_paths and edge_id not in edge_paths
-        ]
-        if missing_edges:
-            raise ManifestError(f"run {run_id} raw_logs.edges is missing edge(s): {missing_edges}")
-        if method != "pure_edge_local_updating" and not raw_logs.get("cloud"):
-            raise ManifestError(f"run {run_id} must define raw_logs.cloud")
-        normalized_run = dict(run)
-        normalized_run["video_slug"] = scenario_slugs[scenario_name]
-        normalized_runs.append(normalized_run)
-        run_ids.add(run_id)
-        seen_method_scenarios.add((method, scenario_name))
-    missing_method_scenarios = [
-        f"{method}/{scenario}"
-        for method in methods
-        for scenario in scenario_names
-        if (method, scenario) not in seen_method_scenarios
-    ]
-    if missing_method_scenarios:
-        raise ManifestError(
-            "runs must cover every method/scenario pair; missing: "
-            + ", ".join(missing_method_scenarios)
-        )
+            raise ManifestError(
+                f"run {run['run_id']} raw-log paths must remain inside experiment dir"
+            )
     manifest["runs"] = normalized_runs
     return manifest
 
 
 def scenario_lookup(manifest: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     return {
-        str(item["name"]): dict(item)
+        str(item["scenario_slug"]): dict(item)
         for item in list(manifest.get("scenarios") or [])
         if isinstance(item, Mapping)
     }
@@ -612,13 +698,18 @@ def canonical_base(
     run: Mapping[str, Any],
     edge_id: int | str | None = None,
 ) -> dict[str, Any]:
+    experiment_id = str(run.get("experiment_id") or comparison_id)
     return {
+        "experiment_id": experiment_id,
         "comparison_id": comparison_id,
         "run_id": str(run["run_id"]),
         "method": str(run["method"]).strip(),
         "edge_id": "" if edge_id is None else int(edge_id),
         "scenario_name": str(run["scenario_name"]),
+        "scenario_slug": str(run.get("scenario_slug", "")),
         "video_slug": str(run.get("video_slug", "")),
+        "edge_count": int(run.get("edge_count", 0) or 0),
+        "repeat": int(run.get("repeat", 0) or 0),
     }
 
 

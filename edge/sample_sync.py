@@ -31,8 +31,6 @@ from model_management.split_contract import (
     feature_layout_from_tensors,
 )
 
-HIGH_QUALITY_SYNC_PROTOCOL_VERSION = "high-quality-feature-label-shard.v2"
-UPLOAD_LEDGER_VERSION = "edge-sample-upload-ledger.v1"
 UPLOAD_LEDGER_FILENAME = "upload_ledger.json"
 UPLOAD_PENDING = "pending"
 UPLOAD_UPLOADED = "uploaded"
@@ -265,7 +263,6 @@ def pack_high_quality_sync_bundle_to_file(
     handle.close()
 
     manifest: dict[str, Any] = {
-        "protocol_version": HIGH_QUALITY_SYNC_PROTOCOL_VERSION,
         "edge_id": int(edge_id),
         "edge_session_id": edge_session_id,
         "model_id": model_id,
@@ -606,7 +603,6 @@ class HighQualitySampleSyncer:
                 self.server_ip,
                 edge_id=self.edge_id,
                 request_id=request_id,
-                protocol_version=manifest["protocol_version"],
                 sync_type="HIGH_QUALITY_FEATURE_LABEL_SHARD",
                 model_id=str(manifest.get("model_id", "")),
                 model_version=str(manifest.get("model_version", "")),
@@ -724,7 +720,6 @@ class HighQualitySampleSyncer:
 
     def _empty_ledger(self) -> dict[str, Any]:
         return {
-            "schema_version": UPLOAD_LEDGER_VERSION,
             "created_at": _utc_now(),
             "samples": {},
         }
@@ -748,7 +743,6 @@ class HighQualitySampleSyncer:
         samples = payload.get("samples")
         if not isinstance(samples, dict):
             payload["samples"] = {}
-        payload.setdefault("schema_version", UPLOAD_LEDGER_VERSION)
         return payload
 
     def _write_ledger_unlocked(self, payload: Mapping[str, Any]) -> None:

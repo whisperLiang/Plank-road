@@ -992,11 +992,10 @@ def _summary_rows(
         rows.append(
             empty_row(
                 SUMMARY_FIELDS,
-                comparison_id=manifest["comparison_id"],
-                run_id=run_id,
-                method=str(run["method"]).strip(),
-                scenario_name=run["scenario_name"],
-                edge_count=len(list(run["edge_ids"])),
+                **canonical_base(
+                    comparison_id=str(manifest["comparison_id"]),
+                    run=run,
+                ),
                 student_model=manifest.get("student_model"),
                 teacher_model=manifest.get("teacher_model"),
                 mean_f1=mean(row.get("f1") for row in run_frames),
@@ -1624,6 +1623,24 @@ def _resolve_ekya_raw_dir(path: Path) -> Path | None:
     return None
 
 
+def _apply_manifest_run_identity(
+    row_sets: Mapping[str, list[dict[str, Any]]],
+    *,
+    comparison_id: str,
+    run: Mapping[str, Any],
+) -> None:
+    for rows in row_sets.values():
+        for row in rows:
+            edge_id = optional_int(row.get("edge_id"))
+            row.update(
+                canonical_base(
+                    comparison_id=comparison_id,
+                    run=run,
+                    edge_id=edge_id,
+                )
+            )
+
+
 def normalize(comparison_dir: Path, manifest_path: Path | None = None) -> dict[str, Any]:
     manifest_path = _resolve_manifest_path(comparison_dir, manifest_path)
     manifest = load_manifest(manifest_path)
@@ -1645,7 +1662,7 @@ def normalize(comparison_dir: Path, manifest_path: Path | None = None) -> dict[s
     seen_files: set[tuple[str, str, int | None]] = set()
 
     for run in list(manifest["runs"]):
-        scenario = scenarios[str(run["scenario_name"])]
+        scenario = scenarios[str(run["scenario_slug"])]
         raw_logs = dict(run["raw_logs"])
         if str(run["method"]).strip() == EKYA_CANONICAL_METHOD:
             source_path = resolve_relative(comparison_dir, raw_logs.get("cloud"))
@@ -1663,6 +1680,11 @@ def normalize(comparison_dir: Path, manifest_path: Path | None = None) -> dict[s
                 scenario_name=str(run["scenario_name"]),
                 video_slug=str(scenario.get("video_slug", "")),
                 plot_method=EKYA_CANONICAL_METHOD,
+            )
+            _apply_manifest_run_identity(
+                row_sets,
+                comparison_id=str(manifest["comparison_id"]),
+                run=run,
             )
             frames.extend(row_sets["frame_metrics.csv"])
             windows.extend(row_sets["window_metrics.csv"])
@@ -1908,14 +1930,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--comparison_dir",
         required=True,
         type=Path,
-        help="Experiment comparison directory containing raw_logs/ and normalized/.",
+        help="Experiment directory containing raw_logs/ and normalized/.",
     )
     parser.add_argument(
         "--manifest",
         type=Path,
         default=None,
         help=(
-            "Manifest YAML describing explicit runs and raw-log paths. "
+            "Matrix manifest YAML. "
             "Defaults to <comparison_dir>/manifest.yaml, then experiment_index.json."
         ),
     )

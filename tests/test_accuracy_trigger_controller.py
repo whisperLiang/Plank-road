@@ -12,7 +12,6 @@ from loguru import logger
 
 from baselines.distributed.cloud_controller import DistributedBaselineController
 from baselines.distributed.messages import BaselineFramePayload, BaselineWindowPayload
-from baselines.runtime.upload_client import BASELINE_TRAINING_PROTOCOL_VERSION
 from cloud.annotation import TeacherAnnotationRetryableError
 from cloud.baselines.accuracy_trigger_controller import AccuracyTriggerController
 from cloud.baselines.detection_agreement import (
@@ -545,11 +544,11 @@ def test_cloud_controller_submits_bundle_with_reused_teacher_targets(tmp_path) -
 
     assert len(backend.requests) == 1
     request = backend.requests[0]
-    assert request.protocol_version == BASELINE_TRAINING_PROTOCOL_VERSION
+    assert request.protocol_version == ""
     assert list(request.frame_indices) == [1, 2, 3, 4, 5, 6]
     manifest = _manifest_from_bundle(request.payload_zip)
     serialized = json.dumps(manifest, sort_keys=True)
-    assert manifest["protocol_version"] == BASELINE_TRAINING_PROTOCOL_VERSION
+    assert "protocol_version" not in manifest
     assert manifest["training_strategy"] == "freeze"
     assert manifest["trigger_reason"] == "adaptive_drop"
     assert manifest["trigger_window_frame_ids"] == [5, 6]

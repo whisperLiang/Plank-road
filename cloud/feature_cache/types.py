@@ -22,7 +22,6 @@ def stable_digest(payload: object) -> str:
 class FeatureCacheKey:
     """Stable shard grouping key, not a per-sample file path key."""
 
-    cache_version: str
     sample_id: str
     image_sha1: str | None
     source: str
@@ -50,7 +49,6 @@ class FeatureCacheKey:
 
 @dataclass(frozen=True)
 class FeatureShardMetadata:
-    format_version: str
     storage_format: str
     model_id: str
     model_family: str
@@ -81,7 +79,6 @@ class FeatureShardMetadata:
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "FeatureShardMetadata":
         return cls(
-            format_version=str(payload.get("format_version") or "feature-shard.v1"),
             storage_format=str(payload.get("storage_format") or ""),
             model_id=str(payload.get("model_id") or ""),
             model_family=str(payload.get("model_family") or ""),
@@ -296,7 +293,6 @@ class TrainingCacheView:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "schema_version": "training-cache-view.v2",
             "view_id": self.view_id,
             "generation": self.generation,
             "feature_layout_id": self.feature_layout_id,

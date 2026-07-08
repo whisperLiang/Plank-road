@@ -819,6 +819,10 @@ def test_microprofile_runs_training_loop_and_not_static_formula(
     cfg = parse_ekya_style_config(runtime, run_id="run")
     monkeypatch.setattr(mp, "run_one_training_epoch", counting_epoch)
     monkeypatch.setattr(mp, "evaluate_model_on_samples", evaluate)
+    monkeypatch.setattr(
+        "cloud.baselines.ekya_style_cloud_scheduling.training_runtime.resolve_training_device",
+        lambda: torch.device("cpu"),
+    )
     base = TinyTrainModel().state_dict()
 
     (result, elapsed), logs = _capture_info_logs(
@@ -1374,14 +1378,11 @@ def test_ekya_cloud_server_uses_dedicated_controller_without_edge_affine(tmp_pat
     config.edge_affine_workers = SimpleNamespace(enabled=False)
     config.experiment_results = SimpleNamespace(
         enabled=True,
-        comparison_id="comparison",
         root_dir=str(tmp_path / "experiments"),
         max_artifact_bytes=1024 * 1024,
-        include_runtime_logs=False,
     )
     baseline_config = SimpleNamespace(
         method="ekya_style_cloud_scheduling",
-        run_id="run",
     )
 
     server = CloudServer(
@@ -1390,6 +1391,11 @@ def test_ekya_cloud_server_uses_dedicated_controller_without_edge_affine(tmp_pat
         baseline_config=baseline_config,
         baseline_method="ekya_style_cloud_scheduling",
         run_id="run",
+        experiment_id="comparison",
+        scenario="road",
+        edge_count=1,
+        repeat=1,
+        runtime_config=runtime,
     )
 
     assert isinstance(server.baseline_controller, EkyaStyleCloudSchedulingController)
@@ -1399,9 +1405,11 @@ def test_ekya_cloud_server_uses_dedicated_controller_without_edge_affine(tmp_pat
         / "experiments"
         / "comparison"
         / "raw_logs"
-        / "ekya_style_cloud_scheduling"
+        / "scenario=road"
+        / "edges=n1"
+        / "repeat=r01"
+        / "method=ekya_style_cloud_scheduling"
         / "cloud"
-        / "run"
     )
     assert _experiment_method_for("ekya_style_cloud_scheduling") == "ekya_style_cloud_scheduling"
 
@@ -1459,6 +1467,10 @@ def test_trainer_saves_nonempty_adoptable_checkpoint_and_epoch_log(
     runtime.server.continual_learning.rfdetr_fixed_split_learning_rate = 0.1
     cfg = parse_ekya_style_config(runtime, run_id="run")
     decision = SimpleNamespace(trains=True)
+    monkeypatch.setattr(
+        "cloud.baselines.ekya_style_cloud_scheduling.training_runtime.resolve_training_device",
+        lambda: torch.device("cpu"),
+    )
 
     result, logs = _capture_info_logs(
         lambda: EkyaCloudTrainer(cfg, checkpoint_dir=tmp_path).train(

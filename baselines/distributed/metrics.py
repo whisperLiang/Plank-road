@@ -24,8 +24,12 @@ class DistributedMetricsWriter:
             / f"edge_{int(edge_id)}"
             / "metrics.jsonl"
         )
+        if self.path.exists():
+            self.path.unlink()
         self._writer = JsonlResultWriter(self.path)
         self.mirror_path = Path(mirror_path) if mirror_path is not None else None
+        if self.mirror_path is not None and self.mirror_path.exists():
+            self.mirror_path.unlink()
         self._mirror_writer = (
             JsonlResultWriter(self.mirror_path) if self.mirror_path is not None else None
         )

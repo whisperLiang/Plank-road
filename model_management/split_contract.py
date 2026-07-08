@@ -9,9 +9,6 @@ from typing import Any, Mapping
 
 import torch
 
-SPLIT_RUNTIME_CONTRACT_VERSION = "split-runtime-contract.v2"
-FIXED_SPLIT_RUNTIME_CONTRACT_VERSION = "fixed-split-runtime-contract.v2"
-
 
 def _stable_json(payload: object) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
@@ -130,9 +127,7 @@ def _symbolize_batch_shape(shape: object, *, batch_symbol: str = "B") -> list[in
 
 @dataclass(frozen=True)
 class FeatureAbiSpec:
-    version: str
     model_family: str
-    adapter_version: str
     runtime_version: str
     canonical_split_key: str
     graph_signature: str
@@ -197,7 +192,6 @@ def build_feature_abi_spec(
     *,
     model_id: str = "",
     model_family: str = "",
-    adapter_version: str = "",
     runtime_version: str = "",
     canonical_split_key: str = "",
     graph_signature: str = "",
@@ -239,9 +233,7 @@ def build_feature_abi_spec(
         or []
     )
     spec = FeatureAbiSpec(
-        version="feature-abi.v1",
         model_family=resolved_model_family,
-        adapter_version=str(adapter_version or identity.get("adapter_version") or ""),
         runtime_version=str(runtime_version or identity.get("runtime_version") or ""),
         canonical_split_key=str(
             canonical_split_key
@@ -400,7 +392,6 @@ def build_runtime_contract(
     )
     abi_id = feature_abi_id(abi_spec)
     return {
-        "contract_version": FIXED_SPLIT_RUNTIME_CONTRACT_VERSION,
         "logical_split_id": str(logical_split_id),
         "trace_signature": str(trace_signature or ""),
         "trace_device_type": str(trace_device_type or ""),
@@ -645,7 +636,6 @@ def _runtime_identity_payload(
         "input_tensor_shape": [int(dim) for dim in list(input_tensor_shape or [])],
         "input_resize_mode": str(input_resize_mode or "direct_resize"),
         "runtime_version": "",
-        "adapter_version": "",
         "split_plan_hash": "",
         "symbolic_input_schema_hash": "",
         "dynamic_batch": None,
@@ -673,7 +663,6 @@ def feature_layout_matches(
 
 @dataclass
 class SplitRuntimeContract:
-    contract_version: str
     contract_id: str
     edge_id: str
     model_id: str
@@ -778,7 +767,6 @@ class SplitRuntimeContract:
         )
         abi_id = feature_abi_id(abi_spec)
         return cls(
-            contract_version=SPLIT_RUNTIME_CONTRACT_VERSION,
             contract_id=identity_id,
             edge_id=str(edge_id),
             model_id=str(model_id),
@@ -846,7 +834,6 @@ class SplitRuntimeContract:
             if isinstance(item, Mapping)
         ]
         return cls(
-            contract_version=str(payload.get("contract_version") or SPLIT_RUNTIME_CONTRACT_VERSION),
             contract_id=str(payload.get("contract_id") or identity_id),
             edge_id=str(payload["edge_id"]),
             model_id=str(payload["model_id"]),
@@ -920,9 +907,7 @@ class SplitRuntimeContract:
 
 
 __all__ = [
-    "FIXED_SPLIT_RUNTIME_CONTRACT_VERSION",
     "FeatureAbiSpec",
-    "SPLIT_RUNTIME_CONTRACT_VERSION",
     "SplitRuntimeContract",
     "build_feature_abi_spec",
     "build_runtime_contract",

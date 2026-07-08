@@ -22,9 +22,11 @@ from common.experiment_results import (
     EKYA_METHOD,
     PLANK_ROAD_METHOD,
     PURE_EDGE_METHOD,
+    ExperimentIdentity,
     ExperimentJsonlWriter,
     collect_edge_artifacts,
     edge_run_dir,
+    normalize_scenario_slug,
 )
 from common.logging_sanitizer import log_diagnostic_debug, summarize_path
 from common.video_identity import (
@@ -32,13 +34,12 @@ from common.video_identity import (
     is_remote_video_source,
     resolve_video_identity,
 )
-from config import default_run_id, load_runtime_config
+from config import load_runtime_config
 from config.baseline import validate_baseline_method
 from edge.box_motion import compensate_boxes_between_frames
 from edge.edge_worker import EdgeWorker
 from edge.experiment_result_uploader import ExperimentResultUploader
 from edge.info import TASK_STATE
-from edge.pure_edge_remote_sync import PureEdgeRemoteSyncer, PureEdgeRemoteSyncError
 from edge.replay_frame_archiver import ReplayFrameArchiver
 from edge.task import Task
 from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
@@ -300,22 +301,41 @@ def _experiment_method_for_runtime(method: str | None) -> str:
     return EKYA_METHOD if str(method or "") == EKYA_STYLE_METHOD else str(method or "")
 
 
+def _create_experiment_identity(
+    *,
+    experiment_id: str | None,
+    scenario: str | None,
+    edge_count: int | str | None,
+    repeat: int | str | None,
+    method: str,
+    run_id: str | None,
+    video_identity: VideoIdentity,
+) -> ExperimentIdentity:
+    scenario_slug = (
+        normalize_scenario_slug(scenario)
+        if str(scenario or "").strip()
+        else normalize_scenario_slug(video_identity.scenario_name or video_identity.video_slug)
+    )
+    return ExperimentIdentity.create(
+        experiment_id=str(experiment_id or "default_experiment"),
+        scenario_slug=scenario_slug,
+        edge_count=1 if edge_count is None else edge_count,
+        repeat=1 if repeat is None else repeat,
+        method=method,
+        run_id=run_id,
+    )
+
+
 def _experiment_result_upload_enabled(
     *,
     mode: str,
     baseline_method: str | None,
     experiment_results: object,
-    disable_experiment_result_upload: bool,
 ) -> bool:
     pure_edge_local = (
         str(mode) == "baseline" and str(baseline_method or "") == PURE_EDGE_METHOD
     )
-    return bool(
-        getattr(experiment_results, "upload_to_cloud", False)
-        and getattr(experiment_results, "upload_on_shutdown", False)
-        and not bool(disable_experiment_result_upload)
-        and not pure_edge_local
-    )
+    return bool(getattr(experiment_results, "enabled", False) and not pure_edge_local)
 
 
 def _upload_experiment_run_artifacts_if_enabled(
@@ -324,8 +344,7 @@ def _upload_experiment_run_artifacts_if_enabled(
     mode: str,
     baseline_method: str | None,
     experiment_results: object,
-    disable_experiment_result_upload: bool,
-    comparison_id: str,
+    identity: ExperimentIdentity,
     run_id: str,
     method: str,
     edge_id: int,
@@ -336,38 +355,20 @@ def _upload_experiment_run_artifacts_if_enabled(
         mode=mode,
         baseline_method=baseline_method,
         experiment_results=experiment_results,
-        disable_experiment_result_upload=disable_experiment_result_upload,
     ):
         return False
     uploader = uploader_cls(str(server_ip), enabled=True)
     return bool(
         uploader.upload_run_artifacts(
-            comparison_id=comparison_id,
+            experiment_id=identity.experiment_id,
+            scenario_slug=identity.scenario_slug,
+            edge_count=identity.edge_count,
+            repeat=identity.repeat,
             run_id=run_id,
             method=method,
             edge_id=int(edge_id),
             artifacts=artifacts,
         )
-    )
-
-
-def _sync_pure_edge_results(
-    *,
-    experiment_results: object,
-    local_run_dir: Path,
-    comparison_id: str,
-    run_id: str,
-    method: str,
-    edge_id: int,
-    syncer_cls=PureEdgeRemoteSyncer,
-) -> str:
-    syncer = syncer_cls(experiment_results)
-    return syncer.sync_run_dir(
-        local_run_dir=local_run_dir,
-        comparison_id=comparison_id,
-        method=method,
-        edge_id=int(edge_id),
-        run_id=run_id,
     )
 
 
@@ -398,16 +399,6 @@ def _configure_baseline_client_runtime(config, baseline_config) -> str:
     if policy == "disabled":
         logger.info("[BaselineEdge] split_runtime_policy=disabled; fixed-split runtime skipped.")
     return policy
-
-
-def _resolve_baseline_run_id(baseline_method: str, run_id: str | None) -> str | None:
-    value = str(run_id or "").strip()
-    if _baseline_requires_cloud(baseline_method) and not value:
-        raise ValueError(
-            "--run_id is required for cloud-backed baseline mode so every edge "
-            "joins the same cloud run"
-        )
-    return value or None
 
 
 def _prepare_experiment_run_dir(run_dir: Path, *, enabled: bool) -> None:
@@ -761,7 +752,7 @@ def _write_edge_summary(
     path: Path,
     *,
     config,
-    comparison_id: str,
+    identity: ExperimentIdentity,
     method: str,
     run_id: str,
     sampled_frame_count: int,
@@ -775,7 +766,10 @@ def _write_edge_summary(
         edge,
     )
     payload = {
-        "comparison_id": comparison_id,
+        "experiment_id": identity.experiment_id,
+        "scenario_slug": identity.scenario_slug,
+        "edge_count": identity.edge_count,
+        "repeat": identity.repeat,
         "run_id": run_id,
         "method": method,
         "edge_id": int(config.edge_id),
@@ -836,7 +830,6 @@ def _write_trigger_manifest_from_metrics(run_dir: Path) -> None:
     (run_dir / "trigger_manifest.json").write_text(
         json.dumps(
             {
-                "schema_version": "experiment-trigger-manifest.v1",
                 "decision_count": len(decisions),
                 "decisions": decisions,
             },
@@ -1178,17 +1171,15 @@ if __name__ == "__main__":
     )
     parser.add_argument("--mode", choices=("main", "baseline"), default="main")
     parser.add_argument("--baseline_method", default=None, help="baseline method for baseline mode")
-    parser.add_argument("--run_id", default=None, help="experiment run id")
-    parser.add_argument("--comparison_id", default=None, help="experiment comparison id")
+    parser.add_argument("--run_id", default=None, help="optional experiment run id override")
+    parser.add_argument("--experiment_id", default=None, help="experiment id")
+    parser.add_argument("--scenario", default=None, help="experiment scenario slug/name")
+    parser.add_argument("--edge_count", type=int, default=1, help="number of edge devices")
+    parser.add_argument("--repeat", default=1, help="repeat index, e.g. 1 or r01")
     parser.add_argument(
         "--experiment_results_root",
         default=None,
         help="override edge local experiment result staging root",
-    )
-    parser.add_argument(
-        "--disable_experiment_result_upload",
-        action="store_true",
-        help="disable shutdown experiment artifact upload without disabling local results",
     )
     args = parser.parse_args()
     if args.baseline_method == EKYA_STYLE_METHOD and args.mode != "baseline":
@@ -1200,8 +1191,6 @@ if __name__ == "__main__":
         getattr(runtime_config.server, "golden", "") or ""
     )
     experiment_results = runtime_config.experiment_results
-    if args.comparison_id is not None:
-        experiment_results.comparison_id = args.comparison_id
     if args.experiment_results_root is not None:
         experiment_results.local_root_dir = args.experiment_results_root
 
@@ -1229,28 +1218,36 @@ if __name__ == "__main__":
         except ValueError as exc:
             parser.error(str(exc))
 
-    if args.mode == "baseline":
-        try:
-            baseline_run_id = _resolve_baseline_run_id(
-                baseline_method,
-                args.run_id or runtime_config.baseline.run_id,
-            )
-        except ValueError as exc:
-            parser.error(str(exc))
-        if baseline_run_id is None:
-            baseline_run_id = default_run_id(baseline_method)
-
     require_server_ip = args.mode == "main" or _baseline_requires_cloud(baseline_method)
     try:
         _validate_startup_config(config, require_server_ip=require_server_ip)
     except (FileNotFoundError, ValueError) as exc:
         parser.error(str(exc))
 
+    method = (
+        _experiment_method_for_runtime(baseline_method)
+        if args.mode == "baseline"
+        else PLANK_ROAD_METHOD
+    )
+    video_identity = _resolve_video_identity(config)
+    experiment_identity = _create_experiment_identity(
+        experiment_id=args.experiment_id,
+        scenario=args.scenario,
+        edge_count=args.edge_count,
+        repeat=args.repeat,
+        method=method,
+        run_id=args.run_id,
+        video_identity=video_identity,
+    )
+    run_id = experiment_identity.run_id
+    config.experiment_identity = experiment_identity
+    if args.mode == "baseline":
+        baseline_run_id = run_id
+
     baseline_adapter = None
     if args.mode == "baseline":
         runtime_config.baseline.enabled = True
         runtime_config.baseline.method = baseline_method
-        runtime_config.baseline.run_id = baseline_run_id
         logger.add(
             f"log/client/baseline_{baseline_method}_edge_{config.edge_id}_{{time}}.log",
             level="INFO",
@@ -1273,7 +1270,7 @@ if __name__ == "__main__":
         logger.info(
             "baseline edge effective startup config: run_id={}, baseline_method={}, "
             "edge_id={}, server_ip={}, video_source={}, split_learning={}",
-            runtime_config.baseline.run_id or "<auto-local>",
+            run_id,
             baseline_method,
             config.edge_id,
             config.server_ip,
@@ -1295,18 +1292,6 @@ if __name__ == "__main__":
             rotation="500 MB",
         )
 
-    method = (
-        _experiment_method_for_runtime(baseline_method)
-        if args.mode == "baseline"
-        else PLANK_ROAD_METHOD
-    )
-    run_id = (
-        str(baseline_run_id)
-        if args.mode == "baseline"
-        else str(args.run_id or default_run_id(PLANK_ROAD_METHOD))
-    )
-    comparison_id = str(experiment_results.comparison_id)
-    video_identity = _resolve_video_identity(config)
     preserve_cache_entries = {"pytest_tmp"}
     if bool(getattr(getattr(config, "split_learning", None), "enabled", False)):
         preserve_cache_entries.add("fixed_split_plan.json")
@@ -1325,7 +1310,10 @@ if __name__ == "__main__":
             if bool(experiment_results.enabled):
                 run_dir = edge_run_dir(
                     str(experiment_results.local_root_dir),
-                    comparison_id,
+                    experiment_identity.experiment_id,
+                    experiment_identity.scenario_slug,
+                    experiment_identity.edge_count,
+                    experiment_identity.repeat,
                     method,
                     int(config.edge_id),
                     run_id,
@@ -1334,12 +1322,6 @@ if __name__ == "__main__":
                     run_dir,
                     enabled=True,
                 )
-                if bool(getattr(experiment_results, "include_runtime_logs", False)):
-                    experiment_log_sink = logger.add(
-                        str(run_dir / "edge.log"),
-                        level="INFO",
-                        rotation="500 MB",
-                    )
             display_events_path = _run_ekya_style_edge_stream(
                 runtime_config=runtime_config,
                 config=config,
@@ -1349,21 +1331,23 @@ if __name__ == "__main__":
             )
             if run_dir is not None and bool(experiment_results.enabled):
                 sampled_frame_count = _count_csv_records(display_events_path)
-                if bool(getattr(experiment_results, "include_edge_summary", True)):
-                    _write_edge_summary(
-                        run_dir / "edge_summary.json",
-                        config=config,
-                        comparison_id=comparison_id,
-                        method=method,
-                        run_id=run_id,
-                        sampled_frame_count=sampled_frame_count,
-                        video_identity=video_identity,
-                    )
+                _write_edge_summary(
+                    run_dir / "edge_summary.json",
+                    config=config,
+                    identity=experiment_identity,
+                    method=method,
+                    run_id=run_id,
+                    sampled_frame_count=sampled_frame_count,
+                    video_identity=video_identity,
+                )
                 artifacts = collect_edge_artifacts(
                     method=method,
                     run_id=run_id,
                     edge_id=int(config.edge_id),
-                    comparison_id=comparison_id,
+                    experiment_id=experiment_identity.experiment_id,
+                    scenario_slug=experiment_identity.scenario_slug,
+                    edge_count=experiment_identity.edge_count,
+                    repeat=experiment_identity.repeat,
                     config=experiment_results,
                     inference_result_path=run_dir / "latest_cloud_inference_results.jsonl",
                     baseline_metrics_path=None,
@@ -1374,8 +1358,7 @@ if __name__ == "__main__":
                     mode=args.mode,
                     baseline_method=baseline_method,
                     experiment_results=experiment_results,
-                    disable_experiment_result_upload=args.disable_experiment_result_upload,
-                    comparison_id=comparison_id,
+                    identity=experiment_identity,
                     run_id=run_id,
                     method=method,
                     edge_id=int(config.edge_id),
@@ -1390,7 +1373,10 @@ if __name__ == "__main__":
 
     run_dir = edge_run_dir(
         str(experiment_results.local_root_dir),
-        comparison_id,
+        experiment_identity.experiment_id,
+        experiment_identity.scenario_slug,
+        experiment_identity.edge_count,
+        experiment_identity.repeat,
         method,
         int(config.edge_id),
         run_id,
@@ -1407,19 +1393,13 @@ if __name__ == "__main__":
     )
     config.experiment_metrics_writer = experiment_metrics
     experiment_log_sink = None
-    if bool(experiment_results.include_runtime_logs):
-        experiment_log_sink = logger.add(
-            str(run_dir / "edge.log"),
-            level="INFO",
-            rotation="500 MB",
-        )
 
     edge = EdgeWorker(config)
     if args.mode == "baseline":
         baseline_adapter = BaselineEdgeAdapter(
             config=config,
             baseline_method=baseline_method,
-            run_id=runtime_config.baseline.run_id,
+            run_id=run_id,
             edge_id=int(config.edge_id),
             server_ip=str(config.server_ip),
             cache_path=str(config.retrain.cache_path),
@@ -1461,22 +1441,19 @@ if __name__ == "__main__":
         if baseline_adapter is not None:
             baseline_adapter.close()
         edge.close()
-        pure_edge_sync_error: PureEdgeRemoteSyncError | None = None
         try:
-            if bool(experiment_results.include_trigger_manifest):
-                _write_trigger_manifest_from_metrics(run_dir)
-            if bool(experiment_results.include_edge_summary):
-                _write_edge_summary(
-                    run_dir / "edge_summary.json",
-                    config=config,
-                    comparison_id=comparison_id,
-                    method=method,
-                    run_id=run_id,
-                    sampled_frame_count=sampled_frame_count,
-                    video_identity=video_identity,
-                    replay_snapshot_failures=replay_archiver.failures,
-                    edge=edge,
-                )
+            _write_trigger_manifest_from_metrics(run_dir)
+            _write_edge_summary(
+                run_dir / "edge_summary.json",
+                config=config,
+                identity=experiment_identity,
+                method=method,
+                run_id=run_id,
+                sampled_frame_count=sampled_frame_count,
+                video_identity=video_identity,
+                replay_snapshot_failures=replay_archiver.failures,
+                edge=edge,
+            )
             baseline_metrics_path = (
                 Path(baseline_adapter.metrics_path)
                 if baseline_adapter is not None
@@ -1487,7 +1464,10 @@ if __name__ == "__main__":
                     method=method,
                     run_id=run_id,
                     edge_id=int(config.edge_id),
-                    comparison_id=comparison_id,
+                    experiment_id=experiment_identity.experiment_id,
+                    scenario_slug=experiment_identity.scenario_slug,
+                    edge_count=experiment_identity.edge_count,
+                    repeat=experiment_identity.repeat,
                     config=experiment_results,
                     inference_result_path=result_path,
                     baseline_metrics_path=baseline_metrics_path,
@@ -1498,25 +1478,12 @@ if __name__ == "__main__":
                     mode=args.mode,
                     baseline_method=baseline_method,
                     experiment_results=experiment_results,
-                    disable_experiment_result_upload=args.disable_experiment_result_upload,
-                    comparison_id=comparison_id,
+                    identity=experiment_identity,
                     run_id=run_id,
                     method=method,
                     edge_id=int(config.edge_id),
                     artifacts=artifacts,
                 )
-                if args.mode == "baseline" and baseline_method == PURE_EDGE_METHOD:
-                    _sync_pure_edge_results(
-                        experiment_results=experiment_results,
-                        local_run_dir=run_dir,
-                        comparison_id=comparison_id,
-                        run_id=run_id,
-                        method=method,
-                        edge_id=int(config.edge_id),
-                    )
-        except PureEdgeRemoteSyncError as exc:
-            logger.error("Pure Edge experiment result upload failed: {}", exc)
-            pure_edge_sync_error = exc
         except Exception as exc:
             logger.warning("Experiment result archival failed during shutdown: {}", exc)
         finally:
@@ -1524,5 +1491,3 @@ if __name__ == "__main__":
                 logger.remove(experiment_log_sink)
             if not args.headless:
                 cv2.destroyAllWindows()
-        if pure_edge_sync_error is not None:
-            raise pure_edge_sync_error

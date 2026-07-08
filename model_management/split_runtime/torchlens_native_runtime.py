@@ -8,8 +8,6 @@ import torch
 import torchlens as tl
 
 from .torchlens_forward_guard import torchlens_forward_guard
-
-TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION = "plank-road-torchlens-native-runtime-v2"
 DEFAULT_SPLIT_MODE = "generated_eager"
 BoundaryPayload = tl.ReplayBoundary
 ReplayBoundary = tl.ReplayBoundary
@@ -312,7 +310,6 @@ __all__ = [
     "SplitRuntimeConfig",
     "SplitSpec",
     "SplitCandidateMetadata",
-    "TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION",
     "build_replay_runtime",
     "build_split_runtime",
     "get_split_runtime_metadata",

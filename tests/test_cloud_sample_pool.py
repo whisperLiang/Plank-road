@@ -1050,7 +1050,6 @@ def test_npy_shard_file_validation_uses_fs_path_for_shard_dir(monkeypatch) -> No
     raw_dir = r"C:\very\long\feature\shard"
     leaf_path = os.path.join(raw_dir, "boundary.npy")
     metadata = FeatureShardMetadata(
-        format_version="feature-shard.v1",
         storage_format=NPY_MEMMAP_SHARD,
         model_id="model-a",
         model_family="test",

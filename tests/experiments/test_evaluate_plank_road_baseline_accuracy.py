@@ -8,30 +8,60 @@ import yaml
 
 from tools.experiments.evaluate_plank_road_baseline_accuracy import evaluate_accuracy
 
+METHODS = [
+    "plank_road",
+    "pure_edge_local_updating",
+    "accuracy_trigger_cloud_retraining",
+]
+PLANK_RUN_ID = "road_n1_r01_plank_road"
+
+
+def _raw_dir(method: str, kind: str) -> Path:
+    return (
+        Path("raw_logs")
+        / "scenario=road"
+        / "edges=n1"
+        / "repeat=r01"
+        / f"method={method}"
+        / kind
+    )
+
+
+def _write_manifest(
+    comparison_dir: Path,
+    *,
+    metrics: dict | None = None,
+) -> Path:
+    payload = {
+        "experiment_id": "comparison-test",
+        "log_timezone": "Asia/Shanghai",
+        "methods": METHODS,
+        "student_model": "rfdetr_nano",
+        "teacher_model": "rtdetr_x",
+        "scenarios": [
+            {
+                "scenario_name": "road",
+                "scenario_slug": "road",
+                "video_path": "road.mp4",
+            }
+        ],
+        "edge_counts": [1],
+        "repeats": [1],
+        "edge_ids_by_count": {"1": [1]},
+        "metrics": metrics or {},
+    }
+    manifest_path = comparison_dir / "manifest.yaml"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    return manifest_path
+
 
 def _write_coco_eval_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
     comparison_dir = tmp_path / "comparison"
-    runs = []
-    for method, run_id in (
-        ("plank_road", "main-r1"),
-        ("pure_edge_local_updating", "pure-r1"),
-        ("accuracy_trigger_cloud_retraining", "accuracy-r1"),
-    ):
-        edge_path = f"raw_logs/{method}/edge_1/{run_id}"
-        raw_logs = {"edges": {"1": edge_path}}
+    for method in METHODS:
+        edge_path = _raw_dir(method, "edge_1")
         if method != "pure_edge_local_updating":
-            cloud_path = f"raw_logs/{method}/cloud/{run_id}"
-            raw_logs["cloud"] = cloud_path
-            (comparison_dir / cloud_path).mkdir(parents=True, exist_ok=True)
-        runs.append(
-            {
-                "run_id": run_id,
-                "method": method,
-                "scenario_name": "road",
-                "edge_ids": [1],
-                "raw_logs": raw_logs,
-            }
-        )
+            (comparison_dir / _raw_dir(method, "cloud")).mkdir(parents=True, exist_ok=True)
         prediction_path = comparison_dir / edge_path / "latest_inference_results.jsonl"
         prediction_path.parent.mkdir(parents=True, exist_ok=True)
         prediction_path.write_text(
@@ -48,18 +78,7 @@ def _write_coco_eval_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
             + "\n",
             encoding="utf-8",
         )
-    manifest = {
-        "comparison_id": "comparison-test",
-        "log_timezone": "Asia/Shanghai",
-        "methods": [run["method"] for run in runs],
-        "student_model": "rfdetr_nano",
-        "teacher_model": "rtdetr_x",
-        "scenarios": [{"name": "road", "video_source": "road.mp4"}],
-        "runs": runs,
-        "metrics": {},
-    }
-    manifest_path = comparison_dir / "manifest.yaml"
-    manifest_path.write_text(yaml.safe_dump(manifest, sort_keys=False), encoding="utf-8")
+    manifest_path = _write_manifest(comparison_dir)
     ground_truth_path = comparison_dir / "ground_truth_coco.json"
     ground_truth_path.write_text(
         json.dumps(
@@ -82,27 +101,10 @@ def _write_coco_eval_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
 
 def test_evaluator_builds_real_precomputed_f1_file(tmp_path: Path) -> None:
     comparison_dir = tmp_path / "comparison"
-    runs = []
-    for method, run_id in (
-        ("plank_road", "main-r1"),
-        ("pure_edge_local_updating", "pure-r1"),
-        ("accuracy_trigger_cloud_retraining", "accuracy-r1"),
-    ):
-        edge_path = f"raw_logs/{method}/edge_1/{run_id}"
-        raw_logs = {"edges": {"1": edge_path}}
+    for method in METHODS:
+        edge_path = _raw_dir(method, "edge_1")
         if method != "pure_edge_local_updating":
-            cloud_path = f"raw_logs/{method}/cloud/{run_id}"
-            raw_logs["cloud"] = cloud_path
-            (comparison_dir / cloud_path).mkdir(parents=True, exist_ok=True)
-        runs.append(
-            {
-                "run_id": run_id,
-                "method": method,
-                "scenario_name": "road",
-                "edge_ids": [1],
-                "raw_logs": raw_logs,
-            }
-        )
+            (comparison_dir / _raw_dir(method, "cloud")).mkdir(parents=True, exist_ok=True)
         path = comparison_dir / edge_path / "latest_inference_results.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
@@ -121,24 +123,13 @@ def test_evaluator_builds_real_precomputed_f1_file(tmp_path: Path) -> None:
             encoding="utf-8",
         )
 
-    manifest = {
-        "comparison_id": "comparison-test",
-        "log_timezone": "Asia/Shanghai",
-        "methods": [run["method"] for run in runs],
-        "student_model": "rfdetr_nano",
-        "teacher_model": "rtdetr_x",
-        "scenarios": [{"name": "road", "video_source": "road.mp4"}],
-        "runs": runs,
-        "metrics": {
+    manifest_path = _write_manifest(
+        comparison_dir,
+        metrics={
             "accuracy_file": "accuracy.jsonl",
             "ground_truth_file": "ground_truth.json",
             "allow_missing_accuracy": False,
         },
-    }
-    manifest_path = comparison_dir / "manifest.yaml"
-    manifest_path.write_text(
-        yaml.safe_dump(manifest, sort_keys=False),
-        encoding="utf-8",
     )
     ground_truth_path = comparison_dir / "ground_truth.json"
     ground_truth_path.write_text(
@@ -168,7 +159,7 @@ def test_evaluator_builds_real_precomputed_f1_file(tmp_path: Path) -> None:
         for line in output_path.read_text(encoding="utf-8").splitlines()
     ]
     assert report["row_count"] == 3
-    assert {row["method"] for row in rows} == set(manifest["methods"])
+    assert {row["method"] for row in rows} == set(METHODS)
     assert all(row["f1"] == 1.0 for row in rows)
     assert all(row["map"] == "" for row in rows)
     assert all(row["timestamp_ms"] == 12500 for row in rows)
@@ -182,7 +173,7 @@ def test_evaluator_reports_unlabelled_frames_without_synthesizing_values(
     tmp_path: Path,
 ) -> None:
     comparison_dir = tmp_path / "comparison"
-    edge_path = comparison_dir / "raw_logs/plank_road/edge_1/main-r1"
+    edge_path = comparison_dir / _raw_dir("plank_road", "edge_1")
     edge_path.mkdir(parents=True)
     (edge_path / "latest_inference_results.jsonl").write_text(
         json.dumps(
@@ -194,58 +185,11 @@ def test_evaluator_reports_unlabelled_frames_without_synthesizing_values(
         + "\n",
         encoding="utf-8",
     )
-    runs = [
-        {
-            "run_id": "main-r1",
-            "method": "plank_road",
-            "scenario_name": "road",
-            "edge_ids": [1],
-            "raw_logs": {
-                "cloud": "raw_logs/plank_road/cloud/main-r1",
-                "edges": {"1": "raw_logs/plank_road/edge_1/main-r1"},
-            },
-        },
-        {
-            "run_id": "pure-r1",
-            "method": "pure_edge_local_updating",
-            "scenario_name": "road",
-            "edge_ids": [1],
-            "raw_logs": {
-                "edges": {"1": "raw_logs/pure_edge_local_updating/edge_1/pure-r1"}
-            },
-        },
-        {
-            "run_id": "accuracy-r1",
-            "method": "accuracy_trigger_cloud_retraining",
-            "scenario_name": "road",
-            "edge_ids": [1],
-            "raw_logs": {
-                "cloud": "raw_logs/accuracy_trigger_cloud_retraining/cloud/accuracy-r1",
-                "edges": {
-                    "1": "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1"
-                },
-            },
-        },
-    ]
-    for run in runs:
-        raw_logs = run["raw_logs"]
-        for value in [raw_logs.get("cloud"), *raw_logs["edges"].values()]:
-            if value:
-                (comparison_dir / value).mkdir(parents=True, exist_ok=True)
-    manifest = {
-        "comparison_id": "comparison-test",
-        "log_timezone": "Asia/Shanghai",
-        "methods": [
-            "plank_road",
-            "pure_edge_local_updating",
-            "accuracy_trigger_cloud_retraining",
-        ],
-        "scenarios": [{"name": "road", "video_source": "road.mp4"}],
-        "runs": runs,
-        "metrics": {},
-    }
-    manifest_path = comparison_dir / "manifest.yaml"
-    manifest_path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
+    for method in METHODS:
+        if method != "pure_edge_local_updating":
+            (comparison_dir / _raw_dir(method, "cloud")).mkdir(parents=True, exist_ok=True)
+        (comparison_dir / _raw_dir(method, "edge_1")).mkdir(parents=True, exist_ok=True)
+    manifest_path = _write_manifest(comparison_dir)
     ground_truth_path = comparison_dir / "ground_truth.json"
     ground_truth_path.write_text(
         json.dumps({"annotations": {"1": {"boxes": [], "labels": []}}}),
@@ -260,7 +204,7 @@ def test_evaluator_reports_unlabelled_frames_without_synthesizing_values(
     )
 
     assert report["row_count"] == 0
-    assert report["missing_ground_truth_frames"] == {"main-r1": [2]}
+    assert report["missing_ground_truth_frames"] == {PLANK_RUN_ID: [2]}
 
 
 def test_coco_ground_truth_requires_explicit_category_map(tmp_path: Path) -> None:

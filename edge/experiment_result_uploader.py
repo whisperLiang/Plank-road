@@ -9,9 +9,8 @@ from loguru import logger
 
 from common.experiment_results import (
     ArtifactContent,
+    ExperimentIdentity,
     content_type_for_path,
-    sanitize_component,
-    sanitize_method,
     sanitize_relative_path,
     sha256_bytes,
 )
@@ -33,7 +32,10 @@ class ExperimentResultUploader:
     def upload_run_artifacts(
         self,
         *,
-        comparison_id: str,
+        experiment_id: str,
+        scenario_slug: str,
+        edge_count: int | str,
+        repeat: int | str,
         run_id: str,
         method: str,
         edge_id: int,
@@ -41,9 +43,14 @@ class ExperimentResultUploader:
     ) -> bool:
         if not self.enabled:
             return False
-        resolved_comparison_id = sanitize_component(comparison_id)
-        resolved_run_id = sanitize_component(run_id)
-        resolved_method = sanitize_method(method)
+        identity = ExperimentIdentity.create(
+            experiment_id=experiment_id,
+            scenario_slug=scenario_slug,
+            edge_count=edge_count,
+            repeat=repeat,
+            method=method,
+            run_id=run_id,
+        )
         resolved_edge_id = int(edge_id)
         manifest_content = artifacts.get("uploaded_artifacts_manifest.json")
         upload_items = [
@@ -72,9 +79,12 @@ class ExperimentResultUploader:
                 else:
                     content = bytes(raw_content)
                 artifact = message_transmission_pb2.ExperimentResultArtifact(
-                    comparison_id=resolved_comparison_id,
-                    run_id=resolved_run_id,
-                    method=resolved_method,
+                    experiment_id=identity.experiment_id,
+                    scenario_slug=identity.scenario_slug,
+                    edge_count=identity.edge_count,
+                    repeat=identity.repeat,
+                    run_id=identity.run_id,
+                    method=identity.method,
                     edge_id=resolved_edge_id,
                     relative_path=safe_relative_path.as_posix(),
                     content=content,
@@ -84,9 +94,12 @@ class ExperimentResultUploader:
                     is_final=index == len(upload_items) - 1,
                 )
                 request = message_transmission_pb2.UploadExperimentResultRequest(
-                    comparison_id=resolved_comparison_id,
-                    run_id=resolved_run_id,
-                    method=resolved_method,
+                    experiment_id=identity.experiment_id,
+                    scenario_slug=identity.scenario_slug,
+                    edge_count=identity.edge_count,
+                    repeat=identity.repeat,
+                    run_id=identity.run_id,
+                    method=identity.method,
                     edge_id=resolved_edge_id,
                     artifacts=[artifact],
                 )
@@ -104,8 +117,8 @@ class ExperimentResultUploader:
             logger.info(
                 "Uploaded {} offline experiment artifact(s): method={} run_id={} edge={}",
                 len(upload_items),
-                resolved_method,
-                resolved_run_id,
+                identity.method,
+                identity.run_id,
                 resolved_edge_id,
             )
             return True

@@ -48,6 +48,131 @@ def sanitize_method(method: str) -> str:
     return value
 
 
+def normalize_scenario_slug(value: str) -> str:
+    raw = str(value or "").strip().lower().replace("_", "-")
+    normalized = "-".join(part for part in raw.replace(" ", "-").split("-") if part)
+    return sanitize_component(normalized)
+
+
+def normalize_edge_count(value: int | str) -> int:
+    edge_count = int(value)
+    if edge_count <= 0:
+        raise ValueError("edge_count must be a positive integer")
+    return edge_count
+
+
+def normalize_edge_id(value: int | str) -> int:
+    edge_id = int(value)
+    if edge_id <= 0:
+        raise ValueError("edge_id must be a positive integer")
+    return edge_id
+
+
+def normalize_edge_id_for_count(edge_id: int | str, edge_count: int | str) -> int:
+    resolved_edge_id = normalize_edge_id(edge_id)
+    resolved_edge_count = normalize_edge_count(edge_count)
+    if resolved_edge_id > resolved_edge_count:
+        raise ValueError("edge_id must be <= edge_count")
+    return resolved_edge_id
+
+
+def normalize_repeat(value: int | str) -> int:
+    raw = "" if value is None else str(value).strip().lower()
+    if raw.startswith("r"):
+        raw = raw[1:]
+    try:
+        repeat = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("repeat must be a positive integer") from exc
+    if repeat <= 0:
+        raise ValueError("repeat must be a positive integer")
+    return repeat
+
+
+def repeat_label(value: int | str) -> str:
+    return f"r{normalize_repeat(value):02d}"
+
+
+def edge_count_label(value: int | str) -> str:
+    return f"n{normalize_edge_count(value)}"
+
+
+def default_experiment_run_id(
+    *,
+    scenario_slug: str,
+    edge_count: int | str,
+    repeat: int | str,
+    method: str,
+) -> str:
+    return sanitize_component(
+        f"{normalize_scenario_slug(scenario_slug)}_"
+        f"{edge_count_label(edge_count)}_"
+        f"{repeat_label(repeat)}_"
+        f"{sanitize_method(method)}"
+    )
+
+
+@dataclass(frozen=True)
+class ExperimentIdentity:
+    experiment_id: str
+    scenario_slug: str
+    edge_count: int
+    repeat: int
+    method: str
+    run_id: str
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        experiment_id: str,
+        scenario_slug: str,
+        edge_count: int | str,
+        repeat: int | str,
+        method: str,
+        run_id: str | None = None,
+    ) -> "ExperimentIdentity":
+        resolved_method = sanitize_method(method)
+        resolved_scenario = normalize_scenario_slug(scenario_slug)
+        resolved_edge_count = normalize_edge_count(edge_count)
+        resolved_repeat = normalize_repeat(repeat)
+        resolved_run_id = (
+            sanitize_component(run_id)
+            if str(run_id or "").strip()
+            else default_experiment_run_id(
+                scenario_slug=resolved_scenario,
+                edge_count=resolved_edge_count,
+                repeat=resolved_repeat,
+                method=resolved_method,
+            )
+        )
+        return cls(
+            experiment_id=sanitize_component(experiment_id),
+            scenario_slug=resolved_scenario,
+            edge_count=resolved_edge_count,
+            repeat=resolved_repeat,
+            method=resolved_method,
+            run_id=resolved_run_id,
+        )
+
+    @property
+    def repeat_label(self) -> str:
+        return repeat_label(self.repeat)
+
+    @property
+    def edge_count_label(self) -> str:
+        return edge_count_label(self.edge_count)
+
+    def raw_logs_relative_dir(self) -> Path:
+        return (
+            Path("raw_logs")
+            / f"scenario={self.scenario_slug}"
+            / f"edges={self.edge_count_label}"
+            / f"repeat={self.repeat_label}"
+            / f"method={self.method}"
+        )
+
+
 def sanitize_relative_path(value: str) -> Path:
     raw = str(value or "").strip()
     if not raw:
@@ -62,54 +187,83 @@ def sanitize_relative_path(value: str) -> Path:
     return Path(*(sanitize_component(part) for part in path.parts))
 
 
-def experiment_root(root_dir: str, comparison_id: str) -> Path:
-    return Path(str(root_dir)).expanduser() / sanitize_component(comparison_id)
+def experiment_root(root_dir: str, experiment_id: str) -> Path:
+    return Path(str(root_dir)).expanduser() / sanitize_component(experiment_id)
 
 
-def cloud_run_dir(root_dir: str, comparison_id: str, method: str, run_id: str) -> Path:
-    return (
-        experiment_root(root_dir, comparison_id)
-        / "raw_logs"
-        / sanitize_method(method)
-        / "cloud"
-        / sanitize_component(run_id)
+def experiment_run_relative_dir(identity: ExperimentIdentity) -> Path:
+    return identity.raw_logs_relative_dir()
+
+
+def cloud_run_dir(
+    root_dir: str,
+    experiment_id: str,
+    scenario_slug: str,
+    edge_count: int | str,
+    repeat: int | str,
+    method: str,
+    run_id: str | None = None,
+) -> Path:
+    identity = ExperimentIdentity.create(
+        experiment_id=experiment_id,
+        scenario_slug=scenario_slug,
+        edge_count=edge_count,
+        repeat=repeat,
+        method=method,
+        run_id=run_id,
     )
+    return experiment_root(root_dir, identity.experiment_id) / identity.raw_logs_relative_dir() / "cloud"
 
 
 def edge_run_dir(
     root_dir: str,
-    comparison_id: str,
+    experiment_id: str,
+    scenario_slug: str,
+    edge_count: int | str,
+    repeat: int | str,
     method: str,
     edge_id: int,
-    run_id: str,
+    run_id: str | None = None,
 ) -> Path:
-    resolved_edge_id = int(edge_id)
-    if resolved_edge_id <= 0:
-        raise ValueError("edge_id must be a positive integer")
+    identity = ExperimentIdentity.create(
+        experiment_id=experiment_id,
+        scenario_slug=scenario_slug,
+        edge_count=edge_count,
+        repeat=repeat,
+        method=method,
+        run_id=run_id,
+    )
+    resolved_edge_id = normalize_edge_id_for_count(edge_id, identity.edge_count)
     return (
-        experiment_root(root_dir, comparison_id)
-        / sanitize_method(method)
+        experiment_root(root_dir, identity.experiment_id)
+        / identity.raw_logs_relative_dir()
         / f"edge_{resolved_edge_id}"
-        / sanitize_component(run_id)
     )
 
 
 def cloud_repository_edge_run_dir(
     root_dir: str,
-    comparison_id: str,
+    experiment_id: str,
+    scenario_slug: str,
+    edge_count: int | str,
+    repeat: int | str,
     method: str,
     edge_id: int,
-    run_id: str,
+    run_id: str | None = None,
 ) -> Path:
-    resolved_edge_id = int(edge_id)
-    if resolved_edge_id <= 0:
-        raise ValueError("edge_id must be a positive integer")
+    identity = ExperimentIdentity.create(
+        experiment_id=experiment_id,
+        scenario_slug=scenario_slug,
+        edge_count=edge_count,
+        repeat=repeat,
+        method=method,
+        run_id=run_id,
+    )
+    resolved_edge_id = normalize_edge_id_for_count(edge_id, identity.edge_count)
     return (
-        experiment_root(root_dir, comparison_id)
-        / "raw_logs"
-        / sanitize_method(method)
+        experiment_root(root_dir, identity.experiment_id)
+        / identity.raw_logs_relative_dir()
         / f"edge_{resolved_edge_id}"
-        / sanitize_component(run_id)
     )
 
 
@@ -128,10 +282,13 @@ class ExperimentJsonlWriter:
 
 @dataclass
 class ExperimentArtifactManifest:
-    comparison_id: str = ""
+    experiment_id: str = ""
     run_id: str = ""
     method: str = ""
     edge_id: int = 0
+    scenario_slug: str = ""
+    edge_count: int = 0
+    repeat: int = 0
     artifacts: list[dict[str, Any]] = field(default_factory=list)
 
     def add_file(
@@ -165,10 +322,13 @@ class ExperimentArtifactManifest:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "comparison_id": self.comparison_id,
+            "experiment_id": self.experiment_id,
             "run_id": self.run_id,
             "method": self.method,
             "edge_id": int(self.edge_id),
+            "scenario_slug": self.scenario_slug,
+            "edge_count": int(self.edge_count),
+            "repeat": int(self.repeat),
             "artifacts": list(self.artifacts),
         }
 
@@ -211,32 +371,44 @@ def collect_edge_artifacts(
     method: str,
     run_id: str,
     edge_id: int,
-    comparison_id: str,
+    experiment_id: str,
+    scenario_slug: str,
+    edge_count: int | str,
+    repeat: int | str,
     config: object,
     inference_result_path: Path,
     baseline_metrics_path: Path | None,
     cache_path: Path | None,
 ) -> dict[str, ArtifactContent]:
-    resolved_method = sanitize_method(method)
-    resolved_run_id = sanitize_component(run_id)
-    resolved_comparison_id = sanitize_component(comparison_id)
+    identity = ExperimentIdentity.create(
+        experiment_id=experiment_id,
+        scenario_slug=scenario_slug,
+        edge_count=edge_count,
+        repeat=repeat,
+        method=method,
+        run_id=run_id,
+    )
+    resolved_method = identity.method
     max_bytes = max(1, int(getattr(config, "max_artifact_bytes", 268435456)))
     manifest = ExperimentArtifactManifest(
-        comparison_id=resolved_comparison_id,
-        run_id=resolved_run_id,
+        experiment_id=identity.experiment_id,
+        run_id=identity.run_id,
         method=resolved_method,
         edge_id=int(edge_id),
+        scenario_slug=identity.scenario_slug,
+        edge_count=identity.edge_count,
+        repeat=identity.repeat,
     )
     candidates: list[tuple[str, Path | None, bool]] = [
         (
             "latest_inference_results.jsonl",
             Path(inference_result_path),
-            bool(getattr(config, "include_inference_results", True)),
+            True,
         ),
         (
             "metrics.jsonl" if resolved_method != PLANK_ROAD_METHOD else "edge_metrics.jsonl",
             Path(baseline_metrics_path) if baseline_metrics_path is not None else None,
-            bool(getattr(config, "include_baseline_metrics", True)),
+            True,
         ),
     ]
     run_dir = Path(inference_result_path).parent
@@ -245,28 +417,25 @@ def collect_edge_artifacts(
             (
                 "display_events.csv",
                 run_dir / "display_events.csv",
-                bool(getattr(config, "include_baseline_metrics", True)),
+                True,
             )
         )
     candidates.append(
         (
             "edge_summary.json",
             run_dir / "edge_summary.json",
-            bool(getattr(config, "include_edge_summary", True)),
+            True,
         )
     )
-    if bool(getattr(config, "include_trigger_manifest", True)):
-        trigger_candidates = [
-            run_dir / "trigger_manifest.json",
-            Path(cache_path) / "trigger_manifest.json" if cache_path is not None else None,
-        ]
-        trigger_path = next(
-            (path for path in trigger_candidates if path is not None and path.is_file()),
-            None,
-        )
-        candidates.append(("trigger_manifest.json", trigger_path, True))
-    if bool(getattr(config, "include_runtime_logs", False)):
-        candidates.append(("edge.log", run_dir / "edge.log", True))
+    trigger_candidates = [
+        run_dir / "trigger_manifest.json",
+        Path(cache_path) / "trigger_manifest.json" if cache_path is not None else None,
+    ]
+    trigger_path = next(
+        (path for path in trigger_candidates if path is not None and path.is_file()),
+        None,
+    )
+    candidates.append(("trigger_manifest.json", trigger_path, True))
     candidates.extend(
         (path.name, path, True) for path in sorted(run_dir.glob("replay_frames_*.zip"))
     )

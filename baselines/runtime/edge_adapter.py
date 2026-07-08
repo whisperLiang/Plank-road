@@ -59,9 +59,12 @@ class BaselineEdgeAdapter:
             self.training_strategy = str(policy_training_strategy or "surgeon_tta")
         self.trainable_param_ratio = _trainable_param_ratio(method_cfg)
         experiment_results = getattr(config, "experiment_results", None)
+        experiment_identity = getattr(config, "experiment_identity", None)
         mirror_path = None
-        if experiment_results is not None and bool(
-            getattr(experiment_results, "enabled", False)
+        if (
+            experiment_results is not None
+            and experiment_identity is not None
+            and bool(getattr(experiment_results, "enabled", False))
         ):
             mirror_path = (
                 edge_run_dir(
@@ -72,7 +75,10 @@ class BaselineEdgeAdapter:
                             "cache/experiment_results",
                         )
                     ),
-                    str(getattr(experiment_results, "comparison_id", "")),
+                    str(experiment_identity.experiment_id),
+                    str(experiment_identity.scenario_slug),
+                    int(experiment_identity.edge_count),
+                    int(experiment_identity.repeat),
                     self.baseline_method,
                     self.edge_id,
                     self.run_id,
@@ -80,9 +86,7 @@ class BaselineEdgeAdapter:
                 / "metrics.jsonl"
             )
         self.metrics = DistributedMetricsWriter(
-            results_root=str(
-                getattr(baseline_cfg, "results_root", "results/baselines_distributed")
-            ),
+            results_root="results/baselines_distributed",
             run_id=self.run_id,
             baseline_method=self.baseline_method,
             edge_id=self.edge_id,

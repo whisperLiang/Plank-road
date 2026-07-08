@@ -26,8 +26,7 @@ from cloud.feature_cache.types import (
 )
 from model_management.payload import BoundaryPayload
 
-SHARD_FORMAT_VERSION = "feature-shard.v2"
-SAMPLE_AXIS_STORAGE_LAYOUT = "sample_axis_v2"
+SAMPLE_AXIS_STORAGE_LAYOUT = "sample_axis"
 
 
 def _sanitize_segment(value: object) -> str:
@@ -275,7 +274,6 @@ class FeatureShardWriter:
     def _base_dir(self, runtime_context: Mapping[str, Any], generation: str) -> str:
         return os.path.join(
             self.root_dir,
-            SHARD_FORMAT_VERSION,
             _sanitize_segment(runtime_context.get("model_id")),
             _sanitize_segment(runtime_context.get("feature_layout_id")),
             _sanitize_segment(generation),
@@ -412,7 +410,6 @@ class FeatureShardWriter:
                 "schema": spec,
             }
         metadata = FeatureShardMetadata(
-            format_version=SHARD_FORMAT_VERSION,
             storage_format=self.storage_format,
             model_id=str(runtime_context.get("model_id") or ""),
             model_family=str(runtime_context.get("model_family") or ""),

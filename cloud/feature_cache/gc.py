@@ -14,7 +14,6 @@ from cloud.feature_cache.shard_reachability import (
     collect_refs_from_pending_feature_rebuild,
     collect_refs_from_pending_high_quality,
 )
-from cloud.feature_cache.shard_writer import SHARD_FORMAT_VERSION
 from cloud.feature_cache.types import FeatureCacheGCResult
 
 
@@ -36,7 +35,7 @@ class FeatureCacheGC:
         dry_run: bool = False,
     ) -> None:
         self.store_root_dir = os.path.abspath(str(store_root_dir))
-        self.version_root = os.path.join(self.store_root_dir, SHARD_FORMAT_VERSION)
+        self.version_root = self.store_root_dir
         self.view_root_dir = (
             None if view_root_dir in (None, "") else os.path.abspath(str(view_root_dir))
         )

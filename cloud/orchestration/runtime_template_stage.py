@@ -448,7 +448,6 @@ class FixedSplitRuntimeTemplateMixin:
         )
         return _json_fingerprint(
             {
-                "plan_version": str(split_plan.get("plan_version") or ""),
                 "canonical_split_key": canonical_split_key,
                 "logical_split_id": str(runtime_contract.get("logical_split_id") or ""),
                 "boundary_tensor_labels": [

@@ -98,7 +98,6 @@ def _key_for_sample(
     if sample.get("input_image_size") is not None:
         preprocessing["input_image_size"] = list(sample.get("input_image_size") or [])
     return FeatureCacheKey(
-        cache_version=str(_runtime_value(runtime_context, "cache_version", "feature-shard-key.v1")),
         sample_id=sample_key,
         image_sha1=(
             None if sample.get("image_sha1") in (None, "") else str(sample.get("image_sha1"))

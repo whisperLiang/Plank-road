@@ -15,8 +15,6 @@ from cloud.feature_cache import FeatureShardRef, FeatureShardStore
 from edge.sample_quality import HIGH_QUALITY, LOW_QUALITY, QUALITY_METHOD
 from model_management.payload import BoundaryPayload
 
-SAMPLE_STORE_VERSION = "edge-sample-store.v2"
-
 
 def _atomic_json_dump(path: str, payload: dict[str, Any]) -> None:
     directory = os.path.dirname(path)
@@ -309,7 +307,6 @@ class EdgeSampleStore:
             _atomic_json_dump(
                 self.manifest_path,
                 {
-                    "schema_version": SAMPLE_STORE_VERSION,
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 },
             )

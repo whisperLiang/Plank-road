@@ -5,7 +5,6 @@ import torchlens as tl
 from torch import nn
 
 from model_management.split_runtime import (
-    TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION,
     get_split_runtime_metadata,
     make_runtime_cache_key,
     make_split_spec,
@@ -243,7 +242,7 @@ def test_runtime_cache_key_ignores_device_for_split_abi() -> None:
     )
     payload = key.as_dict()
 
-    assert payload["adapter_version"] == TORCHLENS_NATIVE_RUNTIME_ADAPTER_VERSION
+    assert "adapter_version" not in payload
     assert "device" not in payload
     assert "runtime_identity_id" not in payload
     assert "runtime_batch_validation_signature" not in payload

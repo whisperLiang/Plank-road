@@ -110,7 +110,6 @@ def boundary_payload_from_tensors(
     weight_version: int | None = None,
     supports_prefix_backward: bool = False,
     prefix_backward_owner_id: str | None = None,
-    protocol_version: int | None = 2,
     metadata: Mapping[str, Any] | None = None,
 ) -> BoundaryPayload:
     ordered = OrderedDict(
@@ -131,6 +130,7 @@ def boundary_payload_from_tensors(
         }
     batch = _metadata_batch_size(ordered, batch_size)
     meta = dict(metadata or {})
+    meta.pop("protocol_version", None)
     meta.update(
         {
             "split_id": str(split_id),
@@ -142,7 +142,6 @@ def boundary_payload_from_tensors(
             "weight_version": weight_version,
             "supports_prefix_backward": bool(supports_prefix_backward),
             "prefix_backward_owner_id": prefix_backward_owner_id,
-            "protocol_version": 2 if protocol_version is None else int(protocol_version),
         }
     )
     return ReplayBoundary(tensors=dict(ordered), spec=spec, metadata=meta)

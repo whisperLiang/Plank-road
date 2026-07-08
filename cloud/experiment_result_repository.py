@@ -14,12 +14,12 @@ from loguru import logger
 from common.experiment_results import (
     EXPERIMENT_METHODS,
     PURE_EDGE_METHOD,
+    ExperimentIdentity,
     ExperimentJsonlWriter,
     cloud_repository_edge_run_dir,
     cloud_run_dir,
     experiment_root,
-    sanitize_component,
-    sanitize_method,
+    normalize_edge_id_for_count,
     sanitize_relative_path,
     sha256_bytes,
 )
@@ -57,154 +57,163 @@ class CloudExperimentManifestWriter:
         self,
         *,
         root_dir: str,
-        comparison_id: str,
+        experiment_id: str,
         student_model: str = "",
         teacher_model: str = "",
         log_timezone: str = "",
     ) -> None:
         self.root_dir = str(root_dir)
-        self.comparison_id = sanitize_component(comparison_id)
+        self.experiment_id = ExperimentIdentity.create(
+            experiment_id=experiment_id,
+            scenario_slug="default",
+            edge_count=1,
+            repeat=1,
+            method=EXPERIMENT_METHODS[0],
+        ).experiment_id
         self.student_model = str(student_model or "")
         self.teacher_model = str(teacher_model or "")
         self.log_timezone = str(log_timezone or detect_log_timezone())
-        self.comparison_dir = experiment_root(self.root_dir, self.comparison_id)
-        self.manifest_path = self.comparison_dir / "manifest.yaml"
-        self.index_path = self.comparison_dir / "experiment_index.json"
+        self.experiment_dir = experiment_root(self.root_dir, self.experiment_id)
+        self.manifest_path = self.experiment_dir / "manifest.yaml"
+        self.index_path = self.experiment_dir / "experiment_index.json"
         self._lock = threading.RLock()
 
-    def upsert_cloud_runtime(self, *, method: str, run_id: str) -> None:
-        resolved_method = sanitize_method(method)
-        if resolved_method == PURE_EDGE_METHOD:
+    def upsert_cloud_runtime(
+        self,
+        *,
+        method: str,
+        scenario_slug: str,
+        edge_count: int | str,
+        repeat: int | str,
+        run_id: str | None = None,
+    ) -> None:
+        identity = ExperimentIdentity.create(
+            experiment_id=self.experiment_id,
+            scenario_slug=scenario_slug,
+            edge_count=edge_count,
+            repeat=repeat,
+            method=method,
+            run_id=run_id,
+        )
+        if identity.method == PURE_EDGE_METHOD:
             return
         self._upsert(
-            method=resolved_method,
-            run_id=sanitize_component(run_id),
+            identity=identity,
             edge_id=None,
             summary={},
-            include_cloud=True,
         )
 
     def upsert_edge_run(
         self,
         *,
         method: str,
+        scenario_slug: str,
+        edge_count: int | str,
+        repeat: int | str,
         run_id: str,
         edge_id: int,
         summary: Mapping[str, Any] | None = None,
     ) -> None:
-        resolved_method = sanitize_method(method)
+        identity = ExperimentIdentity.create(
+            experiment_id=self.experiment_id,
+            scenario_slug=scenario_slug,
+            edge_count=edge_count,
+            repeat=repeat,
+            method=method,
+            run_id=run_id,
+        )
         self._upsert(
-            method=resolved_method,
-            run_id=sanitize_component(run_id),
+            identity=identity,
             edge_id=int(edge_id),
             summary=dict(summary or {}),
-            include_cloud=resolved_method != PURE_EDGE_METHOD,
         )
 
     def _upsert(
         self,
         *,
-        method: str,
-        run_id: str,
+        identity: ExperimentIdentity,
         edge_id: int | None,
         summary: Mapping[str, Any],
-        include_cloud: bool,
     ) -> None:
         with self._lock:
             manifest = self._load()
             video_source = str(summary.get("video_source", "") or "")
-            configured_scenario = str(summary.get("scenario_name", "") or "")
+            configured_scenario = str(summary.get("scenario_name", "") or identity.scenario_slug)
             configured_slug = str(summary.get("video_slug", "") or "")
-            runs = list(manifest.get("runs") or [])
-            existing_run = next(
-                (item for item in runs if str(item.get("run_id", "")) == run_id),
-                None,
-            )
             scenario_name = video_slug(configured_scenario)
-            resolved_video_slug = video_slug(configured_slug)
+            resolved_video_slug = video_slug(configured_slug) or identity.scenario_slug
             if video_source:
-                identity = resolve_video_identity(
+                video_info = resolve_video_identity(
                     video_source,
                     configured_scenario_name=scenario_name,
                     configured_video_slug=resolved_video_slug,
                 )
-                video_source = identity.video_source
-                scenario_name = identity.scenario_name
-                resolved_video_slug = identity.video_slug
+                video_source = video_info.video_source
+                scenario_name = video_info.scenario_name or configured_scenario
+                resolved_video_slug = video_info.video_slug
             elif scenario_name or resolved_video_slug:
                 scenario_name = scenario_name or resolved_video_slug
                 resolved_video_slug = resolved_video_slug or scenario_name
-            if (
-                not video_source
-                and existing_run is not None
-                and str(existing_run.get("scenario_name", "") or "")
-            ):
-                scenario_name = str(existing_run["scenario_name"])
+
+            scenario_name = scenario_name or identity.scenario_slug
+            methods = _ordered_methods(manifest.get("methods"))
+            if identity.method not in methods:
+                methods.append(identity.method)
+            manifest["methods"] = methods
+
             scenarios = list(manifest.get("scenarios") or [])
-            if scenario_name:
-                scenario = next(
-                    (item for item in scenarios if str(item.get("name", "")) == scenario_name),
-                    None,
+            scenario = next(
+                (
+                    item
+                    for item in scenarios
+                    if str(item.get("scenario_slug", "") or "") == identity.scenario_slug
+                ),
+                None,
+            )
+            if scenario is None:
+                scenario = {
+                    "scenario_name": scenario_name,
+                    "scenario_slug": identity.scenario_slug,
+                    "video_path": video_source,
+                }
+                scenarios.append(scenario)
+            else:
+                scenario.setdefault("scenario_name", scenario_name)
+            if video_source:
+                existing_source = str(scenario.get("video_path", "") or "")
+                scenario["video_path"] = (
+                    redact_video_source(existing_source)
+                    if existing_source
+                    else video_source
                 )
-                if scenario is None:
-                    scenario = {
-                        "name": scenario_name,
-                        "video_source": video_source,
-                        "video_slug": resolved_video_slug,
-                        "notes": "",
-                    }
-                    scenarios.append(scenario)
-                elif video_source:
-                    existing_source = str(scenario.get("video_source", "") or "")
-                    scenario["video_source"] = (
-                        redact_video_source(existing_source)
-                        if existing_source
-                        else video_source
-                    )
-                if resolved_video_slug and not str(scenario.get("video_slug", "") or ""):
-                    scenario["video_slug"] = resolved_video_slug
+            if resolved_video_slug:
+                scenario.setdefault("video_slug", resolved_video_slug)
             manifest["scenarios"] = scenarios
 
-            run = existing_run
-            if run is None:
-                run = {
-                    "run_id": run_id,
-                    "method": method,
-                    "scenario_name": scenario_name,
-                    "edge_ids": [],
-                    "raw_logs": {"edges": {}},
-                }
-                runs.append(run)
-            elif str(run.get("method", "")) != method:
-                raise ValueError(
-                    f"run_id {run_id!r} is already assigned to method {run.get('method')!r}"
-                )
-            methods = _ordered_methods(manifest.get("methods"))
-            if method not in methods:
-                methods.append(method)
-            manifest["methods"] = methods
-            if scenario_name and (
-                video_source or run.get("scenario_name") in {"", "unknown_scenario"}
-            ):
-                run["scenario_name"] = scenario_name
-            raw_logs = dict(run.get("raw_logs") or {})
-            edges = dict(raw_logs.get("edges") or {})
-            edge_ids = {int(value) for value in list(run.get("edge_ids") or [])}
+            edge_counts = {int(value) for value in list(manifest.get("edge_counts") or [])}
+            edge_counts.add(identity.edge_count)
+            manifest["edge_counts"] = sorted(edge_counts)
+
+            repeats = {int(value) for value in list(manifest.get("repeats") or [])}
+            repeats.add(identity.repeat)
+            manifest["repeats"] = sorted(repeats)
+
+            edge_ids_by_count = {
+                str(key): list(value or [])
+                for key, value in dict(manifest.get("edge_ids_by_count") or {}).items()
+            }
+            ids_for_count = {
+                int(value)
+                for value in edge_ids_by_count.get(str(identity.edge_count), [])
+            }
+            if not ids_for_count:
+                ids_for_count.update(range(1, identity.edge_count + 1))
             if edge_id is not None:
-                if edge_id <= 0:
-                    raise ValueError("edge_id must be a positive integer")
-                edge_ids.add(edge_id)
-                edges[str(edge_id)] = (
-                    f"raw_logs/{method}/edge_{edge_id}/{run_id}"
-                )
-            raw_logs["edges"] = edges
-            if include_cloud:
-                raw_logs["cloud"] = f"raw_logs/{method}/cloud/{run_id}"
-            else:
-                raw_logs.pop("cloud", None)
-            run["edge_ids"] = sorted(edge_ids)
-            run["raw_logs"] = raw_logs
-            manifest["runs"] = runs
+                ids_for_count.add(normalize_edge_id_for_count(edge_id, identity.edge_count))
+            edge_ids_by_count[str(identity.edge_count)] = sorted(ids_for_count)
+            manifest["edge_ids_by_count"] = dict(
+                sorted(edge_ids_by_count.items(), key=lambda item: int(item[0]))
+            )
 
             student_model = str(summary.get("student_model", "") or "")
             teacher_model = str(summary.get("teacher_model", "") or "")
@@ -221,7 +230,9 @@ class CloudExperimentManifestWriter:
         elif self.index_path.is_file():
             payload = json.loads(self.index_path.read_text(encoding="utf-8"))
         manifest = dict(payload) if isinstance(payload, Mapping) else {}
-        manifest["comparison_id"] = self.comparison_id
+        if "runs" in manifest:
+            raise ValueError("experiment manifest must not define explicit runs")
+        manifest["experiment_id"] = self.experiment_id
         manifest["log_timezone"] = str(
             manifest.get("log_timezone") or self.log_timezone or "UTC"
         )
@@ -229,19 +240,21 @@ class CloudExperimentManifestWriter:
         manifest.setdefault("student_model", self.student_model)
         manifest.setdefault("teacher_model", self.teacher_model)
         manifest.setdefault("scenarios", [])
-        manifest.setdefault("runs", [])
+        manifest.setdefault("edge_counts", [])
+        manifest.setdefault("repeats", [])
+        manifest.setdefault("edge_ids_by_count", {})
         manifest.setdefault(
             "metrics",
             {
+                "accuracy_definition": "teacher_supervised_f1",
                 "accuracy_file": None,
                 "ground_truth_file": None,
-                "allow_missing_accuracy": True,
             },
         )
         return manifest
 
     def _write(self, manifest: Mapping[str, Any]) -> None:
-        self.comparison_dir.mkdir(parents=True, exist_ok=True)
+        self.experiment_dir.mkdir(parents=True, exist_ok=True)
         _atomic_write_text(
             self.manifest_path,
             yaml.safe_dump(dict(manifest), sort_keys=False, allow_unicode=True),
@@ -264,12 +277,17 @@ class CloudExperimentResultRepository:
         self.max_artifact_bytes = max(1, int(max_artifact_bytes))
         self.manifest_writer = manifest_writer
         self._lock = threading.RLock()
-        self._event_writers: dict[tuple[str, str, str], ExperimentJsonlWriter] = {}
+        self._event_writers: dict[tuple[str, str, str, str, str, str], ExperimentJsonlWriter] = {}
 
     def store_artifacts(self, request: object) -> list[Path]:
-        comparison_id = sanitize_component(getattr(request, "comparison_id", ""))
-        run_id = sanitize_component(getattr(request, "run_id", ""))
-        method = sanitize_method(getattr(request, "method", ""))
+        identity = ExperimentIdentity.create(
+            experiment_id=getattr(request, "experiment_id", ""),
+            scenario_slug=getattr(request, "scenario_slug", ""),
+            edge_count=int(getattr(request, "edge_count", 0)),
+            repeat=int(getattr(request, "repeat", 0)),
+            method=getattr(request, "method", ""),
+            run_id=getattr(request, "run_id", ""),
+        )
         edge_id = int(getattr(request, "edge_id", 0))
         if edge_id <= 0:
             raise ValueError("edge_id must be a positive integer")
@@ -279,10 +297,13 @@ class CloudExperimentResultRepository:
 
         run_dir = cloud_repository_edge_run_dir(
             self.root_dir,
-            comparison_id,
-            method,
+            identity.experiment_id,
+            identity.scenario_slug,
+            identity.edge_count,
+            identity.repeat,
+            identity.method,
             edge_id,
-            run_id,
+            identity.run_id,
         )
         summary: dict[str, Any] = {}
         stored_paths: list[Path] = []
@@ -291,9 +312,7 @@ class CloudExperimentResultRepository:
             for artifact in request_artifacts:
                 self._validate_artifact_identity(
                     artifact,
-                    comparison_id=comparison_id,
-                    run_id=run_id,
-                    method=method,
+                    identity=identity,
                     edge_id=edge_id,
                 )
                 relative_path = sanitize_relative_path(
@@ -341,28 +360,34 @@ class CloudExperimentResultRepository:
                         logger.warning("Uploaded edge_summary.json is not valid JSON")
             self._write_uploaded_manifest(
                 run_dir,
-                comparison_id=comparison_id,
-                run_id=run_id,
-                method=method,
+                identity=identity,
                 edge_id=edge_id,
                 entries=manifest_entries,
             )
             if self.manifest_writer is not None:
                 self.manifest_writer.upsert_edge_run(
-                    method=method,
-                    run_id=run_id,
+                    method=identity.method,
+                    scenario_slug=identity.scenario_slug,
+                    edge_count=identity.edge_count,
+                    repeat=identity.repeat,
+                    run_id=identity.run_id,
                     edge_id=edge_id,
                     summary=summary,
                 )
             self.record_cloud_event(
-                comparison_id=comparison_id,
-                method=method,
-                run_id=run_id,
+                experiment_id=identity.experiment_id,
+                scenario_slug=identity.scenario_slug,
+                edge_count=identity.edge_count,
+                repeat=identity.repeat,
+                method=identity.method,
+                run_id=identity.run_id,
                 event="experiment_result_artifact_received",
                 edge_id=edge_id,
                 artifact_count=len(request_artifacts),
                 stored_paths=[
-                    path.relative_to(experiment_root(self.root_dir, comparison_id)).as_posix()
+                    path.relative_to(
+                        experiment_root(self.root_dir, identity.experiment_id)
+                    ).as_posix()
                     for path in stored_paths
                 ],
             )
@@ -371,24 +396,45 @@ class CloudExperimentResultRepository:
     def record_cloud_event(
         self,
         *,
-        comparison_id: str,
+        experiment_id: str,
+        scenario_slug: str,
+        edge_count: int | str,
+        repeat: int | str,
         method: str,
         run_id: str,
         event: str,
         **payload: Any,
     ) -> None:
-        resolved_method = sanitize_method(method)
-        if resolved_method == PURE_EDGE_METHOD:
+        identity = ExperimentIdentity.create(
+            experiment_id=experiment_id,
+            scenario_slug=scenario_slug,
+            edge_count=edge_count,
+            repeat=repeat,
+            method=method,
+            run_id=run_id,
+        )
+        if identity.method == PURE_EDGE_METHOD:
             return
         key = (
-            sanitize_component(comparison_id),
-            resolved_method,
-            sanitize_component(run_id),
+            identity.experiment_id,
+            identity.scenario_slug,
+            str(identity.edge_count),
+            str(identity.repeat),
+            identity.method,
+            identity.run_id,
         )
         writer = self._event_writers.get(key)
         if writer is None:
             writer = ExperimentJsonlWriter(
-                cloud_run_dir(self.root_dir, key[0], key[1], key[2])
+                cloud_run_dir(
+                    self.root_dir,
+                    identity.experiment_id,
+                    identity.scenario_slug,
+                    identity.edge_count,
+                    identity.repeat,
+                    identity.method,
+                    identity.run_id,
+                )
                 / "cloud_events.jsonl"
             )
             self._event_writers[key] = writer
@@ -404,19 +450,23 @@ class CloudExperimentResultRepository:
         self,
         artifact: object,
         *,
-        comparison_id: str,
-        run_id: str,
-        method: str,
+        identity: ExperimentIdentity,
         edge_id: int,
     ) -> None:
         expected = {
-            "comparison_id": comparison_id,
-            "run_id": run_id,
-            "method": method,
+            "experiment_id": identity.experiment_id,
+            "scenario_slug": identity.scenario_slug,
+            "edge_count": identity.edge_count,
+            "repeat": identity.repeat,
+            "run_id": identity.run_id,
+            "method": identity.method,
             "edge_id": edge_id,
         }
         actual = {
-            "comparison_id": str(getattr(artifact, "comparison_id", "") or ""),
+            "experiment_id": str(getattr(artifact, "experiment_id", "") or ""),
+            "scenario_slug": str(getattr(artifact, "scenario_slug", "") or ""),
+            "edge_count": int(getattr(artifact, "edge_count", 0)),
+            "repeat": int(getattr(artifact, "repeat", 0)),
             "run_id": str(getattr(artifact, "run_id", "") or ""),
             "method": str(getattr(artifact, "method", "") or ""),
             "edge_id": int(getattr(artifact, "edge_id", 0)),
@@ -516,9 +566,7 @@ class CloudExperimentResultRepository:
     def _write_uploaded_manifest(
         run_dir: Path,
         *,
-        comparison_id: str,
-        run_id: str,
-        method: str,
+        identity: ExperimentIdentity,
         edge_id: int,
         entries: list[dict[str, Any]],
     ) -> None:
@@ -532,9 +580,12 @@ class CloudExperimentResultRepository:
             except json.JSONDecodeError:
                 existing_entries = []
         payload = {
-            "comparison_id": comparison_id,
-            "run_id": run_id,
-            "method": method,
+            "experiment_id": identity.experiment_id,
+            "scenario_slug": identity.scenario_slug,
+            "edge_count": identity.edge_count,
+            "repeat": identity.repeat,
+            "run_id": identity.run_id,
+            "method": identity.method,
             "edge_id": edge_id,
             "artifacts": _deduplicate_manifest_entries(existing_entries + entries),
         }

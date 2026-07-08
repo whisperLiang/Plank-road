@@ -31,7 +31,7 @@ def test_npy_memmap_shard_writes_npy_arrays_and_reads_rows(tmp_path, monkeypatch
     assert np.load(os.path.join(shard_dir, "leaf_1.npy"), mmap_mode="r").shape == (4, 1, 1, 2)
     with open(refs[0].index_path, encoding="utf-8") as handle:
         metadata = json.load(handle)
-    assert metadata["format_version"] == "feature-shard.v2"
+    assert "format_version" not in metadata
     assert metadata["leaf_specs"]["leaf_0"]["storage_shape"] == [4, 1, 2, 3]
     assert metadata["leaf_specs"]["leaf_0"]["feature_shape_without_batch"] == [2, 3]
 

@@ -4,7 +4,7 @@ service MessageTransmission {
   // Cloud-side continual learning: edge sends collected frame indices,
   // cloud retrains the lightweight model and returns updated weights.
   rpc train_model_request (TrainRequest) returns (TrainReply) {}
-  // Versioned continual-learning bundle upload for the fixed-split pipeline.
+  // Continual-learning bundle upload for the fixed-split pipeline.
   rpc continual_learning_request (ContinualLearningRequest) returns (ContinualLearningReply) {}
   // Sharded sample pool exchange without creating a training job.
   rpc sync_samples (SampleSyncRequest) returns (SampleSyncReply) {}
@@ -405,24 +405,30 @@ message EkyaServerMessage {
 }
 
 message ExperimentResultArtifact {
-  string comparison_id = 1;
-  string run_id = 2;
-  string method = 3;
-  int32 edge_id = 4;
-  string relative_path = 5;
-  bytes content = 6;
-  int64 size_bytes = 7;
-  string sha256 = 8;
-  string content_type = 9;
-  bool is_final = 10;
+  string experiment_id = 1;
+  string scenario_slug = 2;
+  int32 edge_count = 3;
+  int32 repeat = 4;
+  string run_id = 5;
+  string method = 6;
+  int32 edge_id = 7;
+  string relative_path = 8;
+  bytes content = 9;
+  int64 size_bytes = 10;
+  string sha256 = 11;
+  string content_type = 12;
+  bool is_final = 13;
 }
 
 message UploadExperimentResultRequest {
-  string comparison_id = 1;
-  string run_id = 2;
-  string method = 3;
-  int32 edge_id = 4;
-  repeated ExperimentResultArtifact artifacts = 5;
+  string experiment_id = 1;
+  string scenario_slug = 2;
+  int32 edge_count = 3;
+  int32 repeat = 4;
+  string run_id = 5;
+  string method = 6;
+  int32 edge_id = 7;
+  repeated ExperimentResultArtifact artifacts = 8;
 }
 
 message UploadExperimentResultResponse {

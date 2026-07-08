@@ -21,7 +21,6 @@ from model_management.universal_model_split import (
 )
 
 PRIVACY_LEAKAGE_EPSILON = 1e-12
-FIXED_SPLIT_PLAN_VERSION = "fixed-split.v10"
 FIXED_SPLIT_DYNAMIC_BATCH_MAX = 64
 EligibleCandidate = tuple[SplitCandidate, float, float]
 ValidatedCandidate = tuple[CandidateProfile, SplitCandidate, float, float]
@@ -235,7 +234,6 @@ class SplitPlan:
     input_tensor_shape: list[int] = field(default_factory=list)
     input_resize_mode: str = "direct_resize"
     front_version: str = "0"
-    plan_version: str = FIXED_SPLIT_PLAN_VERSION
     runtime_contract: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -345,7 +343,6 @@ class SplitPlan:
                 if payload.get("trace_batch_size") is not None
                 else None
             ),
-            plan_version=str(payload.get("plan_version") or ""),
         )
 
     def matches(
@@ -366,8 +363,7 @@ class SplitPlan:
         )
         cached_model_version = str(dict(self.runtime_contract or {}).get("model_version") or "0")
         return (
-            self.plan_version == FIXED_SPLIT_PLAN_VERSION
-            and self.model_name == model_name
+            self.model_name == model_name
             and cached_model_version == str(model_version or "0")
             and self.constraints == _constraints_payload(constraints)
             and self.trace_signature == trace_signature
@@ -478,7 +474,6 @@ def _make_plan_id(
     raw = json.dumps(
         {
             "model_name": model_name,
-            "plan_version": FIXED_SPLIT_PLAN_VERSION,
             "logical_split_id": _candidate_split_key(candidate),
             "feature_layout_id": str(dict(runtime_contract or {}).get("feature_layout_id") or ""),
             "constraints": _constraints_payload(constraints),
@@ -982,19 +977,10 @@ def load_or_compute_fixed_split_plan(
     validation_inputs = _validation_sample_inputs(sample_input, resolved_validation_batches)
     blacklisted_candidate_ids: set[str] = set()
     cached = load_split_plan(cache_path) if cache_path else None
-    cached_invalidated = False
-    if cached is not None and cached.plan_version != FIXED_SPLIT_PLAN_VERSION:
-        cached_invalidated = True
-        logger.info(
-            "Cached fixed split plan version {} is stale; recomputing with {}.",
-            cached.plan_version,
-            FIXED_SPLIT_PLAN_VERSION,
-        )
     if (
         runtime.runtime is not None
         and runtime.model is not None
         and cached is not None
-        and not cached_invalidated
     ):
         cache_matches = cached.matches(
             model_name=model_key,
@@ -1061,7 +1047,6 @@ def load_or_compute_fixed_split_plan(
 
 __all__ = [
     "FIXED_SPLIT_DYNAMIC_BATCH_MAX",
-    "FIXED_SPLIT_PLAN_VERSION",
     "PRIVACY_LEAKAGE_EPSILON",
     "SplitConstraints",
     "SplitPlan",

@@ -396,11 +396,6 @@ class SampleStageMixin:
             bundle_cache_path = str(workspace)
             manifest = _read_json_file(os.path.join(bundle_cache_path, "bundle_manifest.json"))
             manifest = validate_high_quality_sync_manifest(manifest)
-            if protocol_version and manifest.get("protocol_version") != protocol_version:
-                raise RuntimeError(
-                    f"Request protocol_version={protocol_version!r} does not match bundle "
-                    f"protocol_version={manifest.get('protocol_version')!r}."
-                )
             if model_id and not manifest.get("model_id"):
                 manifest["model_id"] = str(model_id)
             if model_version and not manifest.get("model_version"):

@@ -28,7 +28,6 @@ from cloud.feature_cache.types import SUPPORTED_STORAGE_FORMATS
 from cloud.sample_pool.labels import (
     POOL_LABEL_COORDINATE_SPACE,
     POOL_LABEL_METADATA_FIELDS,
-    POOL_LABEL_RUNTIME_VERSION,
     labels_from_result,
 )
 from cloud.sample_pool.labels import (
@@ -42,12 +41,6 @@ from cloud.sample_pool.labels import (
 )
 from cloud.sample_pool.records import (
     CANONICAL_FEATURE_METADATA_FIELDS as _CANONICAL_FEATURE_METADATA_FIELDS,
-)
-from cloud.sample_pool.records import (
-    CANONICAL_RECORD_VERSION as _CANONICAL_RECORD_VERSION,
-)
-from cloud.sample_pool.records import (
-    GENERATION_MANIFEST_VERSION as _GENERATION_MANIFEST_VERSION,
 )
 from cloud.sample_pool.records import (
     CanonicalSampleRecord,
@@ -187,7 +180,6 @@ def _detach_boundary_payload(payload: BoundaryPayload) -> BoundaryPayload:
         weight_version=payload.metadata.get("weight_version"),
         supports_prefix_backward=bool(payload.metadata.get("supports_prefix_backward", False)),
         prefix_backward_owner_id=payload.metadata.get("prefix_backward_owner_id"),
-        protocol_version=payload.metadata.get("protocol_version", 2),
         metadata=metadata,
     )
 
@@ -382,7 +374,6 @@ def _normalise_boundary_payload_for_contract(
         weight_version=payload.metadata.get("weight_version"),
         supports_prefix_backward=bool(payload.metadata.get("supports_prefix_backward", False)),
         prefix_backward_owner_id=payload.metadata.get("prefix_backward_owner_id"),
-        protocol_version=payload.metadata.get("protocol_version", 2),
         metadata=dict(payload.metadata or {}),
     )
 
@@ -975,7 +966,6 @@ class CloudSamplePool:
             feature_ref=feature_ref,
         )
         return {
-            "schema_version": _CANONICAL_RECORD_VERSION,
             "sample_id": sample_id,
             "labels": labels,
             "sample_source": sample_source,
@@ -1652,7 +1642,6 @@ class CloudSamplePool:
         teacher_labeled_count = sum(1 for record in records if record.label_source == "teacher")
         pseudo_labeled_count = sum(1 for record in records if record.label_source == "edge_pseudo")
         manifest = {
-            "schema_version": _GENERATION_MANIFEST_VERSION,
             "contract_id": split_contract.contract_id,
             "split_config_id": split_contract.split_config_id,
             "front_version": split_contract.front_version,
@@ -2050,7 +2039,6 @@ __all__ = [
     "CanonicalSampleRecord",
     "CloudSamplePool",
     "POOL_LABEL_COORDINATE_SPACE",
-    "POOL_LABEL_RUNTIME_VERSION",
     "SampleFeatureContractAlignment",
     "align_sample_feature_contract",
     "labels_from_result",

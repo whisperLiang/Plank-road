@@ -156,7 +156,6 @@ class CloudBaselineFreezeTrainingStrategy:
             model_name=model_name,
             checkpoint_path=str(workspace_path / "model_update" / "baseline_freeze_state.pt"),
             weights_metadata={
-                "protocol_version": str(manifest.get("protocol_version", "")),
                 "training_strategy": self.name,
                 "trainable_param_ratio": ratio,
                 "source_base_model_version": str(base_model_version or "0"),

@@ -20,7 +20,7 @@ from cloud.feature_cache.types import (
 from model_management.payload import BoundaryPayload, boundary_payload_from_tensors
 from model_management.split_runtime import BoundaryPayloadCacheCodec, prepare_boundary_for_runtime
 
-SAMPLE_AXIS_STORAGE_LAYOUT = "sample_axis_v2"
+SAMPLE_AXIS_STORAGE_LAYOUT = "sample_axis"
 
 
 def _read_json(path: str) -> dict[str, Any]:

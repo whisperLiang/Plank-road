@@ -18,7 +18,6 @@ def _request(**overrides) -> TeacherAnnotationRequest:
         "teacher_num_classes": 91,
         "teacher_annotation_threshold": 0.5,
         "label_coordinate_space": "original_xyxy",
-        "label_runtime_version": "fixed-split-pool-labels.v1",
         "metadata": {},
     }
     payload.update(overrides)
@@ -107,7 +106,6 @@ def test_atomic_write_and_batch_lookup_round_trip(tmp_path) -> None:
         "labels": [1],
         "scores": [0.9],
         "label_coordinate_space": "original_xyxy",
-        "label_runtime_version": "fixed-split-pool-labels.v1",
     }
 
     cache.write(req, labels, source="test")

@@ -28,7 +28,6 @@ def _request(
         teacher_num_classes=91,
         teacher_annotation_threshold=0.5,
         label_coordinate_space="original_xyxy",
-        label_runtime_version="fixed-split-pool-labels.v1",
         metadata={"include_empty": True},
     )
 

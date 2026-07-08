@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import yaml
 
 from cloud.experiment_result_repository import CloudExperimentManifestWriter
@@ -10,7 +11,7 @@ from cloud.experiment_result_repository import CloudExperimentManifestWriter
 def test_manifest_writer_merges_methods_edges_and_preserves_notes(tmp_path: Path) -> None:
     writer = CloudExperimentManifestWriter(
         root_dir=str(tmp_path),
-        comparison_id="comparison",
+        experiment_id="comparison",
         student_model="student",
         teacher_model="teacher",
         log_timezone="UTC",
@@ -18,6 +19,9 @@ def test_manifest_writer_merges_methods_edges_and_preserves_notes(tmp_path: Path
     summary = {"video_source": "road.mp4"}
     writer.upsert_edge_run(
         method="plank_road",
+        scenario_slug="road",
+        edge_count=2,
+        repeat=1,
         run_id="main-r1",
         edge_id=1,
         summary=summary,
@@ -31,32 +35,46 @@ def test_manifest_writer_merges_methods_edges_and_preserves_notes(tmp_path: Path
     )
     writer.upsert_edge_run(
         method="plank_road",
+        scenario_slug="road",
+        edge_count=2,
+        repeat=1,
         run_id="main-r1",
         edge_id=2,
         summary=summary,
     )
     writer.upsert_edge_run(
         method="pure_edge_local_updating",
+        scenario_slug="road",
+        edge_count=2,
+        repeat=1,
         run_id="pure-r1",
         edge_id=1,
         summary=summary,
     )
     writer.upsert_edge_run(
         method="accuracy_trigger_cloud_retraining",
+        scenario_slug="road",
+        edge_count=2,
+        repeat=1,
         run_id="accuracy-r1",
         edge_id=1,
         summary=summary,
     )
 
     result = yaml.safe_load(writer.manifest_path.read_text(encoding="utf-8"))
-    runs = {run["run_id"]: run for run in result["runs"]}
-    assert runs["main-r1"]["edge_ids"] == [1, 2]
-    assert set(runs["main-r1"]["raw_logs"]["edges"]) == {"1", "2"}
-    assert "cloud" not in runs["pure-r1"]["raw_logs"]
-    assert "cloud" in runs["main-r1"]["raw_logs"]
-    assert "cloud" in runs["accuracy-r1"]["raw_logs"]
+    assert result["experiment_id"] == "comparison"
+    assert "runs" not in result
+    assert result["edge_counts"] == [2]
+    assert result["repeats"] == [1]
+    assert result["edge_ids_by_count"] == {"2": [1, 2]}
+    assert result["methods"] == [
+        "plank_road",
+        "pure_edge_local_updating",
+        "accuracy_trigger_cloud_retraining",
+    ]
     assert result["scenarios"][0]["notes"] == "keep me"
     assert result["scenarios"][0]["video_slug"] == "road"
+    assert result["scenarios"][0]["scenario_slug"] == "road"
     assert result["custom"] == {"owner": "user"}
     assert writer.index_path.is_file()
 
@@ -64,13 +82,16 @@ def test_manifest_writer_merges_methods_edges_and_preserves_notes(tmp_path: Path
 def test_manifest_writer_redacts_remote_video_credentials(tmp_path: Path) -> None:
     writer = CloudExperimentManifestWriter(
         root_dir=str(tmp_path),
-        comparison_id="remote-comparison",
+        experiment_id="remote-comparison",
         student_model="student",
         teacher_model="teacher",
         log_timezone="UTC",
     )
     writer.upsert_edge_run(
         method="plank_road",
+        scenario_slug="north-gate",
+        edge_count=1,
+        repeat=1,
         run_id="remote-r1",
         edge_id=1,
         summary={
@@ -80,4 +101,27 @@ def test_manifest_writer_redacts_remote_video_credentials(tmp_path: Path) -> Non
     )
 
     result = yaml.safe_load(writer.manifest_path.read_text(encoding="utf-8"))
-    assert result["scenarios"][0]["video_source"] == "https://example.com/live"
+    assert result["scenarios"][0]["video_path"] == "https://example.com/live"
+
+
+def test_manifest_writer_rejects_edge_ids_above_declared_edge_count(
+    tmp_path: Path,
+) -> None:
+    writer = CloudExperimentManifestWriter(
+        root_dir=str(tmp_path),
+        experiment_id="comparison",
+        student_model="student",
+        teacher_model="teacher",
+        log_timezone="UTC",
+    )
+
+    with pytest.raises(ValueError, match="edge_id must be <= edge_count"):
+        writer.upsert_edge_run(
+            method="plank_road",
+            scenario_slug="road",
+            edge_count=1,
+            repeat=1,
+            run_id="road_n1_r01_plank_road",
+            edge_id=2,
+            summary={"video_source": "road.mp4"},
+        )

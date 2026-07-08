@@ -23,8 +23,6 @@ from grpc_server import message_transmission_pb2, message_transmission_pb2_grpc
 from model_management.fixed_split import SplitPlan
 from tools.grpc_options import grpc_message_options
 
-LOW_QUALITY_TRIGGER_PROTOCOL_VERSION = "low-quality-trigger-shard.v1"
-
 
 def _server_workspace_hint(edge_id: int, request_kind: str) -> str:
     return f"edge_{int(edge_id)}/{request_kind}"
@@ -417,7 +415,6 @@ def pack_low_quality_trigger_bundle_to_file(
         model_meta[str(key)] = value
 
     manifest = {
-        "protocol_version": LOW_QUALITY_TRIGGER_PROTOCOL_VERSION,
         "edge_id": int(edge_id),
         "edge_session_id": str(edge_session_id or ""),
         "model_id": str(model_id),
@@ -537,7 +534,6 @@ def submit_training_job(
     request_id: str,
     job_type: int,
     cache_path: str,
-    protocol_version: str = "",
     send_low_conf_features: bool = False,
     frame_indices: list[int] | None = None,
     payload_zip: bytes = b"",
@@ -568,7 +564,6 @@ def submit_training_job(
             },
         )
         req = message_transmission_pb2.SubmitTrainingJobRequest(
-            protocol_version=str(protocol_version or ""),
             edge_id=int(edge_id),
             request_id=str(request_id or ""),
             job_type=int(job_type),
@@ -630,7 +625,6 @@ def submit_sample_sync(
     *,
     edge_id: int,
     request_id: str,
-    protocol_version: str,
     sync_type: str,
     model_id: str,
     model_version: str,
@@ -653,7 +647,6 @@ def submit_sample_sync(
                 "SampleSyncBundleRequest",
             ),
             {
-                "protocol_version": str(protocol_version or ""),
                 "edge_id": int(edge_id),
                 "model_id": str(model_id or ""),
                 "model_version": str(model_version or ""),
@@ -854,7 +847,6 @@ def submit_continual_learning_job(
             request_id=resolved_request_id,
             job_type=message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING,
             cache_path=_server_workspace_hint(edge_id, "continual_learning"),
-            protocol_version=manifest["protocol_version"],
             send_low_conf_features=bool(send_low_conf_features),
             payload_zip=payload_zip,
             channel=channel,

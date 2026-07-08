@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from cloud.contracts import LOW_QUALITY_TRIGGER_PROTOCOL_VERSION, validate_low_quality_manifest
-from model_management.fixed_split import FIXED_SPLIT_PLAN_VERSION
+from cloud.contracts import validate_low_quality_manifest
 from model_management.split_contract import build_runtime_contract
 
 
@@ -39,7 +38,6 @@ def _runtime_contract() -> dict[str, object]:
 def _low_quality_manifest() -> dict[str, object]:
     runtime_contract = _runtime_contract()
     return {
-        "protocol_version": LOW_QUALITY_TRIGGER_PROTOCOL_VERSION,
         "model_id": "yolo26n",
         "model_version": "1",
         "split_config_id": "split-a",
@@ -47,7 +45,6 @@ def _low_quality_manifest() -> dict[str, object]:
         "input_resize_mode": "direct_resize",
         "runtime_contract": runtime_contract,
         "split_plan": {
-            "plan_version": FIXED_SPLIT_PLAN_VERSION,
             "split_config_id": "split-a",
             "runtime_contract": runtime_contract,
         },
@@ -62,12 +59,14 @@ def test_low_quality_manifest_requires_runtime_contract() -> None:
         validate_low_quality_manifest(manifest)
 
 
-def test_low_quality_manifest_rejects_old_fixed_split_plan() -> None:
+def test_low_quality_manifest_ignores_legacy_version_fields() -> None:
     manifest = _low_quality_manifest()
+    manifest["protocol_version"] = "legacy"
     manifest["split_plan"] = {
         **dict(manifest["split_plan"]),
         "plan_version": "fixed-split.v9",
     }
 
-    with pytest.raises(RuntimeError, match="Unsupported fixed split plan version"):
-        validate_low_quality_manifest(manifest)
+    payload = validate_low_quality_manifest(manifest)
+
+    assert payload["model_id"] == "yolo26n"

@@ -9,6 +9,13 @@ from edge import experiment_result_uploader
 from edge.experiment_result_uploader import ExperimentResultUploader
 from grpc_server import message_transmission_pb2
 
+IDENTITY = {
+    "experiment_id": "comparison",
+    "scenario_slug": "road",
+    "edge_count": 1,
+    "repeat": 1,
+}
+
 
 class _Channel:
     def close(self) -> None:
@@ -43,7 +50,7 @@ def test_uploader_sends_one_artifact_per_rpc_and_marks_final(monkeypatch) -> Non
     summary = json.dumps({"offline_result_archival": True}).encode()
     uploader = ExperimentResultUploader("cloud:50051", enabled=True)
     assert uploader.upload_run_artifacts(
-        comparison_id="comparison",
+        **IDENTITY,
         run_id="pure-r1",
         method="pure_edge_local_updating",
         edge_id=1,
@@ -54,6 +61,10 @@ def test_uploader_sends_one_artifact_per_rpc_and_marks_final(monkeypatch) -> Non
         },
     )
     assert len(requests) == 2
+    assert requests[0].experiment_id == "comparison"
+    assert requests[0].scenario_slug == "road"
+    assert requests[0].edge_count == 1
+    assert requests[0].repeat == 1
     assert not requests[0].artifacts[0].is_final
     assert requests[1].artifacts[0].is_final
     assert json.loads(requests[1].artifacts[0].content)["offline_result_archival"] is True
@@ -100,7 +111,7 @@ def test_uploader_sends_client_manifest_when_it_contains_skipped_metadata(
     uploader = ExperimentResultUploader("cloud:50051", enabled=True)
 
     assert uploader.upload_run_artifacts(
-        comparison_id="comparison",
+        **IDENTITY,
         run_id="run-1",
         method="plank_road",
         edge_id=1,
@@ -139,7 +150,7 @@ def test_uploader_failure_is_reported_without_raising(monkeypatch) -> None:
     )
     uploader = ExperimentResultUploader("cloud:50051", enabled=True)
     assert not uploader.upload_run_artifacts(
-        comparison_id="comparison",
+        **IDENTITY,
         run_id="run-1",
         method="plank_road",
         edge_id=1,
@@ -180,7 +191,7 @@ def test_uploader_reads_path_backed_artifact_when_it_is_sent(
 
     uploader = ExperimentResultUploader("cloud:50051", enabled=True)
     assert uploader.upload_run_artifacts(
-        comparison_id="comparison",
+        **IDENTITY,
         run_id="run-1",
         method="plank_road",
         edge_id=1,
@@ -201,15 +212,8 @@ def test_collect_artifacts_records_oversized_file_without_uploading_it(
         method="plank_road",
         run_id="run-1",
         edge_id=1,
-        comparison_id="comparison",
-        config=SimpleNamespace(
-            max_artifact_bytes=4,
-            include_inference_results=True,
-            include_baseline_metrics=True,
-            include_edge_summary=True,
-            include_trigger_manifest=False,
-            include_runtime_logs=False,
-        ),
+        **IDENTITY,
+        config=SimpleNamespace(max_artifact_bytes=4),
         inference_result_path=inference,
         baseline_metrics_path=None,
         cache_path=None,

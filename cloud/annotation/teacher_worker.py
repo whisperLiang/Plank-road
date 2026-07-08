@@ -84,7 +84,6 @@ def _request_signature(request: TeacherAnnotationRequest) -> tuple[object, ...]:
         int(request.teacher_num_classes),
         float(request.teacher_annotation_threshold),
         str(request.label_coordinate_space),
-        str(request.label_runtime_version),
     )
 
 

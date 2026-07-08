@@ -35,37 +35,8 @@ def _write_csv(path: Path, fields: list[str], rows: list[dict]) -> None:
 
 def _manifest(comparison_dir: Path, *, accuracy_file: str | None = None) -> Path:
     comparison_dir.mkdir(parents=True, exist_ok=True)
-    runs = [
-        {
-            "run_id": "main-r1",
-            "method": "plank_road",
-            "scenario_name": "road",
-            "edge_ids": [1],
-            "raw_logs": {
-                "cloud": "raw_logs/plank_road/cloud/main-r1",
-                "edges": {"1": "raw_logs/plank_road/edge_1/main-r1"},
-            },
-        },
-        {
-            "run_id": "pure-r1",
-            "method": "pure_edge_local_updating",
-            "scenario_name": "road",
-            "edge_ids": [1],
-            "raw_logs": {"edges": {"1": "raw_logs/pure_edge_local_updating/edge_1/pure-r1"}},
-        },
-        {
-            "run_id": "accuracy-r1",
-            "method": "accuracy_trigger_cloud_retraining",
-            "scenario_name": "road",
-            "edge_ids": [1],
-            "raw_logs": {
-                "cloud": "raw_logs/accuracy_trigger_cloud_retraining/cloud/accuracy-r1",
-                "edges": {"1": "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1"},
-            },
-        },
-    ]
     payload = {
-        "comparison_id": "comparison-test",
+        "experiment_id": "comparison-test",
         "log_timezone": "Asia/Shanghai",
         "methods": [
             "plank_road",
@@ -74,12 +45,19 @@ def _manifest(comparison_dir: Path, *, accuracy_file: str | None = None) -> Path
         ],
         "student_model": "rfdetr_nano",
         "teacher_model": "rtdetr_x",
-        "scenarios": [{"name": "road", "video_source": "road.mp4"}],
-        "runs": runs,
+        "scenarios": [
+            {
+                "scenario_name": "road",
+                "scenario_slug": "road",
+                "video_path": "road.mp4",
+            }
+        ],
+        "edge_counts": [1],
+        "repeats": [1],
+        "edge_ids_by_count": {"1": [1]},
         "metrics": {
             "accuracy_file": accuracy_file,
             "ground_truth_file": None,
-            "allow_missing_accuracy": True,
         },
     }
     path = comparison_dir / "manifest.yaml"
@@ -90,20 +68,6 @@ def _manifest(comparison_dir: Path, *, accuracy_file: str | None = None) -> Path
 def _append_ekya_run(manifest_path: Path) -> None:
     payload = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
     payload["methods"].append(EKYA_CANONICAL_METHOD)
-    payload["runs"].append(
-        {
-            "run_id": "ekya-r1",
-            "method": EKYA_CANONICAL_METHOD,
-            "scenario_name": "road",
-            "edge_ids": [1],
-            "raw_logs": {
-                "cloud": "raw_logs/ekya_style_cloud_scheduling/cloud/ekya-r1",
-                "edges": {
-                    "1": "raw_logs/ekya_style_cloud_scheduling/edge_1/ekya-r1"
-                },
-            },
-        }
-    )
     manifest_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 
 
@@ -134,17 +98,22 @@ def test_summary_rows_training_mean_uses_actual_training_jobs() -> None:
         "teacher_model": "rtdetr_x",
         "runs": [
             {
-                "run_id": "ekya-r1",
+                "experiment_id": "comparison-test",
+                "run_id": "road_n1_r01_ekya_style_cloud_scheduling",
                 "method": EKYA_CANONICAL_METHOD,
                 "scenario_name": "road",
+                "scenario_slug": "road",
+                "video_slug": "road",
+                "edge_count": 1,
+                "repeat": 1,
                 "edge_ids": [1],
             }
         ],
     }
     latency = [
-        {"run_id": "ekya-r1", "training_ms": "0", "total_adaptation_ms": "30"},
+        {"run_id": "road_n1_r01_ekya_style_cloud_scheduling", "training_ms": "0", "total_adaptation_ms": "30"},
         {
-            "run_id": "ekya-r1",
+            "run_id": "road_n1_r01_ekya_style_cloud_scheduling",
             "training_ms": "111000",
             "total_adaptation_ms": "111030",
         },
@@ -154,6 +123,10 @@ def test_summary_rows_training_mean_uses_actual_training_jobs() -> None:
 
     assert summary[0]["mean_training_ms"] == 111000.0
     assert summary[0]["mean_adaptation_ms"] == 55530.0
+    assert summary[0]["experiment_id"] == "comparison-test"
+    assert summary[0]["scenario_slug"] == "road"
+    assert summary[0]["edge_count"] == 1
+    assert summary[0]["repeat"] == 1
 
 
 def test_summary_rows_training_job_count_prefers_windowed_successes() -> None:
@@ -163,7 +136,7 @@ def test_summary_rows_training_job_count_prefers_windowed_successes() -> None:
         "teacher_model": "rtdetr_x",
         "runs": [
             {
-                "run_id": "accuracy-r1",
+                "run_id": "road_n1_r01_accuracy_trigger_cloud_retraining",
                 "method": "accuracy_trigger_cloud_retraining",
                 "scenario_name": "road",
                 "edge_ids": [1],
@@ -171,15 +144,15 @@ def test_summary_rows_training_job_count_prefers_windowed_successes() -> None:
         ],
     }
     events = [
-        {"run_id": "accuracy-r1", "event_name": "training_job_succeeded", "job_id": "old-a"},
-        {"run_id": "accuracy-r1", "event_name": "training_job_succeeded", "job_id": "old-b"},
+        {"run_id": "road_n1_r01_accuracy_trigger_cloud_retraining", "event_name": "training_job_succeeded", "job_id": "old-a"},
+        {"run_id": "road_n1_r01_accuracy_trigger_cloud_retraining", "event_name": "training_job_succeeded", "job_id": "old-b"},
         {
-            "run_id": "accuracy-r1",
+            "run_id": "road_n1_r01_accuracy_trigger_cloud_retraining",
             "event_name": "training_job_succeeded",
             "job_id": "current",
         },
         {
-            "run_id": "accuracy-r1",
+            "run_id": "road_n1_r01_accuracy_trigger_cloud_retraining",
             "event_name": "training_job_succeeded",
             "job_id": "current",
             "window_id": "window-current",
@@ -196,7 +169,7 @@ def test_accuracy_trigger_upload_summary_uses_encoded_raw_bytes(tmp_path: Path) 
     manifest_path = _manifest(comparison_dir)
     _write_jsonl(
         comparison_dir
-        / "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1/metrics.jsonl",
+        / "raw_logs/scenario=road/edges=n1/repeat=r01/method=accuracy_trigger_cloud_retraining/edge_1/metrics.jsonl",
         [
             {
                 "event": "bundle_upload_done",
@@ -215,12 +188,12 @@ def test_accuracy_trigger_upload_summary_uses_encoded_raw_bytes(tmp_path: Path) 
     normalize(comparison_dir, manifest_path)
 
     uploads = read_csv(comparison_dir / "normalized/upload_breakdown.csv")
-    row = next(item for item in uploads if item["run_id"] == "accuracy-r1")
+    row = next(item for item in uploads if item["run_id"] == "road_n1_r01_accuracy_trigger_cloud_retraining")
     assert row["raw_frame_bytes"] == "70"
     assert row["total_upload_bytes"] == "70"
 
     summary = read_csv(comparison_dir / "normalized/summary.csv")
-    row = next(item for item in summary if item["run_id"] == "accuracy-r1")
+    row = next(item for item in summary if item["run_id"] == "road_n1_r01_accuracy_trigger_cloud_retraining")
     assert row["mean_upload_bytes"] == "70.0"
 
 
@@ -248,29 +221,29 @@ def test_normalizer_materializes_manifest_from_experiment_index(tmp_path: Path) 
         encoding="utf-8",
     )
     for path in (
-        "raw_logs/plank_road/cloud/main-r1",
-        "raw_logs/plank_road/edge_1/main-r1",
-        "raw_logs/pure_edge_local_updating/edge_1/pure-r1",
-        "raw_logs/accuracy_trigger_cloud_retraining/cloud/accuracy-r1",
-        "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=plank_road/cloud",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=plank_road/edge_1",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=pure_edge_local_updating/edge_1",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=accuracy_trigger_cloud_retraining/cloud",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=accuracy_trigger_cloud_retraining/edge_1",
     ):
         (comparison_dir / path).mkdir(parents=True, exist_ok=True)
 
     report = normalize(comparison_dir)
 
     assert (comparison_dir / "manifest.yaml").is_file()
-    assert report["structural_zero_runs"] == ["pure-r1"]
+    assert report["structural_zero_runs"] == ["road_n1_r01_pure_edge_local_updating"]
 
 
 def test_normalizer_handles_three_methods_and_preserves_missing_values(tmp_path: Path) -> None:
     comparison_dir = tmp_path / "comparison"
     manifest_path = _manifest(comparison_dir)
     _write_jsonl(
-        comparison_dir / "raw_logs/plank_road/edge_1/main-r1/latest_inference_results.jsonl",
+        comparison_dir / "raw_logs/scenario=road/edges=n1/repeat=r01/method=plank_road/edge_1/latest_inference_results.jsonl",
         [_minimal_frame(1)],
         bad_line=True,
     )
-    main_log = comparison_dir / "raw_logs/plank_road/edge_1/main-r1/edge.log"
+    main_log = comparison_dir / "raw_logs/scenario=road/edges=n1/repeat=r01/method=plank_road/edge_1/edge.log"
     main_log.parent.mkdir(parents=True, exist_ok=True)
     main_log.write_text(
         "\n".join(
@@ -288,12 +261,12 @@ def test_normalizer_handles_three_methods_and_preserves_missing_values(tmp_path:
         encoding="utf-8",
     )
     _write_jsonl(
-        comparison_dir / "raw_logs/pure_edge_local_updating/edge_1/pure-r1/metrics.jsonl",
+        comparison_dir / "raw_logs/scenario=road/edges=n1/repeat=r01/method=pure_edge_local_updating/edge_1/metrics.jsonl",
         [{"event": "frame_decision", "timestamp_ms": 1000, "frame_id": 1}],
     )
     _write_jsonl(
         comparison_dir
-        / "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1/metrics.jsonl",
+        / "raw_logs/scenario=road/edges=n1/repeat=r01/method=accuracy_trigger_cloud_retraining/edge_1/metrics.jsonl",
         [
             {
                 "event": "accuracy_trigger_window_uploaded",
@@ -313,7 +286,7 @@ def test_normalizer_handles_three_methods_and_preserves_missing_values(tmp_path:
         ],
     )
     accuracy_cloud_log = (
-        comparison_dir / "raw_logs/accuracy_trigger_cloud_retraining/cloud/accuracy-r1/cloud.log"
+        comparison_dir / "raw_logs/scenario=road/edges=n1/repeat=r01/method=accuracy_trigger_cloud_retraining/cloud/cloud.log"
     )
     accuracy_cloud_log.parent.mkdir(parents=True, exist_ok=True)
     accuracy_cloud_log.write_text(
@@ -348,14 +321,14 @@ def test_normalizer_handles_three_methods_and_preserves_missing_values(tmp_path:
     assert not any(row["window_id"] == "" and row["window_accuracy"] == "0.7000" for row in windows)
 
     uploads = read_csv(comparison_dir / "normalized/upload_breakdown.csv")
-    pure_upload = next(row for row in uploads if row["run_id"] == "pure-r1")
+    pure_upload = next(row for row in uploads if row["run_id"] == "road_n1_r01_pure_edge_local_updating")
     assert pure_upload["total_upload_bytes"] == "0"
-    main_upload = next(row for row in uploads if row["run_id"] == "main-r1")
+    main_upload = next(row for row in uploads if row["run_id"] == "road_n1_r01_plank_road")
     assert main_upload["total_upload_bytes"] == "10240"
     assert main_upload["raw_frame_bytes"] == ""
     assert main_upload["feature_bytes"] == ""
 
-    assert report["structural_zero_runs"] == ["pure-r1"]
+    assert report["structural_zero_runs"] == ["road_n1_r01_pure_edge_local_updating"]
     assert report["parse_errors"]
     assert "f1" in report["missing_metrics"]
     assert report["scenarios"][0]["video_slug"] == "road"
@@ -368,15 +341,17 @@ def test_normalizer_converts_ekya_raw_logs_from_manifest(tmp_path: Path) -> None
     raw = (
         comparison_dir
         / "raw_logs"
-        / "ekya_style_cloud_scheduling"
+        / "scenario=road"
+        / "edges=n1"
+        / "repeat=r01"
+        / "method=ekya_style_cloud_scheduling"
         / "cloud"
-        / "ekya-r1"
     )
     raw.mkdir(parents=True)
     (raw / "summary.json").write_text(
         json.dumps(
             {
-                "run_id": "ekya-r1",
+                "run_id": "legacy-ekya-run",
                 "student_model": "rfdetr_nano",
                 "teacher_model": "rtdetr_x",
                 "video_name": "road.mp4",
@@ -465,7 +440,13 @@ def test_normalizer_converts_ekya_raw_logs_from_manifest(tmp_path: Path) -> None
 
     frames = read_csv(comparison_dir / "normalized" / "frame_metrics.csv")
     summary = read_csv(comparison_dir / "normalized" / "summary.csv")
-    assert any(row["method"] == EKYA_CANONICAL_METHOD and row["f1"] == "0.75" for row in frames)
+    ekya_frame = next(row for row in frames if row["method"] == EKYA_CANONICAL_METHOD)
+    assert ekya_frame["run_id"] == "road_n1_r01_ekya_style_cloud_scheduling"
+    assert ekya_frame["experiment_id"] == "comparison-test"
+    assert ekya_frame["scenario_slug"] == "road"
+    assert ekya_frame["edge_count"] == "1"
+    assert ekya_frame["repeat"] == "1"
+    assert ekya_frame["f1"] == "0.75"
     assert any(
         row["method"] == EKYA_CANONICAL_METHOD and row["mean_upload_bytes"] == "123.0"
         for row in summary
@@ -477,15 +458,15 @@ def test_normalizer_extracts_pure_edge_local_tta_latency(tmp_path: Path) -> None
     comparison_dir = tmp_path / "comparison"
     manifest_path = _manifest(comparison_dir)
     for path in (
-        "raw_logs/plank_road/cloud/main-r1",
-        "raw_logs/plank_road/edge_1/main-r1",
-        "raw_logs/pure_edge_local_updating/edge_1/pure-r1",
-        "raw_logs/accuracy_trigger_cloud_retraining/cloud/accuracy-r1",
-        "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=plank_road/cloud",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=plank_road/edge_1",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=pure_edge_local_updating/edge_1",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=accuracy_trigger_cloud_retraining/cloud",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=accuracy_trigger_cloud_retraining/edge_1",
     ):
         (comparison_dir / path).mkdir(parents=True, exist_ok=True)
     _write_jsonl(
-        comparison_dir / "raw_logs/pure_edge_local_updating/edge_1/pure-r1/metrics.jsonl",
+        comparison_dir / "raw_logs/scenario=road/edges=n1/repeat=r01/method=pure_edge_local_updating/edge_1/metrics.jsonl",
         [
             {
                 "event": "surgeon_tta_triggered",
@@ -520,7 +501,7 @@ def test_normalizer_extracts_pure_edge_local_tta_latency(tmp_path: Path) -> None
     normalize(comparison_dir, manifest_path)
 
     events = read_csv(comparison_dir / "normalized/adaptation_events.csv")
-    pure_events = [row for row in events if row["run_id"] == "pure-r1"]
+    pure_events = [row for row in events if row["run_id"] == "road_n1_r01_pure_edge_local_updating"]
     assert [row["event_name"] for row in pure_events] == [
         "trigger_decision",
         "training_job_started",
@@ -532,13 +513,13 @@ def test_normalizer_extracts_pure_edge_local_tta_latency(tmp_path: Path) -> None
     assert update["result_model_version"] == "surgeon_1"
 
     latencies = read_csv(comparison_dir / "normalized/latency_breakdown.csv")
-    pure_latencies = [row for row in latencies if row["run_id"] == "pure-r1"]
+    pure_latencies = [row for row in latencies if row["run_id"] == "road_n1_r01_pure_edge_local_updating"]
     assert any(row["training_ms"] == "3000.0" for row in pure_latencies)
     assert any(row["model_apply_ms"] == "25.5" for row in pure_latencies)
     assert any(row["total_adaptation_ms"] == "3200" for row in pure_latencies)
 
     summary = read_csv(comparison_dir / "normalized/summary.csv")
-    pure_summary = next(row for row in summary if row["run_id"] == "pure-r1")
+    pure_summary = next(row for row in summary if row["run_id"] == "road_n1_r01_pure_edge_local_updating")
     assert pure_summary["mean_training_ms"] == "3000.0"
     assert pure_summary["mean_adaptation_ms"] == "3200.0"
     assert pure_summary["num_trigger_decisions"] == "1"
@@ -552,16 +533,16 @@ def test_accuracy_trigger_decision_is_anchored_to_uploaded_window(
     comparison_dir = tmp_path / "comparison"
     manifest_path = _manifest(comparison_dir)
     for path in (
-        "raw_logs/plank_road/cloud/main-r1",
-        "raw_logs/plank_road/edge_1/main-r1",
-        "raw_logs/pure_edge_local_updating/edge_1/pure-r1",
-        "raw_logs/accuracy_trigger_cloud_retraining/cloud/accuracy-r1",
-        "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=plank_road/cloud",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=plank_road/edge_1",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=pure_edge_local_updating/edge_1",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=accuracy_trigger_cloud_retraining/cloud",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=accuracy_trigger_cloud_retraining/edge_1",
     ):
         (comparison_dir / path).mkdir(parents=True, exist_ok=True)
     _write_jsonl(
         comparison_dir
-        / "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1/metrics.jsonl",
+        / "raw_logs/scenario=road/edges=n1/repeat=r01/method=accuracy_trigger_cloud_retraining/edge_1/metrics.jsonl",
         [
             {
                 "event": "accuracy_trigger_window_uploaded",
@@ -600,12 +581,12 @@ def test_accuracy_trigger_decision_is_anchored_to_uploaded_window(
     trigger = next(
         row
         for row in events
-        if row["run_id"] == "accuracy-r1" and row["event_name"] == "trigger_decision"
+        if row["run_id"] == "road_n1_r01_accuracy_trigger_cloud_retraining" and row["event_name"] == "trigger_decision"
     )
     assert trigger["frame_id"] == "60"
     assert trigger["event_time_ms"] == "2000"
     summary = read_csv(comparison_dir / "normalized/summary.csv")
-    accuracy_summary = next(row for row in summary if row["run_id"] == "accuracy-r1")
+    accuracy_summary = next(row for row in summary if row["run_id"] == "road_n1_r01_accuracy_trigger_cloud_retraining")
     assert accuracy_summary["mean_adaptation_ms"] == "9000.0"
 
 
@@ -615,14 +596,14 @@ def test_normalizer_does_not_count_false_resource_decision_as_trigger(
     comparison_dir = tmp_path / "comparison"
     manifest_path = _manifest(comparison_dir)
     for path in (
-        "raw_logs/plank_road/cloud/main-r1",
-        "raw_logs/pure_edge_local_updating/edge_1/pure-r1",
-        "raw_logs/accuracy_trigger_cloud_retraining/cloud/accuracy-r1",
-        "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=plank_road/cloud",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=pure_edge_local_updating/edge_1",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=accuracy_trigger_cloud_retraining/cloud",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=accuracy_trigger_cloud_retraining/edge_1",
     ):
         (comparison_dir / path).mkdir(parents=True, exist_ok=True)
     _write_jsonl(
-        comparison_dir / "raw_logs/plank_road/edge_1/main-r1/edge_metrics.jsonl",
+        comparison_dir / "raw_logs/scenario=road/edges=n1/repeat=r01/method=plank_road/edge_1/edge_metrics.jsonl",
         [
             {
                 "event": "resource_trigger_decision",
@@ -658,7 +639,7 @@ def test_normalizer_does_not_count_false_resource_decision_as_trigger(
     trigger_events = [
         row
         for row in events
-        if row["run_id"] == "main-r1" and row["event_name"] == "trigger_decision"
+        if row["run_id"] == "road_n1_r01_plank_road" and row["event_name"] == "trigger_decision"
     ]
     assert len(trigger_events) == 1
     assert trigger_events[0]["window_id"] == "window-true"
@@ -666,12 +647,12 @@ def test_normalizer_does_not_count_false_resource_decision_as_trigger(
     decisions = {
         row["window_id"]: row["trigger_decision"]
         for row in windows
-        if row["run_id"] == "main-r1"
+        if row["run_id"] == "road_n1_r01_plank_road"
     }
     assert decisions["window-false"] == "false"
     assert decisions["window-true"] == "true"
     summaries = read_csv(comparison_dir / "normalized/summary.csv")
-    main_summary = next(row for row in summaries if row["run_id"] == "main-r1")
+    main_summary = next(row for row in summaries if row["run_id"] == "road_n1_r01_plank_road")
     assert main_summary["num_trigger_decisions"] == "1"
 
 
@@ -679,30 +660,38 @@ def test_precomputed_accuracy_is_merged_without_detection_count_proxy(tmp_path: 
     comparison_dir = tmp_path / "comparison"
     manifest_path = _manifest(comparison_dir, accuracy_file="accuracy.csv")
     for method, run_id in (
-        ("plank_road", "main-r1"),
-        ("pure_edge_local_updating", "pure-r1"),
-        ("accuracy_trigger_cloud_retraining", "accuracy-r1"),
+        ("plank_road", "road_n1_r01_plank_road"),
+        ("pure_edge_local_updating", "road_n1_r01_pure_edge_local_updating"),
+        ("accuracy_trigger_cloud_retraining", "road_n1_r01_accuracy_trigger_cloud_retraining"),
     ):
+        raw_base = (
+            comparison_dir
+            / "raw_logs"
+            / "scenario=road"
+            / "edges=n1"
+            / "repeat=r01"
+            / f"method={method}"
+        )
         if method == "plank_road":
-            cloud = comparison_dir / f"raw_logs/{method}/cloud/{run_id}"
-            edge = comparison_dir / f"raw_logs/{method}/edge_1/{run_id}"
+            cloud = raw_base / "cloud"
+            edge = raw_base / "edge_1"
         elif method == "pure_edge_local_updating":
             cloud = None
-            edge = comparison_dir / f"raw_logs/{method}/edge_1/{run_id}"
+            edge = raw_base / "edge_1"
         else:
-            cloud = comparison_dir / f"raw_logs/{method}/cloud/{run_id}"
-            edge = comparison_dir / f"raw_logs/{method}/edge_1/{run_id}"
+            cloud = raw_base / "cloud"
+            edge = raw_base / "edge_1"
         edge.mkdir(parents=True, exist_ok=True)
         if cloud is not None:
             cloud.mkdir(parents=True, exist_ok=True)
     _write_jsonl(
-        comparison_dir / "raw_logs/plank_road/edge_1/main-r1/latest_inference_results.jsonl",
+        comparison_dir / "raw_logs/scenario=road/edges=n1/repeat=r01/method=plank_road/edge_1/latest_inference_results.jsonl",
         [_minimal_frame(3)],
     )
     (comparison_dir / "accuracy.csv").write_text(
         "run_id,method,scenario_name,edge_id,frame_id,timestamp_ms,window_id,"
         "f1,map,window_accuracy\n"
-        "main-r1,plank_road,road,1,3,13000,,0.55,0.44,\n",
+        "road_n1_r01_plank_road,plank_road,road,1,3,13000,,0.55,0.44,\n",
         encoding="utf-8",
     )
 
@@ -719,14 +708,14 @@ def test_events_are_deduplicated_and_cross_file_latency_is_derived(
     comparison_dir = tmp_path / "comparison"
     manifest_path = _manifest(comparison_dir)
     for path in (
-        "raw_logs/plank_road/cloud/main-r1",
-        "raw_logs/plank_road/edge_1/main-r1",
-        "raw_logs/pure_edge_local_updating/edge_1/pure-r1",
-        "raw_logs/accuracy_trigger_cloud_retraining/cloud/accuracy-r1",
-        "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=plank_road/cloud",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=plank_road/edge_1",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=pure_edge_local_updating/edge_1",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=accuracy_trigger_cloud_retraining/cloud",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=accuracy_trigger_cloud_retraining/edge_1",
     ):
         (comparison_dir / path).mkdir(parents=True, exist_ok=True)
-    (comparison_dir / "raw_logs/plank_road/cloud/main-r1/cloud.log").write_text(
+    (comparison_dir / "raw_logs/scenario=road/edges=n1/repeat=r01/method=plank_road/cloud/cloud.log").write_text(
         "\n".join(
             [
                 "2026-06-01 10:00:00.000 | INFO | x - "
@@ -743,13 +732,13 @@ def test_events_are_deduplicated_and_cross_file_latency_is_derived(
         + "\n",
         encoding="utf-8",
     )
-    (comparison_dir / "raw_logs/plank_road/edge_1/main-r1/edge.log").write_text(
+    (comparison_dir / "raw_logs/scenario=road/edges=n1/repeat=r01/method=plank_road/edge_1/edge.log").write_text(
         "2026-06-01 10:00:00.100 | INFO | x - "
         "[EdgeCL] training status=SUCCEEDED queue_position=-1.\n",
         encoding="utf-8",
     )
     (
-        comparison_dir / "raw_logs/accuracy_trigger_cloud_retraining/cloud/accuracy-r1/cloud.log"
+        comparison_dir / "raw_logs/scenario=road/edges=n1/repeat=r01/method=accuracy_trigger_cloud_retraining/cloud/cloud.log"
     ).write_text(
         "2026-06-01 10:00:00.000 | INFO | x - "
         "accuracy_trigger_window_decision edge=1 accuracy=0.7 "
@@ -760,7 +749,7 @@ def test_events_are_deduplicated_and_cross_file_latency_is_derived(
     )
     _write_jsonl(
         comparison_dir
-        / "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1/metrics.jsonl",
+        / "raw_logs/scenario=road/edges=n1/repeat=r01/method=accuracy_trigger_cloud_retraining/edge_1/metrics.jsonl",
         [
             {
                 "event": "cloud_scheduled_model_update_applied",
@@ -774,8 +763,8 @@ def test_events_are_deduplicated_and_cross_file_latency_is_derived(
     normalize(comparison_dir, manifest_path)
 
     summary = read_csv(comparison_dir / "normalized/summary.csv")
-    main = next(row for row in summary if row["run_id"] == "main-r1")
-    accuracy = next(row for row in summary if row["run_id"] == "accuracy-r1")
+    main = next(row for row in summary if row["run_id"] == "road_n1_r01_plank_road")
+    accuracy = next(row for row in summary if row["run_id"] == "road_n1_r01_accuracy_trigger_cloud_retraining")
     assert main["num_training_jobs"] == "1"
     assert accuracy["mean_adaptation_ms"] == "5000.0"
 
@@ -793,15 +782,15 @@ def test_structured_events_capture_bytes_and_derive_stage_latency(tmp_path: Path
     comparison_dir = tmp_path / "comparison"
     manifest_path = _manifest(comparison_dir)
     for path in (
-        "raw_logs/plank_road/cloud/main-r1",
-        "raw_logs/plank_road/edge_1/main-r1",
-        "raw_logs/pure_edge_local_updating/edge_1/pure-r1",
-        "raw_logs/accuracy_trigger_cloud_retraining/cloud/accuracy-r1",
-        "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=plank_road/cloud",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=plank_road/edge_1",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=pure_edge_local_updating/edge_1",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=accuracy_trigger_cloud_retraining/cloud",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=accuracy_trigger_cloud_retraining/edge_1",
     ):
         (comparison_dir / path).mkdir(parents=True, exist_ok=True)
     _write_jsonl(
-        comparison_dir / "raw_logs/plank_road/edge_1/main-r1/edge_metrics.jsonl",
+        comparison_dir / "raw_logs/scenario=road/edges=n1/repeat=r01/method=plank_road/edge_1/edge_metrics.jsonl",
         [
             {
                 "event": "resource_trigger_decision",
@@ -861,7 +850,7 @@ def test_structured_events_capture_bytes_and_derive_stage_latency(tmp_path: Path
     measured = next(
         row
         for row in uploads
-        if row["run_id"] == "main-r1" and row["total_upload_bytes"] == "100"
+        if row["run_id"] == "road_n1_r01_plank_road" and row["total_upload_bytes"] == "100"
     )
     assert measured["raw_frame_bytes"] == "70"
     assert measured["feature_bytes"] == "20"
@@ -869,7 +858,7 @@ def test_structured_events_capture_bytes_and_derive_stage_latency(tmp_path: Path
     download = next(
         row
         for row in uploads
-        if row["run_id"] == "main-r1"
+        if row["run_id"] == "road_n1_r01_plank_road"
         and row["model_update_download_bytes"] == "40"
     )
     assert download["total_upload_bytes"] == ""
@@ -896,16 +885,16 @@ def test_accuracy_terminal_message_training_ms_overrides_job_interval(
     comparison_dir = tmp_path / "comparison"
     manifest_path = _manifest(comparison_dir)
     for path in (
-        "raw_logs/plank_road/cloud/main-r1",
-        "raw_logs/plank_road/edge_1/main-r1",
-        "raw_logs/pure_edge_local_updating/edge_1/pure-r1",
-        "raw_logs/accuracy_trigger_cloud_retraining/cloud/accuracy-r1",
-        "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=plank_road/cloud",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=plank_road/edge_1",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=pure_edge_local_updating/edge_1",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=accuracy_trigger_cloud_retraining/cloud",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=accuracy_trigger_cloud_retraining/edge_1",
     ):
         (comparison_dir / path).mkdir(parents=True, exist_ok=True)
     _write_jsonl(
         comparison_dir
-        / "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1/metrics.jsonl",
+        / "raw_logs/scenario=road/edges=n1/repeat=r01/method=accuracy_trigger_cloud_retraining/edge_1/metrics.jsonl",
         [
             {
                 "event": "cloud_scheduled_training_job_started",
@@ -931,7 +920,7 @@ def test_accuracy_terminal_message_training_ms_overrides_job_interval(
 
     latency = read_csv(comparison_dir / "normalized/latency_breakdown.csv")
     accuracy_rows = [
-        row for row in latency if row["run_id"] == "accuracy-r1" and row["training_ms"]
+        row for row in latency if row["run_id"] == "road_n1_r01_accuracy_trigger_cloud_retraining" and row["training_ms"]
     ]
     assert [row["training_ms"] for row in accuracy_rows] == ["1234.5"]
 
@@ -940,20 +929,20 @@ def test_stage_latency_keeps_existing_total_without_total_pair(tmp_path: Path) -
     comparison_dir = tmp_path / "comparison"
     manifest_path = _manifest(comparison_dir)
     for path in (
-        "raw_logs/plank_road/cloud/main-r1",
-        "raw_logs/plank_road/edge_1/main-r1",
-        "raw_logs/pure_edge_local_updating/edge_1/pure-r1",
-        "raw_logs/accuracy_trigger_cloud_retraining/cloud/accuracy-r1",
-        "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=plank_road/cloud",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=plank_road/edge_1",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=pure_edge_local_updating/edge_1",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=accuracy_trigger_cloud_retraining/cloud",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=accuracy_trigger_cloud_retraining/edge_1",
     ):
         (comparison_dir / path).mkdir(parents=True, exist_ok=True)
-    (comparison_dir / "raw_logs/plank_road/cloud/main-r1/cloud.log").write_text(
+    (comparison_dir / "raw_logs/scenario=road/edges=n1/repeat=r01/method=plank_road/cloud/cloud.log").write_text(
         "2026-06-01 10:00:00.000 | INFO | x - "
         "[FixedSplitCL] total round time took 3.000s.\n",
         encoding="utf-8",
     )
     _write_jsonl(
-        comparison_dir / "raw_logs/plank_road/edge_1/main-r1/edge_metrics.jsonl",
+        comparison_dir / "raw_logs/scenario=road/edges=n1/repeat=r01/method=plank_road/edge_1/edge_metrics.jsonl",
         [
             {
                 "event": "bundle_upload_started",
@@ -983,15 +972,15 @@ def test_structured_latency_prefers_payload_values_and_matching_ids(
     comparison_dir = tmp_path / "comparison"
     manifest_path = _manifest(comparison_dir)
     for path in (
-        "raw_logs/plank_road/cloud/main-r1",
-        "raw_logs/plank_road/edge_1/main-r1",
-        "raw_logs/pure_edge_local_updating/edge_1/pure-r1",
-        "raw_logs/accuracy_trigger_cloud_retraining/cloud/accuracy-r1",
-        "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=plank_road/cloud",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=plank_road/edge_1",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=pure_edge_local_updating/edge_1",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=accuracy_trigger_cloud_retraining/cloud",
+        "raw_logs/scenario=road/edges=n1/repeat=r01/method=accuracy_trigger_cloud_retraining/edge_1",
     ):
         (comparison_dir / path).mkdir(parents=True, exist_ok=True)
     _write_jsonl(
-        comparison_dir / "raw_logs/plank_road/edge_1/main-r1/edge_metrics.jsonl",
+        comparison_dir / "raw_logs/scenario=road/edges=n1/repeat=r01/method=plank_road/edge_1/edge_metrics.jsonl",
         [
             {
                 "event": "training_job_succeeded",
@@ -1017,7 +1006,7 @@ def test_structured_latency_prefers_payload_values_and_matching_ids(
     )
     _write_jsonl(
         comparison_dir
-        / "raw_logs/accuracy_trigger_cloud_retraining/edge_1/accuracy-r1/metrics.jsonl",
+        / "raw_logs/scenario=road/edges=n1/repeat=r01/method=accuracy_trigger_cloud_retraining/edge_1/metrics.jsonl",
         [
             {
                 "event": "training_job_succeeded",
@@ -1037,8 +1026,8 @@ def test_structured_latency_prefers_payload_values_and_matching_ids(
     normalize(comparison_dir, manifest_path)
 
     latency = read_csv(comparison_dir / "normalized/latency_breakdown.csv")
-    main_latency = [row for row in latency if row["run_id"] == "main-r1"]
-    accuracy_latency = [row for row in latency if row["run_id"] == "accuracy-r1"]
+    main_latency = [row for row in latency if row["run_id"] == "road_n1_r01_plank_road"]
+    accuracy_latency = [row for row in latency if row["run_id"] == "road_n1_r01_accuracy_trigger_cloud_retraining"]
     assert any(row["model_update_download_ms"] == "123.0" for row in main_latency)
     assert not any(row["model_update_download_ms"] == "5000" for row in main_latency)
     assert any(row["model_apply_ms"] == "77.0" for row in main_latency)

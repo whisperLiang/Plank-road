@@ -29,7 +29,6 @@ def test_canonical_pool_commits_shard_refs_without_feature_pt(tmp_path) -> None:
     pool = CloudSamplePool(str(tmp_path / "pool"), model_id="yolo26n", split_config_id="split-a")
     pool.store_pending_high_quality_samples(samples)
     contract = SplitRuntimeContract(
-        contract_version="fixed-split-runtime-contract.v2",
         contract_id="contract-a",
         edge_id="1",
         model_id="yolo26n",

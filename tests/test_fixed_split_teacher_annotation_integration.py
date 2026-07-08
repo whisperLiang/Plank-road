@@ -196,7 +196,6 @@ def test_cache_label_format_is_accepted_by_cloud_sample_pool(tmp_path) -> None:
                     "labels": [1],
                     "scores": [0.9],
                     "label_coordinate_space": "original_xyxy",
-                    "label_runtime_version": "fixed-split-pool-labels.v1",
                 },
             )
         ]
@@ -310,7 +309,6 @@ def test_low_quality_materialized_samples_submit_early(tmp_path) -> None:
         raw_dir = tmp_path / "bundle" / "low_quality_staging" / "raw"
         raw_path = _write_image(raw_dir, "sample-1")
         manifest = {
-            "protocol_version": "low-quality-trigger-shard.v1",
             "samples": [
                 {
                     "sample_id": "sample-1",

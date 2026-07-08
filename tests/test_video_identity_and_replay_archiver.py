@@ -58,18 +58,16 @@ def test_replay_frame_archiver_writes_chunked_zip(tmp_path: Path) -> None:
         (),
         {
             "max_artifact_bytes": 100_000,
-            "include_inference_results": True,
-            "include_baseline_metrics": False,
-            "include_edge_summary": True,
-            "include_trigger_manifest": False,
-            "include_runtime_logs": False,
         },
     )()
     artifacts = collect_edge_artifacts(
         method="plank_road",
         run_id="plank_road_camera_001",
         edge_id=1,
-        comparison_id="exp_camera_plankroad_vs_baselines_001",
+        experiment_id="exp_camera_plankroad_vs_baselines_001",
+        scenario_slug="camera",
+        edge_count=1,
+        repeat=1,
         config=config,
         inference_result_path=inference,
         baseline_metrics_path=None,

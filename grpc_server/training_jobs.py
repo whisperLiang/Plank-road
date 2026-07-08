@@ -53,7 +53,7 @@ class TrainingJob:
     request_id: str
     job_type: int
     workspace: str
-    protocol_version: str
+    protocol_version: str = ""
     workspace_root: str = "./cache/server_workspace"
     request_kind: str = ""
     payload_zip: bytes = b""
@@ -129,7 +129,7 @@ class TrainingJobManager:
         request_id: str,
         job_type: int,
         workspace: str,
-        protocol_version: str,
+        protocol_version: str = "",
         workspace_root: str = "./cache/server_workspace",
         request_kind: str = "",
         payload_zip: bytes = b"",

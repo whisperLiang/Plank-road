@@ -621,8 +621,11 @@ class EkyaServerMessage(_message.Message):
     def __init__(self, detection_result: _Optional[_Union[EkyaDetectionResult, _Mapping]] = ..., ack: _Optional[_Union[EkyaAck, _Mapping]] = ..., error: _Optional[_Union[EkyaAck, _Mapping]] = ...) -> None: ...
 
 class ExperimentResultArtifact(_message.Message):
-    __slots__ = ("comparison_id", "run_id", "method", "edge_id", "relative_path", "content", "size_bytes", "sha256", "content_type", "is_final")
-    COMPARISON_ID_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ("experiment_id", "scenario_slug", "edge_count", "repeat", "run_id", "method", "edge_id", "relative_path", "content", "size_bytes", "sha256", "content_type", "is_final")
+    EXPERIMENT_ID_FIELD_NUMBER: _ClassVar[int]
+    SCENARIO_SLUG_FIELD_NUMBER: _ClassVar[int]
+    EDGE_COUNT_FIELD_NUMBER: _ClassVar[int]
+    REPEAT_FIELD_NUMBER: _ClassVar[int]
     RUN_ID_FIELD_NUMBER: _ClassVar[int]
     METHOD_FIELD_NUMBER: _ClassVar[int]
     EDGE_ID_FIELD_NUMBER: _ClassVar[int]
@@ -632,7 +635,10 @@ class ExperimentResultArtifact(_message.Message):
     SHA256_FIELD_NUMBER: _ClassVar[int]
     CONTENT_TYPE_FIELD_NUMBER: _ClassVar[int]
     IS_FINAL_FIELD_NUMBER: _ClassVar[int]
-    comparison_id: str
+    experiment_id: str
+    scenario_slug: str
+    edge_count: int
+    repeat: int
     run_id: str
     method: str
     edge_id: int
@@ -642,21 +648,27 @@ class ExperimentResultArtifact(_message.Message):
     sha256: str
     content_type: str
     is_final: bool
-    def __init__(self, comparison_id: _Optional[str] = ..., run_id: _Optional[str] = ..., method: _Optional[str] = ..., edge_id: _Optional[int] = ..., relative_path: _Optional[str] = ..., content: _Optional[bytes] = ..., size_bytes: _Optional[int] = ..., sha256: _Optional[str] = ..., content_type: _Optional[str] = ..., is_final: bool = ...) -> None: ...
+    def __init__(self, experiment_id: _Optional[str] = ..., scenario_slug: _Optional[str] = ..., edge_count: _Optional[int] = ..., repeat: _Optional[int] = ..., run_id: _Optional[str] = ..., method: _Optional[str] = ..., edge_id: _Optional[int] = ..., relative_path: _Optional[str] = ..., content: _Optional[bytes] = ..., size_bytes: _Optional[int] = ..., sha256: _Optional[str] = ..., content_type: _Optional[str] = ..., is_final: bool = ...) -> None: ...
 
 class UploadExperimentResultRequest(_message.Message):
-    __slots__ = ("comparison_id", "run_id", "method", "edge_id", "artifacts")
-    COMPARISON_ID_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ("experiment_id", "scenario_slug", "edge_count", "repeat", "run_id", "method", "edge_id", "artifacts")
+    EXPERIMENT_ID_FIELD_NUMBER: _ClassVar[int]
+    SCENARIO_SLUG_FIELD_NUMBER: _ClassVar[int]
+    EDGE_COUNT_FIELD_NUMBER: _ClassVar[int]
+    REPEAT_FIELD_NUMBER: _ClassVar[int]
     RUN_ID_FIELD_NUMBER: _ClassVar[int]
     METHOD_FIELD_NUMBER: _ClassVar[int]
     EDGE_ID_FIELD_NUMBER: _ClassVar[int]
     ARTIFACTS_FIELD_NUMBER: _ClassVar[int]
-    comparison_id: str
+    experiment_id: str
+    scenario_slug: str
+    edge_count: int
+    repeat: int
     run_id: str
     method: str
     edge_id: int
     artifacts: _containers.RepeatedCompositeFieldContainer[ExperimentResultArtifact]
-    def __init__(self, comparison_id: _Optional[str] = ..., run_id: _Optional[str] = ..., method: _Optional[str] = ..., edge_id: _Optional[int] = ..., artifacts: _Optional[_Iterable[_Union[ExperimentResultArtifact, _Mapping]]] = ...) -> None: ...
+    def __init__(self, experiment_id: _Optional[str] = ..., scenario_slug: _Optional[str] = ..., edge_count: _Optional[int] = ..., repeat: _Optional[int] = ..., run_id: _Optional[str] = ..., method: _Optional[str] = ..., edge_id: _Optional[int] = ..., artifacts: _Optional[_Iterable[_Union[ExperimentResultArtifact, _Mapping]]] = ...) -> None: ...
 
 class UploadExperimentResultResponse(_message.Message):
     __slots__ = ("accepted", "message", "stored_paths")

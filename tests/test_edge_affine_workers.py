@@ -1111,7 +1111,6 @@ def test_routed_backend_forwards_exclusive_gpu_lease_flag() -> None:
     backend = EdgeWorkerRoutedContinualLearningBackend(worker_pool=pool)
     backend.submit_training_job(
         SimpleNamespace(
-            protocol_version="v1",
             edge_id=1,
             request_id="req-exclusive",
             job_type=message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_TRAINING,
@@ -1164,7 +1163,6 @@ def test_routed_backend_reports_expired_lease_as_retryable_failure() -> None:
     )
     submit_reply = backend.submit_training_job(
         message_transmission_pb2.SubmitTrainingJobRequest(
-            protocol_version="v1",
             edge_id=1,
             request_id="req-a",
             job_type=message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING,
@@ -1214,7 +1212,6 @@ def test_routed_backend_restarts_worker_for_exclusive_oom_retry() -> None:
                     message="CUDA out of memory during suffix training",
                     request_id="req-a",
                     job_type=message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING,
-                    protocol_version="v1",
                     base_model_version="0",
                 )
             return message_transmission_pb2.TrainingJobStatusReply(
@@ -1225,7 +1222,6 @@ def test_routed_backend_restarts_worker_for_exclusive_oom_retry() -> None:
                 queue_position=0,
                 request_id="req-a:exclusive-retry",
                 job_type=message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING,
-                protocol_version="v1",
                 base_model_version="0",
             )
 
@@ -1236,7 +1232,6 @@ def test_routed_backend_restarts_worker_for_exclusive_oom_retry() -> None:
                 job_id=request.job_id,
                 status="SUCCEEDED",
                 model_data="weights",
-                protocol_version="v1",
                 result_model_version="1",
             )
 
@@ -1256,7 +1251,6 @@ def test_routed_backend_restarts_worker_for_exclusive_oom_retry() -> None:
     backend = EdgeWorkerRoutedContinualLearningBackend(worker_pool=pool)
     submit_reply = backend.submit_training_job(
         message_transmission_pb2.SubmitTrainingJobRequest(
-            protocol_version="v1",
             edge_id=1,
             request_id="req-a",
             job_type=message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING,
@@ -1334,9 +1328,8 @@ def test_cloud_server_worker_pool_does_not_create_local_training_objects(
     config = load_runtime_config("./config/config.yaml").server
     config.workspace_root = str(tmp_path)
     config.edge_affine_workers.enabled = True
-    config.edge_affine_workers.run_id = "run-a"
 
-    server = CloudServer(config, yaml_path="./config/config.yaml")
+    server = CloudServer(config, run_id="run-a", yaml_path="./config/config.yaml")
 
     assert server.large_object_detection is None
     assert not hasattr(server, "continual_learner")
@@ -1406,7 +1399,6 @@ def test_cloud_server_baseline_loads_teacher_detector_only(
     accuracy_config = runtime.server
     accuracy_config.workspace_root = str(tmp_path / "accuracy")
     accuracy_config.edge_affine_workers.enabled = True
-    accuracy_config.edge_affine_workers.run_id = "run-accuracy"
     accuracy_server = CloudServer(
         accuracy_config,
         mode="baseline",

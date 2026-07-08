@@ -51,25 +51,20 @@ guess weather labels from filenames.
 
 ## Result Layout
 
-Use one comparison directory:
+Use one experiment directory:
 
 ```text
-results/experiments/{comparison_id}/
+results/experiments/{experiment_id}/
   manifest.yaml
   raw_logs/
-    plank_road/
-    pure_edge_local_updating/
-    accuracy_trigger_cloud_retraining/
-    ekya_style_cloud_scheduling/
+    scenario={scenario_slug}/edges=n{edge_count}/repeat=r{repeat}/method={method}/
   normalized/
   figures/
 ```
 
-Each `runs` entry maps one run to its method, scenario, edge IDs, repeat, and
-raw-log directories. Add one complete set of method/scenario run entries for
-each repeat. The example manifest at
-`configs/experiments/plank_road_baselines_manifest.example.yaml` lists repeat
-`r1`; duplicate those entries for `r2` through `r5` as needed.
+The matrix manifest lists `methods`, `scenarios`, `edge_counts`, `repeats`, and
+`edge_ids_by_count`. The normalizer expands that matrix and reports missing raw
+log combinations without generating placeholder data.
 
 The required `log_timezone` field must name the IANA timezone used by the
 machines that generated Loguru text logs, for example `Asia/Shanghai`.
@@ -81,8 +76,8 @@ Run the evaluator before normalization:
 
 ```bash
 python tools/experiments/evaluate_plank_road_baseline_teacher_accuracy.py \
-  --comparison_dir results/experiments/{comparison_id} \
-  --manifest results/experiments/{comparison_id}/manifest.yaml \
+  --comparison_dir results/experiments/{experiment_id} \
+  --manifest results/experiments/{experiment_id}/manifest.yaml \
   --teacher_model rtdetr_x \
   --device cuda:0 \
   --update_manifest
@@ -97,12 +92,12 @@ real measured values; detection counts and confidence are not accuracy.
 
 ```bash
 python tools/experiments/normalize_plank_road_baseline_logs.py \
-  --comparison_dir results/experiments/{comparison_id} \
-  --manifest results/experiments/{comparison_id}/manifest.yaml
+  --comparison_dir results/experiments/{experiment_id} \
+  --manifest results/experiments/{experiment_id}/manifest.yaml
 
 python tools/experiments/plot_plank_road_baseline_figures.py \
-  --normalized_dir results/experiments/{comparison_id}/normalized \
-  --figure_dir results/experiments/{comparison_id}/figures
+  --normalized_dir results/experiments/{experiment_id}/normalized \
+  --figure_dir results/experiments/{experiment_id}/figures
 ```
 
 The main plotting command emits exactly:

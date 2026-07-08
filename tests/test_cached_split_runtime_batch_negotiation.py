@@ -99,7 +99,6 @@ def test_runtime_identity_uses_public_splitter_dynamic_batch_range() -> None:
         split_spec=split_spec,
         trace_graph=types.SimpleNamespace(graph_shape_hash="graph"),
         symbolic_input_schema={"input": [1, 3, 384, 384]},
-        adapter_version="adapter",
         trace_batch_size=2,
     )
     splitter = types.SimpleNamespace(runtime=runtime)

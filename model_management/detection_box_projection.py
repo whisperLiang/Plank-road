@@ -320,6 +320,4 @@ def canonicalize_labels_to_original_xyxy(
             model_input_size,
             resize_mode,
         )
-    if labels.get("label_runtime_version") is not None:
-        canonical["label_runtime_version"] = labels["label_runtime_version"]
     return canonical

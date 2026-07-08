@@ -16,8 +16,6 @@ from cloud.sample_pool.labels import (
 from model_management.payload import BoundaryPayload
 from model_management.split_contract import feature_layout_from_tensors
 
-CANONICAL_RECORD_VERSION = "canonical-sample-record.v1"
-GENERATION_MANIFEST_VERSION = "canonical-cloud-sample-pool.v1"
 CANONICAL_FEATURE_METADATA_FIELDS = {
     "sample_id",
     "contract_id",
@@ -128,7 +126,6 @@ class CanonicalSampleRecord:
 
     def to_label_payload(self) -> dict[str, Any]:
         return {
-            "schema_version": CANONICAL_RECORD_VERSION,
             "sample_id": self.sample_id,
             "boxes": list(self.labels.get("boxes") or []),
             "labels": list(self.labels.get("labels") or []),
@@ -151,7 +148,6 @@ class CanonicalSampleRecord:
         generation_id: str,
     ) -> dict[str, Any]:
         return {
-            "schema_version": CANONICAL_RECORD_VERSION,
             "sample_id": self.sample_id,
             "contract_id": self.contract_id,
             "split_config_id": self.split_config_id,
@@ -207,7 +203,5 @@ class CanonicalSampleRecord:
 
 __all__ = [
     "CANONICAL_FEATURE_METADATA_FIELDS",
-    "CANONICAL_RECORD_VERSION",
     "CanonicalSampleRecord",
-    "GENERATION_MANIFEST_VERSION",
 ]

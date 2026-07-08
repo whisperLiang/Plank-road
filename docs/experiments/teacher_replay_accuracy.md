@@ -10,26 +10,30 @@ must not call this actual, real, or ground-truth accuracy.
 
 ## Workflow
 
-Run all three methods with video-aware comparison and run IDs. For example:
+Run all methods with the same experiment identity. For example:
 
 ```bash
 python cloud_server.py \
   --yaml_path ./config/config.yaml \
   --mode main \
-  --run_id plank_road_road_001 \
-  --comparison_id exp_road_plankroad_vs_baselines_001
+  --experiment_id exp_road_plankroad_vs_baselines_001 \
+  --scenario road \
+  --edge_count 1 \
+  --repeat 1
 
 python edge_client.py \
   --yaml_path ./config/config.yaml \
   --mode main \
-  --run_id plank_road_road_001 \
-  --comparison_id exp_road_plankroad_vs_baselines_001 \
+  --experiment_id exp_road_plankroad_vs_baselines_001 \
+  --scenario road \
+  --edge_count 1 \
+  --repeat 1 \
   --video_path ./video_data/road.mp4 \
   --headless
 ```
 
-Use corresponding `pure_edge_road_001` and `accuracy_trigger_road_001` run IDs
-for the baselines. After all artifacts are present:
+Use the same identity for baseline processes; method-specific `run_id` values are
+generated automatically. After all artifacts are present:
 
 ```bash
 python tools/experiments/evaluate_plank_road_baseline_teacher_accuracy.py \

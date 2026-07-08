@@ -308,8 +308,6 @@ class BaselineTrainingConfig(ConfigSection):
 class BaselineConfig(ConfigSection):
     enabled: bool = False
     method: str = "accuracy_trigger_cloud_retraining"
-    run_id: str | None = None
-    results_root: str = "results/baselines_distributed"
     edge: BaselineEdgeConfig = field(default_factory=BaselineEdgeConfig)
     training: BaselineTrainingConfig = field(default_factory=BaselineTrainingConfig)
     pure_edge_local_updating: PureEdgeBaselineConfig = field(default_factory=PureEdgeBaselineConfig)
@@ -322,28 +320,11 @@ class BaselineConfig(ConfigSection):
 
 
 @dataclass
-class PureEdgeRemoteSyncConfig(ConfigSection):
-    target: str = ""
-    timeout_sec: float = 300.0
-
-
-@dataclass
 class ExperimentResultsConfig(ConfigSection):
     enabled: bool = True
-    comparison_id: str = "exp_road_plankroad_vs_baselines_001"
     root_dir: str = "results/experiments"
     local_root_dir: str = "cache/experiment_results"
-    upload_to_cloud: bool = True
-    upload_on_shutdown: bool = True
-    include_inference_results: bool = True
-    include_baseline_metrics: bool = True
-    include_edge_summary: bool = True
-    include_trigger_manifest: bool = True
-    include_runtime_logs: bool = False
     max_artifact_bytes: int = 268435456
-    pure_edge_remote_sync: PureEdgeRemoteSyncConfig = field(
-        default_factory=PureEdgeRemoteSyncConfig
-    )
 
 
 @dataclass
@@ -405,7 +386,6 @@ class WorkerServiceConfig(ConfigSection):
 @dataclass
 class EdgeAffineWorkersConfig(ConfigSection):
     enabled: bool = True
-    run_id: str | None = None
     mode: str = "edge_affine_single_gpu_mps"
     edge_workers: EdgeWorkerConfig = field(default_factory=EdgeWorkerConfig)
     mps: MPSConfig = field(default_factory=MPSConfig)
@@ -600,11 +580,6 @@ def _section(section_cls, value: Mapping[str, Any] | None):
         )
     elif section_cls is SplitLearningConfig:
         known["fixed_split"] = _section(FixedSplitConfig, known.get("fixed_split"))
-    elif section_cls is ExperimentResultsConfig:
-        known["pure_edge_remote_sync"] = _section(
-            PureEdgeRemoteSyncConfig,
-            known.get("pure_edge_remote_sync"),
-        )
     elif section_cls is ContinualLearningConfig:
         known["teacher_annotation"] = _section(
             TeacherAnnotationConfig,
@@ -848,6 +823,40 @@ def _reject_removed_ekya_config_fields(
         )
 
 
+def _reject_removed_config_fields(config: RuntimeConfig) -> None:
+    removed_by_section: dict[str, tuple[ConfigSection, set[str]]] = {
+        "experiment_results": (
+            config.experiment_results,
+            {
+                "comparison_id",
+                "upload_to_cloud",
+                "upload_on_shutdown",
+                "include_inference_results",
+                "include_baseline_metrics",
+                "include_edge_summary",
+                "include_trigger_manifest",
+                "include_runtime_logs",
+                "pure_edge_remote_sync",
+            },
+        ),
+        "baseline": (config.baseline, {"run_id", "results_root"}),
+        "server.edge_affine_workers": (
+            config.server.edge_affine_workers,
+            {"run_id"},
+        ),
+    }
+    removed: list[str] = []
+    for section_path, (section, fields) in removed_by_section.items():
+        extras = set(getattr(section, "_extras", {}) or {})
+        removed.extend(f"{section_path}.{name}" for name in sorted(extras & fields))
+    if removed:
+        raise ValueError(
+            "These config fields were removed by the current experiment layout: "
+            + ", ".join(removed)
+            + ". Use CLI experiment identity fields instead."
+        )
+
+
 def _validate_sample_pool_config(name: str, value: SamplePoolConfig) -> None:
     if not isinstance(value.enabled, bool):
         raise ValueError(f"{name}.enabled must be a boolean, got {value.enabled!r}")
@@ -873,6 +882,7 @@ def _validate_sample_pool_config(name: str, value: SamplePoolConfig) -> None:
 
 
 def _validate_runtime_config(config: RuntimeConfig) -> None:
+    _reject_removed_config_fields(config)
     removed_fields = {
         "client.retrain.batch_size": (
             "client.retrain.batch_size has been removed; "
@@ -966,32 +976,15 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
 
     _validate_sample_pool_config("sample_pool", config.sample_pool)
     experiment_results = config.experiment_results
-    for name in (
-        "enabled",
-        "upload_to_cloud",
-        "upload_on_shutdown",
-        "include_inference_results",
-        "include_baseline_metrics",
-        "include_edge_summary",
-        "include_trigger_manifest",
-        "include_runtime_logs",
-    ):
+    for name in ("enabled",):
         if not isinstance(getattr(experiment_results, name), bool):
             raise ValueError(f"experiment_results.{name} must be a boolean")
-    for name in ("comparison_id", "root_dir", "local_root_dir"):
+    for name in ("root_dir", "local_root_dir"):
         if not str(getattr(experiment_results, name) or "").strip():
             raise ValueError(f"experiment_results.{name} must be non-empty")
-    from common.experiment_results import sanitize_component
-
-    sanitize_component(experiment_results.comparison_id)
     _validate_positive(
         "experiment_results.max_artifact_bytes",
         int(experiment_results.max_artifact_bytes),
-    )
-    remote_sync = experiment_results.pure_edge_remote_sync
-    _validate_positive(
-        "experiment_results.pure_edge_remote_sync.timeout_sec",
-        float(remote_sync.timeout_sec),
     )
     if bool(config.client.source.teacher_replay.save_sampled_frames) and int(
         config.client.source.teacher_replay.archive_chunk_max_bytes
@@ -1000,19 +993,9 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             "client.source.teacher_replay.archive_chunk_max_bytes must be <= "
             "experiment_results.max_artifact_bytes"
         )
-    if (
-        experiment_results.enabled
-        and experiment_results.upload_to_cloud
-        and not experiment_results.include_edge_summary
-    ):
-        raise ValueError(
-            "experiment_results.include_edge_summary must be true when cloud upload is enabled"
-        )
     validate_baseline_method(config.baseline.method)
     if not isinstance(config.baseline.enabled, bool):
         raise ValueError("baseline.enabled must be a boolean")
-    if not str(config.baseline.results_root or "").strip():
-        raise ValueError("baseline.results_root must be non-empty")
     baseline_training = config.baseline.training
     _validate_positive("baseline.training.batch_size", int(baseline_training.batch_size))
     _validate_positive("baseline.training.num_epoch", int(baseline_training.num_epoch))

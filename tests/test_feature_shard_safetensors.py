@@ -35,8 +35,8 @@ def test_safetensors_shard_writes_stacked_leaves_and_reads_batch(tmp_path) -> No
     assert [ref.row_id for ref in refs] == [0, 1, 2]
     with open(refs[0].index_path, encoding="utf-8") as handle:
         metadata = json.load(handle)
-    assert metadata["format_version"] == "feature-shard.v2"
-    assert metadata["leaf_specs"]["leaf_0"]["storage_layout"] == "sample_axis_v2"
+    assert "format_version" not in metadata
+    assert metadata["leaf_specs"]["leaf_0"]["storage_layout"] == "sample_axis"
     assert metadata["leaf_specs"]["leaf_0"]["feature_shape_without_batch"] == [2, 3]
     try:
         from safetensors import safe_open

@@ -8,7 +8,6 @@ from loguru import logger
 from torch import nn
 
 from cloud.orchestration.runtime_template_stage import FixedSplitRuntimeTemplateMixin
-from model_management.fixed_split import FIXED_SPLIT_PLAN_VERSION
 from model_management.fixed_split_runtime_template import fixed_split_runtime_template_key
 from model_management.split_contract import build_runtime_contract
 from model_management.split_runtime import make_split_spec, prepare_split_runtime
@@ -113,7 +112,6 @@ def _manifest(
         "input_resize_mode": "direct_resize",
         "samples": [],
         "split_plan": {
-            "plan_version": FIXED_SPLIT_PLAN_VERSION,
             "split_config_id": split_config_id,
             "canonical_split_key": split,
             "edge_split_id": split,
@@ -205,7 +203,6 @@ def test_default_runtime_template_info_logs_exclude_diagnostic_fields(tmp_path: 
     for forbidden in (
         "runtime template cache key",
         "runtime_version",
-        "adapter_version",
         "graph_signature",
         "split_plan_hash",
         "symbolic_input_schema_hash",

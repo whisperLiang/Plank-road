@@ -108,7 +108,6 @@ class EkyaStyleCloudSchedulingController:
             teacher_model=config.teacher_model,
             window_size=config.window_size,
             num_frames=config.num_frames,
-            result_schema_version=1,
         )
         self.frame_buffer = CloudFrameBuffer(
             window_size=config.window_size,

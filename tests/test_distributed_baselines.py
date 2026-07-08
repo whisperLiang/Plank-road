@@ -12,15 +12,15 @@ from baselines.distributed.cloud_controller import DistributedBaselineController
 from baselines.distributed.messages import BaselineFramePayload
 from baselines.method_factory import create_policy, registered_methods
 from baselines.runtime import BaselineEdgeAdapter, stable_window_id
-from common.experiment_results import collect_edge_artifacts
+from common.experiment_results import ExperimentIdentity, collect_edge_artifacts
+from common.video_identity import VideoIdentity
 from config.baseline import PLANK_ROAD_BASELINE_ERROR
 from config.runtime import RuntimeConfig, load_runtime_config
 from edge_client import (
     _configure_baseline_client_runtime,
+    _create_experiment_identity,
     _experiment_result_upload_enabled,
     _prepare_experiment_run_dir,
-    _resolve_baseline_run_id,
-    _sync_pure_edge_results,
     _upload_experiment_run_artifacts_if_enabled,
     _validate_startup_config,
 )
@@ -378,13 +378,6 @@ def test_pure_edge_startup_validation_can_skip_cloud_address(tmp_path) -> None:
         _validate_startup_config(config, require_server_ip=True)
 
 
-def test_cloud_backed_baselines_require_explicit_run_id() -> None:
-    with pytest.raises(ValueError, match="--run_id is required"):
-        _resolve_baseline_run_id("accuracy_trigger_cloud_retraining", None)
-    assert _resolve_baseline_run_id("accuracy_trigger_cloud_retraining", "run-a") == "run-a"
-    assert _resolve_baseline_run_id("pure_edge_local_updating", None) is None
-
-
 def test_prepare_experiment_run_dir_overwrites_existing_enabled_run(tmp_path) -> None:
     run_dir = tmp_path / "comparison" / "accuracy_trigger_cloud_retraining" / "edge_1" / "run-a"
     run_dir.mkdir(parents=True)
@@ -403,6 +396,73 @@ def test_prepare_experiment_run_dir_overwrites_existing_enabled_run(tmp_path) ->
     assert (run_dir / "keep.jsonl").read_text(encoding="utf-8") == "kept\n"
 
 
+@pytest.mark.parametrize(
+    ("edge_count", "repeat", "message"),
+    [
+        (0, 1, "edge_count must be a positive integer"),
+        (1, 0, "repeat must be a positive integer"),
+    ],
+)
+def test_create_experiment_identity_preserves_explicit_zero_values(
+    edge_count: int,
+    repeat: int,
+    message: str,
+) -> None:
+    video_identity = VideoIdentity(
+        video_source="road.mp4",
+        video_slug="road",
+        scenario_name="road",
+        frame_replayable=True,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        _create_experiment_identity(
+            experiment_id="comparison",
+            scenario=None,
+            edge_count=edge_count,
+            repeat=repeat,
+            method="plank_road",
+            run_id=None,
+            video_identity=video_identity,
+        )
+
+
+@pytest.mark.parametrize(
+    ("edge_count", "repeat", "message"),
+    [
+        (0, 1, "edge_count must be a positive integer"),
+        (1, 0, "repeat must be a positive integer"),
+    ],
+)
+def test_cloud_create_experiment_identity_preserves_explicit_zero_values(
+    edge_count: int,
+    repeat: int,
+    message: str,
+) -> None:
+    from cloud_server import _create_experiment_identity as create_cloud_identity
+
+    runtime_config = SimpleNamespace(
+        client=SimpleNamespace(
+            source=SimpleNamespace(
+                video_path="road.mp4",
+                video_slug="road",
+                scenario_name="road",
+            )
+        )
+    )
+
+    with pytest.raises(ValueError, match=message):
+        create_cloud_identity(
+            experiment_id="comparison",
+            scenario=None,
+            edge_count=edge_count,
+            repeat=repeat,
+            method="plank_road",
+            run_id=None,
+            runtime_config=runtime_config,
+        )
+
+
 def test_pure_edge_shutdown_upload_disabled_but_local_artifacts_collected(tmp_path) -> None:
     run_dir = tmp_path / "pure-edge-run"
     run_dir.mkdir()
@@ -415,13 +475,7 @@ def test_pure_edge_shutdown_upload_disabled_but_local_artifacts_collected(tmp_pa
         encoding="utf-8",
     )
     experiment_results = SimpleNamespace(
-        upload_to_cloud=True,
-        upload_on_shutdown=True,
-        include_inference_results=True,
-        include_baseline_metrics=True,
-        include_edge_summary=True,
-        include_trigger_manifest=False,
-        include_runtime_logs=False,
+        enabled=True,
         max_artifact_bytes=1024 * 1024,
     )
 
@@ -429,7 +483,10 @@ def test_pure_edge_shutdown_upload_disabled_but_local_artifacts_collected(tmp_pa
         method="pure_edge_local_updating",
         run_id="pure-run",
         edge_id=1,
-        comparison_id="comparison",
+        experiment_id="comparison",
+        scenario_slug="road",
+        edge_count=1,
+        repeat=1,
         config=experiment_results,
         inference_result_path=inference_path,
         baseline_metrics_path=metrics_path,
@@ -443,34 +500,31 @@ def test_pure_edge_shutdown_upload_disabled_but_local_artifacts_collected(tmp_pa
         mode="baseline",
         baseline_method="pure_edge_local_updating",
         experiment_results=experiment_results,
-        disable_experiment_result_upload=False,
     )
 
 
 @pytest.mark.parametrize(
-    ("mode", "baseline_method", "disabled", "expected"),
+    ("mode", "baseline_method", "enabled", "expected"),
     [
-        ("main", None, False, True),
-        ("baseline", "accuracy_trigger_cloud_retraining", False, True),
-        ("main", None, True, False),
-        ("baseline", "accuracy_trigger_cloud_retraining", True, False),
-        ("baseline", "pure_edge_local_updating", False, False),
+        ("main", None, True, True),
+        ("baseline", "accuracy_trigger_cloud_retraining", True, True),
+        ("main", None, False, False),
+        ("baseline", "pure_edge_local_updating", True, False),
     ],
 )
 def test_shutdown_experiment_upload_enablement_preserves_non_pure_edge_modes(
     mode: str,
     baseline_method: str | None,
-    disabled: bool,
+    enabled: bool,
     expected: bool,
 ) -> None:
-    experiment_results = SimpleNamespace(upload_to_cloud=True, upload_on_shutdown=True)
+    experiment_results = SimpleNamespace(enabled=enabled)
 
     assert (
         _experiment_result_upload_enabled(
             mode=mode,
             baseline_method=baseline_method,
             experiment_results=experiment_results,
-            disable_experiment_result_upload=disabled,
         )
         is expected
     )
@@ -491,9 +545,15 @@ def test_shutdown_upload_helper_does_not_call_uploader_for_pure_edge() -> None:
         server_ip="127.0.0.1:1",
         mode="baseline",
         baseline_method="pure_edge_local_updating",
-        experiment_results=SimpleNamespace(upload_to_cloud=True, upload_on_shutdown=True),
-        disable_experiment_result_upload=False,
-        comparison_id="comparison",
+        experiment_results=SimpleNamespace(enabled=True),
+        identity=ExperimentIdentity.create(
+            experiment_id="comparison",
+            scenario_slug="road",
+            edge_count=1,
+            repeat=1,
+            method="pure_edge_local_updating",
+            run_id="pure-run",
+        ),
         run_id="pure-run",
         method="pure_edge_local_updating",
         edge_id=1,
@@ -520,9 +580,15 @@ def test_shutdown_upload_helper_still_calls_uploader_for_accuracy_trigger() -> N
         server_ip="127.0.0.1:1",
         mode="baseline",
         baseline_method="accuracy_trigger_cloud_retraining",
-        experiment_results=SimpleNamespace(upload_to_cloud=True, upload_on_shutdown=True),
-        disable_experiment_result_upload=False,
-        comparison_id="comparison",
+        experiment_results=SimpleNamespace(enabled=True),
+        identity=ExperimentIdentity.create(
+            experiment_id="comparison",
+            scenario_slug="road",
+            edge_count=1,
+            repeat=1,
+            method="accuracy_trigger_cloud_retraining",
+            run_id="acc-run",
+        ),
         run_id="acc-run",
         method="accuracy_trigger_cloud_retraining",
         edge_id=1,
@@ -534,35 +600,6 @@ def test_shutdown_upload_helper_still_calls_uploader_for_accuracy_trigger() -> N
     assert calls[0] == {"event": "init", "server_ip": "127.0.0.1:1", "enabled": True}
     assert calls[1]["event"] == "upload"
     assert calls[1]["method"] == "accuracy_trigger_cloud_retraining"
-
-
-def test_pure_edge_shutdown_sync_helper_uploads_run_dir(tmp_path) -> None:
-    calls: list[dict[str, object]] = []
-
-    class FakeSyncer:
-        def __init__(self, experiment_results) -> None:
-            calls.append({"event": "init", "experiment_results": experiment_results})
-
-        def sync_run_dir(self, **kwargs) -> str:
-            calls.append({"event": "sync", **kwargs})
-            return "whisperliang@192.168.66.205:/remote/run"
-
-    experiment_results = SimpleNamespace()
-    result = _sync_pure_edge_results(
-        experiment_results=experiment_results,
-        local_run_dir=tmp_path / "run",
-        comparison_id="comparison",
-        run_id="pure-run",
-        method="pure_edge_local_updating",
-        edge_id=1,
-        syncer_cls=FakeSyncer,
-    )
-
-    assert result == "whisperliang@192.168.66.205:/remote/run"
-    assert calls[0] == {"event": "init", "experiment_results": experiment_results}
-    assert calls[1]["event"] == "sync"
-    assert calls[1]["local_run_dir"] == tmp_path / "run"
-    assert calls[1]["run_id"] == "pure-run"
 
 
 def test_accuracy_adapter_uploads_keyframes_without_local_training_submit(tmp_path) -> None:

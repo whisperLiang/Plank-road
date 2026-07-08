@@ -15,10 +15,7 @@ from baselines.distributed.messages import (
     baseline_state_key,
     now_ms,
 )
-from baselines.runtime.upload_client import (
-    BASELINE_TRAINING_PROTOCOL_VERSION,
-    build_baseline_training_bundle,
-)
+from baselines.runtime.upload_client import build_baseline_training_bundle
 from cloud.annotation import RawFrameAnnotationSample, TeacherAnnotationRetryableError
 from cloud.baselines.accuracy_trigger_controller import (
     AccuracyTriggerController,
@@ -416,7 +413,6 @@ class DistributedBaselineController:
             f"{submission.model_version}:{submission.window_id}"
         )
         request = message_transmission_pb2.SubmitTrainingJobRequest(
-            protocol_version=BASELINE_TRAINING_PROTOCOL_VERSION,
             edge_id=int(submission.edge_id),
             request_id=request_id,
             job_type=message_transmission_pb2.TRAINING_JOB_TYPE_BASELINE_TRAINING,

@@ -34,9 +34,16 @@ from cloud.workers.lease_service import GpuLeaseService
 from cloud.workers.mps_runtime import ensure_mps_runtime
 from cloud.workers.worker_client import GpuLeaseHttpClient
 from cloud.workers.worker_protocol import JsonRpcError
-from common.experiment_results import EKYA_METHOD, PLANK_ROAD_METHOD, cloud_run_dir
+from common.experiment_results import (
+    EKYA_METHOD,
+    PLANK_ROAD_METHOD,
+    ExperimentIdentity,
+    cloud_run_dir,
+    normalize_scenario_slug,
+)
 from common.logging_sanitizer import log_diagnostic_debug
-from config import default_run_id, load_runtime_config, validate_baseline_method
+from common.video_identity import resolve_video_identity
+from config import load_runtime_config, validate_baseline_method
 from grpc_server import message_transmission_pb2_grpc
 from grpc_server.continual_backends import EdgeWorkerRoutedContinualLearningBackend
 from grpc_server.rpc_server import MessageTransmissionServicer
@@ -52,6 +59,58 @@ def _experiment_method_for(method: str) -> str:
     if normalized == EKYA_STYLE_METHOD:
         return EKYA_METHOD
     return normalized or PLANK_ROAD_METHOD
+
+
+def _runtime_source(runtime_config) -> object | None:
+    client = getattr(runtime_config, "client", None)
+    return getattr(client, "source", None)
+
+
+def _scenario_slug_from_inputs(*, scenario: str | None, runtime_config) -> str:
+    explicit = str(scenario or "").strip()
+    if explicit:
+        return normalize_scenario_slug(explicit)
+    source = _runtime_source(runtime_config)
+    if source is None:
+        return "default"
+    scenario_name = str(getattr(source, "scenario_name", "") or "")
+    video_slug = str(getattr(source, "video_slug", "") or "")
+    video_path = str(getattr(source, "video_path", "") or "")
+    try:
+        identity = resolve_video_identity(
+            video_path,
+            configured_scenario_name=scenario_name,
+            configured_video_slug=video_slug,
+        )
+        return normalize_scenario_slug(identity.scenario_name or identity.video_slug)
+    except ValueError:
+        for value in (scenario_name, video_slug, Path(video_path).stem):
+            if str(value or "").strip():
+                return normalize_scenario_slug(str(value))
+    return "default"
+
+
+def _create_experiment_identity(
+    *,
+    experiment_id: str | None,
+    scenario: str | None,
+    edge_count: int | str | None,
+    repeat: int | str | None,
+    method: str,
+    run_id: str | None,
+    runtime_config,
+) -> ExperimentIdentity:
+    return ExperimentIdentity.create(
+        experiment_id=str(experiment_id or "default_experiment"),
+        scenario_slug=_scenario_slug_from_inputs(
+            scenario=scenario,
+            runtime_config=runtime_config,
+        ),
+        edge_count=1 if edge_count is None else edge_count,
+        repeat=1 if repeat is None else repeat,
+        method=method,
+        run_id=run_id,
+    )
 
 
 class BaselineHeavyLaneBusy(RuntimeError):
@@ -75,6 +134,10 @@ class CloudServer:
         baseline_config=None,
         baseline_method: str = "",
         run_id: str = "",
+        experiment_id: str = "",
+        scenario: str = "",
+        edge_count: int | str = 1,
+        repeat: int | str = 1,
         yaml_path: str = "./config/config.yaml",
         runtime_config=None,
     ):
@@ -100,9 +163,17 @@ class CloudServer:
             method = validate_baseline_method(
                 baseline_method or getattr(baseline_config, "method", "")
             )
-            resolved_run_id = str(run_id or getattr(baseline_config, "run_id", "") or "")
-            if not resolved_run_id:
-                resolved_run_id = default_run_id(method)
+            experiment_method = _experiment_method_for(method)
+            self.experiment_identity = _create_experiment_identity(
+                experiment_id=experiment_id,
+                scenario=scenario,
+                edge_count=edge_count,
+                repeat=repeat,
+                method=experiment_method,
+                run_id=run_id,
+                runtime_config=runtime_config,
+            )
+            resolved_run_id = self.experiment_identity.run_id
             if method == EKYA_STYLE_METHOD:
                 from cloud.baselines.ekya_style_cloud_scheduling import (
                     EkyaStyleCloudSchedulingController,
@@ -116,9 +187,12 @@ class CloudServer:
                 ):
                     ekya_output_dir = cloud_run_dir(
                         str(getattr(experiment_config, "root_dir", "results/experiments")),
-                        str(getattr(experiment_config, "comparison_id", "") or ""),
-                        EKYA_METHOD,
-                        resolved_run_id,
+                        self.experiment_identity.experiment_id,
+                        self.experiment_identity.scenario_slug,
+                        self.experiment_identity.edge_count,
+                        self.experiment_identity.repeat,
+                        self.experiment_identity.method,
+                        self.experiment_identity.run_id,
                     )
                 ekya_config = parse_ekya_style_config(
                     runtime_config or SimpleNamespace(server=config, baseline=baseline_config),
@@ -140,10 +214,9 @@ class CloudServer:
                 if edge_affine is None or not bool(getattr(edge_affine, "enabled", False)):
                     raise ValueError(
                         "Cloud-backed baseline training requires "
-                        "server.edge_affine_workers.enabled=true."
+                            "server.edge_affine_workers.enabled=true."
                     )
-                edge_affine.run_id = resolved_run_id
-                self._init_edge_affine_backend(edge_affine)
+                self._init_edge_affine_backend(edge_affine, run_id=resolved_run_id)
                 from model_management.object_detection import Object_Detection
 
                 self.large_object_detection = Object_Detection(config, type="large inference")
@@ -160,9 +233,7 @@ class CloudServer:
             self.baseline_controller = DistributedBaselineController(
                 baseline_method=method,
                 run_id=resolved_run_id,
-                results_root=str(
-                    getattr(baseline_config, "results_root", "results/baselines_distributed")
-                ),
+                results_root="results/baselines_distributed",
                 training_backend=self.continual_backend,
                 baseline_training_config=getattr(baseline_config, "training", None),
                 baseline_method_config=getattr(baseline_config, method, None),
@@ -184,10 +255,20 @@ class CloudServer:
                 raise ValueError(
                     "Main-mode cloud continual learning requires "
                     "server.edge_affine_workers.enabled=true; the fixed-split "
-                    "runtime path is no longer supported."
+                        "runtime path is no longer supported."
                 )
-            self._init_edge_affine_backend(edge_affine)
             self.baseline_method = PLANK_ROAD_METHOD
+            self.experiment_identity = _create_experiment_identity(
+                experiment_id=experiment_id,
+                scenario=scenario,
+                edge_count=edge_count,
+                repeat=repeat,
+                method=PLANK_ROAD_METHOD,
+                run_id=run_id,
+                runtime_config=runtime_config,
+            )
+            self.run_id = self.experiment_identity.run_id
+            self._init_edge_affine_backend(edge_affine, run_id=self.run_id)
 
         method = (
             str(getattr(self, "baseline_method", "") or "")
@@ -200,11 +281,11 @@ class CloudServer:
         experiment_config = getattr(self.config, "experiment_results", None)
         if experiment_config is None or not bool(getattr(experiment_config, "enabled", False)):
             return
-        comparison_id = str(getattr(experiment_config, "comparison_id", "") or "")
         root_dir = str(getattr(experiment_config, "root_dir", "results/experiments"))
+        identity = self.experiment_identity
         self.experiment_manifest_writer = CloudExperimentManifestWriter(
             root_dir=root_dir,
-            comparison_id=comparison_id,
+            experiment_id=identity.experiment_id,
             student_model=str(getattr(self.config, "edge_model_name", "") or ""),
             teacher_model=str(getattr(self.config, "golden", "") or ""),
         )
@@ -215,29 +296,16 @@ class CloudServer:
         )
         self.experiment_manifest_writer.upsert_cloud_runtime(
             method=method,
-            run_id=self.run_id,
+            scenario_slug=identity.scenario_slug,
+            edge_count=identity.edge_count,
+            repeat=identity.repeat,
+            run_id=identity.run_id,
         )
-        if (
-            bool(getattr(experiment_config, "include_runtime_logs", False))
-            and method != "pure_edge_local_updating"
-        ):
-            cloud_log = cloud_run_dir(root_dir, comparison_id, method, self.run_id) / "cloud.log"
-            cloud_log.parent.mkdir(parents=True, exist_ok=True)
-            self._experiment_log_sink = logger.add(
-                str(cloud_log),
-                level="INFO",
-                rotation="500 MB",
-            )
 
-    def _init_edge_affine_backend(self, edge_affine) -> None:
-        run_id = str(getattr(edge_affine, "run_id", "") or "").strip()
+    def _init_edge_affine_backend(self, edge_affine, *, run_id: str) -> None:
+        run_id = str(run_id or "").strip()
         if not run_id:
-            run_id = "plank_road_real_devices"
-            logger.warning(
-                "server.edge_affine_workers.run_id is not configured; using default {}. "
-                "Set an explicit run_id for formal experiments to avoid assignment reuse.",
-                run_id,
-            )
+            raise ValueError("experiment run_id must be non-empty")
         self.run_id = run_id
         workspace_root = str(getattr(self.config, "workspace_root", "./cache/server_workspace"))
         assignment_store = EdgeAssignmentStore(
@@ -321,9 +389,14 @@ class CloudServer:
         )
         experiment_config = getattr(self.config, "experiment_results", None)
         if experiment_config is not None:
+            identity = getattr(self, "experiment_identity", None)
             logger.info(
-                "experiment results: comparison_id={} root={} mode={} method={} run_id={}",
-                getattr(experiment_config, "comparison_id", ""),
+                "experiment results: experiment_id={} scenario={} edges={} repeat={} "
+                "root={} mode={} method={} run_id={}",
+                getattr(identity, "experiment_id", ""),
+                getattr(identity, "scenario_slug", ""),
+                getattr(identity, "edge_count", ""),
+                getattr(identity, "repeat", ""),
                 getattr(experiment_config, "root_dir", ""),
                 self.mode,
                 getattr(self, "baseline_method", PLANK_ROAD_METHOD),
@@ -351,7 +424,14 @@ class CloudServer:
                 continual_backend=self.continual_backend,
                 log_internal_ids=self.log_internal_ids,
                 experiment_result_repository=self.experiment_result_repository,
-                experiment_comparison_id=str(getattr(experiment_config, "comparison_id", "") or ""),
+                experiment_id=str(getattr(self.experiment_identity, "experiment_id", "") or ""),
+                experiment_scenario_slug=str(
+                    getattr(self.experiment_identity, "scenario_slug", "") or ""
+                ),
+                experiment_edge_count=int(
+                    getattr(self.experiment_identity, "edge_count", 1) or 1
+                ),
+                experiment_repeat=int(getattr(self.experiment_identity, "repeat", 1) or 1),
                 experiment_method=experiment_method,
                 experiment_run_id=str(getattr(self, "run_id", "") or ""),
             ),
@@ -367,7 +447,10 @@ class CloudServer:
         )
         if self.experiment_result_repository is not None:
             self.experiment_result_repository.record_cloud_event(
-                comparison_id=str(getattr(experiment_config, "comparison_id", "") or ""),
+                experiment_id=str(self.experiment_identity.experiment_id),
+                scenario_slug=str(self.experiment_identity.scenario_slug),
+                edge_count=int(self.experiment_identity.edge_count),
+                repeat=int(self.experiment_identity.repeat),
                 method=experiment_method,
                 run_id=str(getattr(self, "run_id", "") or ""),
                 event="cloud_server_started",
@@ -622,8 +705,11 @@ if __name__ == "__main__":
     )
     parser.add_argument("--mode", choices=("main", "baseline"), default="main")
     parser.add_argument("--baseline_method", default=None, help="baseline method for baseline mode")
-    parser.add_argument("--run_id", default=None, help="baseline run id")
-    parser.add_argument("--comparison_id", default=None, help="experiment comparison id")
+    parser.add_argument("--run_id", default=None, help="optional experiment run id override")
+    parser.add_argument("--experiment_id", default=None, help="experiment id")
+    parser.add_argument("--scenario", default=None, help="experiment scenario slug/name")
+    parser.add_argument("--edge_count", type=int, default=1, help="number of edge devices")
+    parser.add_argument("--repeat", default=1, help="repeat index, e.g. 1 or r01")
     parser.add_argument(
         "--experiment_results_root",
         default=None,
@@ -643,8 +729,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     config = load_runtime_config(args.yaml_path)
     server_config = config.server
-    if args.comparison_id is not None:
-        config.experiment_results.comparison_id = args.comparison_id
     if args.experiment_results_root is not None:
         config.experiment_results.root_dir = args.experiment_results_root
     if args.listen_address is not None:
@@ -657,21 +741,21 @@ if __name__ == "__main__":
         server_config.edge_affine_workers.enabled = _parse_bool(args.edge_affine_workers_enabled)
     if args.edge_affine_worker_mode is not None:
         server_config.edge_affine_workers.mode = args.edge_affine_worker_mode
-    if args.run_id is not None and args.mode == "main":
-        server_config.edge_affine_workers.run_id = args.run_id
     baseline_method = args.baseline_method or config.baseline.method
     if args.mode == "baseline":
         baseline_method = validate_baseline_method(baseline_method)
         config.baseline.enabled = True
         config.baseline.method = baseline_method
-        if args.run_id is not None:
-            config.baseline.run_id = args.run_id
     cloud_server = CloudServer(
         server_config,
         mode=args.mode,
         baseline_config=config.baseline,
         baseline_method=baseline_method,
         run_id=args.run_id or "",
+        experiment_id=args.experiment_id or "",
+        scenario=args.scenario or "",
+        edge_count=args.edge_count,
+        repeat=args.repeat,
         yaml_path=args.yaml_path,
         runtime_config=config,
     )

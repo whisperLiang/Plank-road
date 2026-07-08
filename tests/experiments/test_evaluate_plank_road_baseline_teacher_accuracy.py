@@ -12,10 +12,24 @@ from tools.experiments import evaluate_plank_road_baseline_teacher_accuracy as e
 from tools.experiments.experiment_common import ACCURACY_FIELDS
 
 METHOD_RUNS = (
-    ("plank_road", "plank_road_road_001"),
-    ("pure_edge_local_updating", "pure_edge_road_001"),
-    ("accuracy_trigger_cloud_retraining", "accuracy_trigger_road_001"),
+    ("plank_road", "road-night-rain_n1_r01_plank_road"),
+    ("pure_edge_local_updating", "road-night-rain_n1_r01_pure_edge_local_updating"),
+    (
+        "accuracy_trigger_cloud_retraining",
+        "road-night-rain_n1_r01_accuracy_trigger_cloud_retraining",
+    ),
 )
+
+
+def _raw_dir(method: str, kind: str) -> Path:
+    return (
+        Path("raw_logs")
+        / "scenario=road-night-rain"
+        / "edges=n1"
+        / "repeat=r01"
+        / f"method={method}"
+        / kind
+    )
 
 
 class _FakeTeacher:
@@ -67,23 +81,10 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path]:
         writer.write(np.full((12, 12, 3), value, dtype=np.uint8))
     writer.release()
 
-    runs = []
     for method, run_id in METHOD_RUNS:
-        edge_rel = f"raw_logs/{method}/edge_1/{run_id}"
-        raw_logs = {"edges": {"1": edge_rel}}
+        edge_rel = _raw_dir(method, "edge_1")
         if method != "pure_edge_local_updating":
-            cloud_rel = f"raw_logs/{method}/cloud/{run_id}"
-            raw_logs["cloud"] = cloud_rel
-            (comparison_dir / cloud_rel).mkdir(parents=True, exist_ok=True)
-        runs.append(
-            {
-                "run_id": run_id,
-                "method": method,
-                "scenario_name": "road_night_rain",
-                "edge_ids": [1],
-                "raw_logs": raw_logs,
-            }
-        )
+            (comparison_dir / _raw_dir(method, "cloud")).mkdir(parents=True, exist_ok=True)
         prediction_path = comparison_dir / edge_rel / "latest_inference_results.jsonl"
         prediction_path.parent.mkdir(parents=True, exist_ok=True)
         rows = []
@@ -116,19 +117,22 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path]:
             encoding="utf-8",
         )
     manifest = {
-        "comparison_id": "exp_road_night_rain_plankroad_vs_baselines_001",
+        "experiment_id": "exp_road_night_rain_plankroad_vs_baselines_001",
         "log_timezone": "UTC",
         "methods": [method for method, _run_id in METHOD_RUNS],
         "student_model": "custom-student",
         "teacher_model": "rtdetr_x",
         "scenarios": [
             {
-                "name": "road_night_rain",
-                "video_source": str(video_path),
+                "scenario_name": "road_night_rain",
+                "scenario_slug": "road-night-rain",
+                "video_path": str(video_path),
                 "video_slug": "road_night_rain",
             }
         ],
-        "runs": runs,
+        "edge_counts": [1],
+        "repeats": [1],
+        "edge_ids_by_count": {"1": [1]},
         "metrics": {},
     }
     manifest_path = comparison_dir / "manifest.yaml"
