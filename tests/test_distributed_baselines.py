@@ -23,6 +23,7 @@ from edge_client import (
     _prepare_experiment_run_dir,
     _upload_experiment_run_artifacts_if_enabled,
     _validate_startup_config,
+    _write_edge_summary,
 )
 from grpc_server import message_transmission_pb2
 
@@ -425,6 +426,50 @@ def test_create_experiment_identity_preserves_explicit_zero_values(
             run_id=None,
             video_identity=video_identity,
         )
+
+
+def test_write_edge_summary_keeps_experiment_and_video_identity_separate(tmp_path) -> None:
+    experiment_identity = ExperimentIdentity.create(
+        experiment_id="comparison",
+        scenario_slug="snowy",
+        edge_count=1,
+        repeat=1,
+        method="ekya_style_cloud_scheduling",
+        run_id="snowy_n1_r01_ekya_style_cloud_scheduling",
+    )
+    video_identity = VideoIdentity(
+        video_source="snowy.mp4",
+        video_slug="snowy",
+        scenario_name="snowy",
+        frame_replayable=True,
+    )
+    config = SimpleNamespace(
+        edge_id=1,
+        lightweight="rfdetr_nano",
+        experiment_teacher_model="rtdetr_x",
+        class_names=["car"],
+        label_schema="zero_based",
+        source=SimpleNamespace(video_path="snowy.mp4"),
+    )
+
+    _write_edge_summary(
+        tmp_path / "edge_summary.json",
+        config=config,
+        identity=experiment_identity,
+        method="ekya_style_cloud_scheduling",
+        run_id=experiment_identity.run_id,
+        sampled_frame_count=12,
+        video_identity=video_identity,
+    )
+
+    summary = json.loads((tmp_path / "edge_summary.json").read_text(encoding="utf-8"))
+    assert summary["experiment_id"] == "comparison"
+    assert summary["scenario_slug"] == "snowy"
+    assert summary["edge_count"] == 1
+    assert summary["repeat"] == 1
+    assert summary["video_source"] == "snowy.mp4"
+    assert summary["video_slug"] == "snowy"
+    assert summary["sampled_frame_count"] == 12
 
 
 @pytest.mark.parametrize(

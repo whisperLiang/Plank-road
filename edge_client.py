@@ -760,7 +760,7 @@ def _write_edge_summary(
     replay_snapshot_failures: Mapping[int, str] | None = None,
     edge: EdgeWorker | None = None,
 ) -> None:
-    identity = video_identity or _resolve_video_identity(config)
+    video_info = video_identity or _resolve_video_identity(config)
     class_names, label_schema = _resolve_display_label_config(
         config,
         edge,
@@ -773,10 +773,10 @@ def _write_edge_summary(
         "run_id": run_id,
         "method": method,
         "edge_id": int(config.edge_id),
-        "video_source": identity.video_source,
-        "video_slug": identity.video_slug,
-        "scenario_name": identity.scenario_name,
-        "frame_replayable": bool(identity.frame_replayable),
+        "video_source": video_info.video_source,
+        "video_slug": video_info.video_slug,
+        "scenario_name": video_info.scenario_name,
+        "frame_replayable": bool(video_info.frame_replayable),
         "label_schema": str(label_schema or ""),
         "class_names": list(class_names or []),
         "student_model": str(getattr(config, "lightweight", "") or ""),
