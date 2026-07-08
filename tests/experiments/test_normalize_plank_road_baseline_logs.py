@@ -97,9 +97,9 @@ def _append_ekya_run(manifest_path: Path) -> None:
             "scenario_name": "road",
             "edge_ids": [1],
             "raw_logs": {
-                "cloud": "raw_logs/ekya_style_centralized_scheduling/cloud/ekya-r1",
+                "cloud": "raw_logs/ekya_style_cloud_scheduling/cloud/ekya-r1",
                 "edges": {
-                    "1": "raw_logs/ekya_style_centralized_scheduling/edge_1/ekya-r1"
+                    "1": "raw_logs/ekya_style_cloud_scheduling/edge_1/ekya-r1"
                 },
             },
         }
@@ -368,7 +368,7 @@ def test_normalizer_converts_ekya_raw_logs_from_manifest(tmp_path: Path) -> None
     raw = (
         comparison_dir
         / "raw_logs"
-        / "ekya_style_centralized_scheduling"
+        / "ekya_style_cloud_scheduling"
         / "cloud"
         / "ekya-r1"
     )

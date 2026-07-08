@@ -18,7 +18,7 @@ METHODS = (
     "pure_edge_local_updating",
     "accuracy_trigger_cloud_retraining",
 )
-EKYA_CANONICAL_METHOD = "ekya_style_centralized_scheduling"
+EKYA_CANONICAL_METHOD = "ekya_style_cloud_scheduling"
 OPTIONAL_METHODS = (EKYA_CANONICAL_METHOD,)
 SUPPORTED_METHODS = (*METHODS, *OPTIONAL_METHODS)
 METHOD_ORDER = (

@@ -9,7 +9,7 @@ methods:
   - plank_road
   - pure_edge_local_updating
   - accuracy_trigger_cloud_retraining
-  - ekya_style_centralized_scheduling
+  - ekya_style_cloud_scheduling
 
 student_model: rfdetr_nano
 teacher_model: rtdetr_x
@@ -66,14 +66,14 @@ runs:
         "2": raw_logs/accuracy_trigger_cloud_retraining/edge_2/accuracy_trigger_sunny_n2_r1
 
   - run_id: ekya_style_sunny_n2_r1
-    method: ekya_style_centralized_scheduling
+    method: ekya_style_cloud_scheduling
     scenario_name: Sunny
     edge_ids: [1, 2]
     raw_logs:
-      cloud: raw_logs/ekya_style_centralized_scheduling/cloud/ekya_style_sunny_n2_r1
+      cloud: raw_logs/ekya_style_cloud_scheduling/cloud/ekya_style_sunny_n2_r1
       edges:
-        "1": raw_logs/ekya_style_centralized_scheduling/edge_1/ekya_style_sunny_n2_r1
-        "2": raw_logs/ekya_style_centralized_scheduling/edge_2/ekya_style_sunny_n2_r1
+        "1": raw_logs/ekya_style_cloud_scheduling/edge_1/ekya_style_sunny_n2_r1
+        "2": raw_logs/ekya_style_cloud_scheduling/edge_2/ekya_style_sunny_n2_r1
 
   - run_id: plank_road_rainy_n2_r1
     method: plank_road
@@ -105,14 +105,14 @@ runs:
         "2": raw_logs/accuracy_trigger_cloud_retraining/edge_2/accuracy_trigger_rainy_n2_r1
 
   - run_id: ekya_style_rainy_n2_r1
-    method: ekya_style_centralized_scheduling
+    method: ekya_style_cloud_scheduling
     scenario_name: Rainy
     edge_ids: [1, 2]
     raw_logs:
-      cloud: raw_logs/ekya_style_centralized_scheduling/cloud/ekya_style_rainy_n2_r1
+      cloud: raw_logs/ekya_style_cloud_scheduling/cloud/ekya_style_rainy_n2_r1
       edges:
-        "1": raw_logs/ekya_style_centralized_scheduling/edge_1/ekya_style_rainy_n2_r1
-        "2": raw_logs/ekya_style_centralized_scheduling/edge_2/ekya_style_rainy_n2_r1
+        "1": raw_logs/ekya_style_cloud_scheduling/edge_1/ekya_style_rainy_n2_r1
+        "2": raw_logs/ekya_style_cloud_scheduling/edge_2/ekya_style_rainy_n2_r1
 
   - run_id: plank_road_snowy_n2_r1
     method: plank_road
@@ -144,14 +144,14 @@ runs:
         "2": raw_logs/accuracy_trigger_cloud_retraining/edge_2/accuracy_trigger_snowy_n2_r1
 
   - run_id: ekya_style_snowy_n2_r1
-    method: ekya_style_centralized_scheduling
+    method: ekya_style_cloud_scheduling
     scenario_name: Snowy
     edge_ids: [1, 2]
     raw_logs:
-      cloud: raw_logs/ekya_style_centralized_scheduling/cloud/ekya_style_snowy_n2_r1
+      cloud: raw_logs/ekya_style_cloud_scheduling/cloud/ekya_style_snowy_n2_r1
       edges:
-        "1": raw_logs/ekya_style_centralized_scheduling/edge_1/ekya_style_snowy_n2_r1
-        "2": raw_logs/ekya_style_centralized_scheduling/edge_2/ekya_style_snowy_n2_r1
+        "1": raw_logs/ekya_style_cloud_scheduling/edge_1/ekya_style_snowy_n2_r1
+        "2": raw_logs/ekya_style_cloud_scheduling/edge_2/ekya_style_snowy_n2_r1
 
 hardware:
   cloud:
@@ -173,7 +173,7 @@ runtime:
   accuracy_trigger_cloud_retraining:
     mode: baseline
     baseline_method: accuracy_trigger_cloud_retraining
-  ekya_style_centralized_scheduling:
+  ekya_style_cloud_scheduling:
     mode: baseline
     baseline_method: ekya_style_cloud_scheduling
 

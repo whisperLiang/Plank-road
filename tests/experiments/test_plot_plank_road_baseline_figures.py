@@ -21,7 +21,7 @@ METHODS = (
     "plank_road",
     "pure_edge_local_updating",
     "accuracy_trigger_cloud_retraining",
-    "ekya_style_centralized_scheduling",
+    "ekya_style_cloud_scheduling",
 )
 METHOD_LABELS = ("Ours", "Pure Edge", "Accuracy-Trigger", "Ekya-style")
 SCENARIOS = ("Sunny", "Rainy", "Snowy")

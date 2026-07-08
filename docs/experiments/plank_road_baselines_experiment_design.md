@@ -8,17 +8,16 @@ Preflight HEAD recorded before this refactor:
 
 ## Comparison Boundary
 
-The paper-facing baseline comparison uses four methods:
+The baseline comparison uses four methods:
 
 1. `plank_road` -> Ours
 2. `pure_edge_local_updating` -> Pure Edge
 3. `accuracy_trigger_cloud_retraining` -> Accuracy-Trigger
-4. `ekya_style_centralized_scheduling` -> Ekya-style
+4. `ekya_style_cloud_scheduling` -> Ekya-style
 
-`ekya_style_centralized_scheduling` is the post-processing and paper-facing
-method identity. Production inference, training, protocol fields, scheduling,
-model updates, sample pools, caches, online RPC behavior, and baseline runtime
-behavior are outside the scope of this experiment refactor.
+Production inference, training, protocol fields, scheduling, model updates,
+sample pools, caches, online RPC behavior, and baseline runtime behavior are
+outside the scope of this experiment refactor.
 
 The tools in this directory normalize existing outputs and draw figures. They
 do not launch edge or cloud processes and do not synthesize missing metrics.
@@ -61,7 +60,7 @@ results/experiments/{comparison_id}/
     plank_road/
     pure_edge_local_updating/
     accuracy_trigger_cloud_retraining/
-    ekya_style_centralized_scheduling/
+    ekya_style_cloud_scheduling/
   normalized/
   figures/
 ```

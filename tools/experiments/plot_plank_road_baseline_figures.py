@@ -60,13 +60,13 @@ METHOD_COLORS = {
     "plank_road": "#0F4D92",
     "pure_edge_local_updating": "#767676",
     "accuracy_trigger_cloud_retraining": "#B64342",
-    "ekya_style_centralized_scheduling": "#42949E",
+    "ekya_style_cloud_scheduling": "#42949E",
 }
 METHOD_MARKERS = {
     "plank_road": "D",
     "pure_edge_local_updating": "o",
     "accuracy_trigger_cloud_retraining": "s",
-    "ekya_style_centralized_scheduling": "^",
+    "ekya_style_cloud_scheduling": "^",
 }
 COMPONENT_COLORS = {
     "transmit": "#7EA7C8",
@@ -814,7 +814,7 @@ def _component_specs(method: str) -> list[tuple[str, str, str, tuple[str, ...]]]
                 ("model_update_download_ms", "model_apply_ms"),
             ),
         ]
-    if method == "ekya_style_centralized_scheduling":
+    if method == "ekya_style_cloud_scheduling":
         return [
             ("upload", "Ekya-Upload", "upload", ("upload_ms",)),
             ("profile", "Ekya-Profile", "profile", ("microprofile_ms",)),
@@ -1114,9 +1114,7 @@ def plot_figures(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Plot the three paper-facing Plank-road baseline figures."
-    )
+    parser = argparse.ArgumentParser(description="Plot the three Plank-road baseline figures.")
     parser.add_argument("--normalized_dir", required=True, type=Path)
     parser.add_argument("--figure_dir", required=True, type=Path)
     return parser

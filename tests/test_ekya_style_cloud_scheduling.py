@@ -1395,9 +1395,15 @@ def test_ekya_cloud_server_uses_dedicated_controller_without_edge_affine(tmp_pat
     assert isinstance(server.baseline_controller, EkyaStyleCloudSchedulingController)
     assert server.experiment_result_repository is not None
     assert server.baseline_controller.output_dir == (
-        tmp_path / "experiments" / "comparison" / "raw_logs" / "ekya" / "cloud" / "run"
+        tmp_path
+        / "experiments"
+        / "comparison"
+        / "raw_logs"
+        / "ekya_style_cloud_scheduling"
+        / "cloud"
+        / "run"
     )
-    assert _experiment_method_for("ekya_style_cloud_scheduling") == "ekya"
+    assert _experiment_method_for("ekya_style_cloud_scheduling") == "ekya_style_cloud_scheduling"
 
 
 def test_ekya_edge_route_archives_before_edge_worker_construction() -> None:

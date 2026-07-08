@@ -57,6 +57,7 @@ results/experiments/{comparison_id}/
     plank_road/{cloud,edge_*}/{run_id}/
     pure_edge_local_updating/edge_*/{run_id}/
     accuracy_trigger_cloud_retraining/{cloud,edge_*}/{run_id}/
+    ekya_style_cloud_scheduling/{cloud,edge_*}/{run_id}/
   normalized/
   figures/
 ```
@@ -73,8 +74,8 @@ python edge_client.py --headless --mode main \
   --run_id main-road-r1 --comparison_id comparison-001
 ```
 
-After all three methods for a scenario have produced their staged result files,
-run the video-aware offline teacher replay evaluation:
+After the required methods for a scenario have produced their staged result
+files, run the video-aware offline teacher replay evaluation:
 
 ```shell
 python tools/experiments/evaluate_plank_road_baseline_teacher_accuracy.py \
@@ -460,28 +461,14 @@ python tools/convert_ekya_style_results_to_plot_schema.py --run_id ekya_style_00
 
 ## Experiment Post-processing and Figures
 
-The experiment post-processing framework compares:
-
-```text
-plank_road
-pure_edge_local_updating
-accuracy_trigger_cloud_retraining
-```
-
-`plank_road` is the result label for the normal `main` path and is not
-registered as a baseline. Experiment tools only consume existing logs and
-metrics; they do not launch edge/cloud processes or modify runtime behavior.
-Ekya-style runs are normalized separately with
-`tools/convert_ekya_style_results_to_plot_schema.py`, which writes method alias
-`ekya` and can append those rows to an existing normalized experiment directory.
+The baseline figure pipeline compares `plank_road`,
+`pure_edge_local_updating`, `accuracy_trigger_cloud_retraining`, and
+`ekya_style_cloud_scheduling`.
 
 Start from
 [configs/experiments/plank_road_baselines_manifest.example.yaml](./configs/experiments/plank_road_baselines_manifest.example.yaml).
-Each manifest `runs` entry explicitly maps a run ID to its method, scenario,
-edge IDs, and raw-log directories. The required `log_timezone` field must name
-the IANA timezone used by the machines that generated the text logs so those
-timestamps can be correlated with epoch-based JSONL metrics on any
-post-processing host.
+The formal setup is Sunny/Rainy/Snowy, all four methods, and 3 to 5 repeats with
+matching frame ranges per scenario.
 
 ```text
 results/experiments/{comparison_id}/
@@ -490,29 +477,12 @@ results/experiments/{comparison_id}/
     plank_road/
     pure_edge_local_updating/
     accuracy_trigger_cloud_retraining/
+    ekya_style_cloud_scheduling/
   normalized/
   figures/
 ```
 
-Build teacher-supervised F1 and normalize existing logs:
-
-```shell
-python tools/experiments/evaluate_plank_road_baseline_teacher_accuracy.py --comparison_dir results/experiments/{comparison_id} --manifest results/experiments/{comparison_id}/manifest.yaml --teacher_model rtdetr_x --device cuda:0 --update_manifest
-python tools/experiments/normalize_plank_road_baseline_logs.py --comparison_dir results/experiments/{comparison_id} --manifest results/experiments/{comparison_id}/manifest.yaml
-```
-
-Generate SVG, PDF, TIFF, and PNG figures:
-
-```shell
-python tools/experiments/plot_plank_road_baseline_figures.py --normalized_dir results/experiments/{comparison_id}/normalized --figure_dir results/experiments/{comparison_id}/figures
-```
-
-After rerunning an experiment and replacing files under `raw_logs/`, recompute
-teacher-supervised F1 before normalization when accuracy-dependent figures are
-needed. Fig. 1 and Fig. 8 require this frame-level accuracy file through
-`metrics.accuracy_file`; otherwise they are skipped or have incomplete panels.
-Then rerun normalization and point `--figure_dir` at the existing figure
-directory to overwrite the old SVG/PDF/TIFF/PNG outputs in place:
+Build teacher-supervised F1, normalize logs, and plot:
 
 ```shell
 python tools/experiments/evaluate_plank_road_baseline_teacher_accuracy.py --comparison_dir results/experiments/{comparison_id} --manifest results/experiments/{comparison_id}/manifest.yaml --teacher_model rtdetr_x --device cuda:0 --update_manifest
@@ -520,63 +490,26 @@ python tools/experiments/normalize_plank_road_baseline_logs.py --comparison_dir 
 python tools/experiments/plot_plank_road_baseline_figures.py --normalized_dir results/experiments/{comparison_id}/normalized --figure_dir results/experiments/{comparison_id}/figures
 ```
 
-Add `--overwrite_teacher_cache` to the teacher command only when the cached
-teacher labels should be regenerated, such as after changing teacher weights,
-score thresholds, IoU thresholds, or replayed frame content.
+After replacing files under `raw_logs/`, rerun the same three commands. Add
+`--overwrite_teacher_cache` only when teacher labels should be regenerated.
 
-For the checked-in road comparison that uses the teacher-F1 plotting manifest
-and `figures_accuracy` output directory, refresh the plots with:
+The plotting command emits:
 
-```shell
-python tools/experiments/evaluate_plank_road_baseline_teacher_accuracy.py --comparison_dir results/experiments/exp_road_plankroad_vs_baselines_001 --manifest results/experiments/exp_road_plankroad_vs_baselines_001/manifest.plot.yaml --output results/experiments/exp_road_plankroad_vs_baselines_001/teacher_accuracy_road.jsonl --teacher_model rtdetr_x --device cuda:0 --update_manifest
-python tools/experiments/normalize_plank_road_baseline_logs.py --comparison_dir results/experiments/exp_road_plankroad_vs_baselines_001 --manifest results/experiments/exp_road_plankroad_vs_baselines_001/manifest.plot.yaml
-python tools/experiments/plot_plank_road_baseline_figures.py --normalized_dir results/experiments/exp_road_plankroad_vs_baselines_001/normalized --figure_dir results/experiments/exp_road_plankroad_vs_baselines_001/figures_accuracy
-```
+- `fig1_dynamic_accuracy_recovery.{svg,pdf,tiff,png}`
+- `fig2_accuracy_retraining_time_tradeoff.{svg,pdf,tiff,png}`
+- `fig3_retraining_time_breakdown.{svg,pdf,tiff,png}`
+- `plot_report.json`
 
-The framework produces these figures when their required measured data exists:
+Teacher replay reports Teacher-supervised F1, not ground-truth accuracy, and is
+excluded from online latency and communication metrics. Missing values stay
+empty and skipped or partial figures are reported in `figures/plot_report.json`.
 
-| Figure | Experimental question |
-|---|---|
-| Fig. 1 — Accuracy Over Time | How quickly does accuracy recover after drift and model updates? |
-| Fig. 2 — Adaptation Timeline | How long do trigger, upload, annotation, training, and update stages take? |
-| Fig. 3 — Accuracy/Latency/Upload Tradeoff | How does each method balance accuracy, adaptation latency, and communication? |
-| Fig. 4 — Upload Breakdown | How much communication comes from raw frames, features, metadata, and model downloads? |
-| Fig. 5 — Adaptation Latency Breakdown | Which adaptation stages dominate response time? |
-| Fig. 6 — Multi-edge Scalability | How do metrics change as the number of edge devices increases? |
-| Fig. 7 — Resource Timeline | How are upload, GPU waiting, annotation, training, and update stages scheduled? |
-| Fig. 8 — Component-style Summary | What is the overall accuracy, latency, and upload comparison? |
-
-Missing values remain empty. The tools never substitute detection count for
-accuracy, estimate unavailable byte components, create random data, or draw
-placeholder curves. A skipped or partial figure is explained in
-`figures/plot_report.json`.
-
-Frame-level F1 and mAP must come from a real precomputed accuracy CSV or JSONL
-referenced by `metrics.accuracy_file` in the manifest. Accuracy-Trigger teacher
-agreement remains a window-level trigger metric and is not presented as
-ground-truth F1 or mAP.
-
-`evaluate_plank_road_baseline_accuracy.py` builds that file from the archived
-per-frame predictions and real annotations. It accepts a one-scenario JSON
-frame mapping, JSONL rows containing `scenario_name`, `frame_id`, `boxes`, and
-`labels`, or COCO detection JSON when `--coco_category_id_map` provides an
-explicit mapping from COCO `category_id` values to model label indices. It
-computes class-aware per-frame F1 with an explicit IoU threshold and leaves mAP
-empty. Frames without annotations are reported and omitted rather than assigned
-a value. On success it updates the manifest and experiment index to reference
-the generated accuracy file and annotation provenance.
-
-`evaluate_plank_road_baseline_teacher_accuracy.py` is the pseudo-label
-alternative. It reopens the logged fixed-video frame, or an explicitly
-archived RTSP/camera JPEG, runs the teacher offline, maps teacher classes into
-the student label space, and writes Teacher-supervised F1. This metric is not
-ground-truth accuracy, and teacher replay time is not an online system cost.
-
-Future runs also record measured application-payload bytes for compressed raw
-shards, feature shards, prediction/protocol metadata, and model downloads.
-Upload, download, and model-apply latency use measured runtime durations when
-available; otherwise the normalizer falls back to paired event timestamps.
-Offline result archival remains excluded from these communication metrics.
+Ekya-style raw logs can be consumed directly by the normalizer when the manifest
+uses method `ekya_style_cloud_scheduling` and `raw_logs.cloud` points to
+the Ekya raw directory, or to a run directory containing
+`baselines/ekya_style_cloud_scheduling/summary.json`. For ad hoc conversion, use
+`tools/convert_ekya_style_results_to_plot_schema.py`; it writes the same
+canonical method identity.
 
 Legacy external Ekya summary data uses
 [configs/experiments/external_ekya_schema.example.csv](./configs/experiments/external_ekya_schema.example.csv)

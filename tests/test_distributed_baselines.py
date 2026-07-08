@@ -235,21 +235,6 @@ def test_native_baseline_methods_are_registered() -> None:
     assert str(PLANK_ROAD_BASELINE_ERROR).startswith("plank_road" + "_multi_device")
 
 
-def test_removed_ekya_baseline_config_section_is_rejected(tmp_path) -> None:
-    path = tmp_path / "config.yaml"
-    path.write_text(
-        """
-baseline:
-  ekya_style_centralized_scheduling:
-    cloud_inference: true
-""",
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="removed and no longer supported"):
-        load_runtime_config(path)
-
-
 def test_baseline_defaults_to_freeze_and_disabled_edge_split_runtime() -> None:
     config = RuntimeConfig()
 

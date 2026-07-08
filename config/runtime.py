@@ -1009,17 +1009,6 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             "experiment_results.include_edge_summary must be true when cloud upload is enabled"
         )
     validate_baseline_method(config.baseline.method)
-    removed_baseline_sections = {"ekya_style_centralized_scheduling"}
-    stale_sections = removed_baseline_sections.intersection(
-        set(getattr(config.baseline, "_extras", {}) or {})
-    )
-    if stale_sections:
-        names = ", ".join(sorted(stale_sections))
-        raise ValueError(
-            f"baseline section(s) removed and no longer supported: {names}. "
-            "Valid baseline methods are pure_edge_local_updating and "
-            "accuracy_trigger_cloud_retraining, and ekya_style_cloud_scheduling."
-        )
     if not isinstance(config.baseline.enabled, bool):
         raise ValueError("baseline.enabled must be a boolean")
     if not str(config.baseline.results_root or "").strip():

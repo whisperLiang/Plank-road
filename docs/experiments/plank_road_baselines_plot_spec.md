@@ -6,7 +6,7 @@ as SVG, PDF, TIFF, and PNG. The figures compare the same method order:
 1. `plank_road` -> Ours
 2. `pure_edge_local_updating` -> Pure Edge
 3. `accuracy_trigger_cloud_retraining` -> Accuracy-Trigger
-4. `ekya_style_centralized_scheduling` -> Ekya-style
+4. `ekya_style_cloud_scheduling` -> Ekya-style
 
 The scenario order is Sunny, Rainy, Snowy, mapped explicitly to:
 

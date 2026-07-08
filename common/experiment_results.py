@@ -13,7 +13,7 @@ ArtifactContent = bytes | str | Path
 PLANK_ROAD_METHOD = "plank_road"
 PURE_EDGE_METHOD = "pure_edge_local_updating"
 ACCURACY_TRIGGER_METHOD = "accuracy_trigger_cloud_retraining"
-EKYA_METHOD = "ekya"
+EKYA_METHOD = "ekya_style_cloud_scheduling"
 EXPERIMENT_METHODS: tuple[str, ...] = (
     PLANK_ROAD_METHOD,
     PURE_EDGE_METHOD,
