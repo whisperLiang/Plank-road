@@ -10,30 +10,31 @@ must not call this actual, real, or ground-truth accuracy.
 
 ## Workflow
 
-Run all methods with the same experiment identity. For example:
+Run all methods with the same `experiment_run` identity:
+
+```yaml
+experiment_run:
+  experiment_id: exp_road_plankroad_vs_baselines_001
+  scenario: road
+  video_path: ./video_data/road.mp4
+  max_count: 2000
+  edge_count: 1
+  repeat: 1
+```
 
 ```bash
 python cloud_server.py \
   --yaml_path ./config/config.yaml \
-  --mode main \
-  --experiment_id exp_road_plankroad_vs_baselines_001 \
-  --scenario road \
-  --edge_count 1 \
-  --repeat 1
+  --mode main
 
 python edge_client.py \
   --yaml_path ./config/config.yaml \
   --mode main \
-  --experiment_id exp_road_plankroad_vs_baselines_001 \
-  --scenario road \
-  --edge_count 1 \
-  --repeat 1 \
-  --video_path ./video_data/road.mp4 \
   --headless
 ```
 
-Use the same identity for baseline processes; method-specific `run_id` values are
-generated automatically. After all artifacts are present:
+Method-specific `run_id` values are generated automatically. After all artifacts
+are present:
 
 ```bash
 python tools/experiments/evaluate_plank_road_baseline_teacher_accuracy.py \

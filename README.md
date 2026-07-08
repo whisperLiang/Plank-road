@@ -360,25 +360,25 @@ an explicit ablation opts into edge targets.
 Cloud:
 
 ```shell
-python cloud_server.py --yaml_path ./config/config.yaml --mode baseline --baseline_method accuracy_trigger_cloud_retraining --listen_address "[::]:50051" --experiment_id road_baselines --scenario road --edge_count 2 --repeat 1
+python cloud_server.py --yaml_path ./config/config.yaml --mode baseline --baseline_method accuracy_trigger_cloud_retraining --listen_address "[::]:50051"
 ```
 
 Accuracy-Trigger edge device 1:
 
 ```shell
-python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method accuracy_trigger_cloud_retraining --experiment_id road_baselines --scenario road --edge_count 2 --repeat 1 --edge_id 1 --server_ip 192.168.66.205:50051 --cache_path ./cache/edge_1 --video_path ./video_data/road.mp4 --headless
+python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method accuracy_trigger_cloud_retraining --edge_id 1 --server_ip 192.168.66.205:50051 --cache_path ./cache/edge_1 --headless
 ```
 
 Accuracy-Trigger edge device 2:
 
 ```shell
-python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method accuracy_trigger_cloud_retraining --experiment_id road_baselines --scenario road --edge_count 2 --repeat 1 --edge_id 2 --server_ip 192.168.66.205:50051 --cache_path ./cache/edge_2 --video_path ./video_data/cam1-rin.mp4 --headless
+python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method accuracy_trigger_cloud_retraining --edge_id 2 --server_ip 192.168.66.205:50051 --cache_path ./cache/edge_2 --video_path ./video_data/cam1-rin.mp4 --headless
 ```
 
 #### Pure Edge Local Updating
 
 ```shell
-python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method pure_edge_local_updating --edge_id 1 --cache_path ./cache/edge_1 --video_path ./video_data/road.mp4 --headless
+python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method pure_edge_local_updating --edge_id 1 --cache_path ./cache/edge_1 --headless
 ```
 
 Pure Edge Local Updating writes metrics locally under
@@ -400,13 +400,13 @@ implemented under
 Cloud:
 
 ```shell
-python cloud_server.py --yaml_path ./config/config.yaml --mode baseline --baseline_method ekya_style_cloud_scheduling --listen_address "[::]:50051" --experiment_id road_baselines --scenario road --edge_count 1 --repeat 1
+python cloud_server.py --yaml_path ./config/config.yaml --mode baseline --baseline_method ekya_style_cloud_scheduling --listen_address "[::]:50051"
 ```
 
 Ekya-style edge:
 
 ```shell
-python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method ekya_style_cloud_scheduling --experiment_id road_baselines --scenario road --edge_count 1 --repeat 1 --edge_id 1 --server_ip 192.168.66.205:50051 --video_path ./video_data/road.mp4 --headless
+python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method ekya_style_cloud_scheduling --edge_id 1 --server_ip 192.168.66.205:50051 --headless
 ```
 
 Cloud-side raw logs are written under
