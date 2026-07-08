@@ -70,10 +70,7 @@ def test_repository_stores_all_supported_methods(tmp_path: Path, method: str) ->
         tmp_path
         / "comparison"
         / "raw_logs"
-        / "scenario=road"
-        / "edges=n1"
-        / "repeat=r01"
-        / f"method={method}"
+        / f"road_n1_r01_{method}"
         / "edge_1"
         / "latest_inference_results.jsonl"
     ]
@@ -131,10 +128,7 @@ def test_repository_preserves_skipped_metadata_from_client_manifest(
         tmp_path
         / "comparison"
         / "raw_logs"
-        / "scenario=road"
-        / "edges=n1"
-        / "repeat=r01"
-        / "method=plank_road"
+        / "road_n1_r01_plank_road"
         / "edge_1"
         / "uploaded_artifacts_manifest.json"
     )

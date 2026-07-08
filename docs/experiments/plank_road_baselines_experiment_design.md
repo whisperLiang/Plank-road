@@ -57,7 +57,7 @@ Use one experiment directory:
 results/experiments/{experiment_id}/
   manifest.yaml
   raw_logs/
-    scenario={scenario_slug}/edges=n{edge_count}/repeat=r{repeat}/method={method}/
+    {scenario_slug}_n{edge_count}_r{repeat}_{method}/
   normalized/
   figures/
 ```

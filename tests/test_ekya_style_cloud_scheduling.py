@@ -1405,10 +1405,7 @@ def test_ekya_cloud_server_uses_dedicated_controller_without_edge_affine(tmp_pat
         / "experiments"
         / "comparison"
         / "raw_logs"
-        / "scenario=road"
-        / "edges=n1"
-        / "repeat=r01"
-        / "method=ekya_style_cloud_scheduling"
+        / "road_n1_r01_ekya_style_cloud_scheduling"
         / "cloud"
     )
     assert _experiment_method_for("ekya_style_cloud_scheduling") == "ekya_style_cloud_scheduling"

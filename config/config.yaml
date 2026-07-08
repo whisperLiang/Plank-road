@@ -1,3 +1,9 @@
+experiment_run:
+ experiment_id: suwon5a_weather
+ scenario: snowy
+ edge_count: 1
+ repeat: 1
+
 sample_pool:
  enabled: true
  shard_size: 64

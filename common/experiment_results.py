@@ -163,14 +163,17 @@ class ExperimentIdentity:
     def edge_count_label(self) -> str:
         return edge_count_label(self.edge_count)
 
-    def raw_logs_relative_dir(self) -> Path:
-        return (
-            Path("raw_logs")
-            / f"scenario={self.scenario_slug}"
-            / f"edges={self.edge_count_label}"
-            / f"repeat={self.repeat_label}"
-            / f"method={self.method}"
+    @property
+    def run_dimension_label(self) -> str:
+        return default_experiment_run_id(
+            scenario_slug=self.scenario_slug,
+            edge_count=self.edge_count,
+            repeat=self.repeat,
+            method=self.method,
         )
+
+    def raw_logs_relative_dir(self) -> Path:
+        return Path("raw_logs") / self.run_dimension_label
 
 
 def sanitize_relative_path(value: str) -> Path:

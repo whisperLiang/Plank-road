@@ -22,8 +22,7 @@ def test_paths_are_dimension_first_and_repeat_separated() -> None:
     cloud = cloud_run_dir(root, "exp", "Sunny", 2, 1, "plank_road")
 
     assert first == Path(
-        "results/experiments/exp/raw_logs/scenario=sunny/edges=n2/"
-        "repeat=r01/method=plank_road/edge_1"
+        "results/experiments/exp/raw_logs/sunny_n2_r01_plank_road/edge_1"
     )
     assert rerun == first
     assert second != first
@@ -88,10 +87,10 @@ def test_manifest_expands_matrix_and_reports_generated_paths(tmp_path: Path) -> 
     )
     assert run["run_id"] == "sunny_n2_r02_plank_road"
     assert run["raw_logs"]["cloud"] == (
-        "raw_logs/scenario=sunny/edges=n2/repeat=r02/method=plank_road/cloud"
+        "raw_logs/sunny_n2_r02_plank_road/cloud"
     )
     assert run["raw_logs"]["edges"]["2"] == (
-        "raw_logs/scenario=sunny/edges=n2/repeat=r02/method=plank_road/edge_2"
+        "raw_logs/sunny_n2_r02_plank_road/edge_2"
     )
 
 

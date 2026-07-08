@@ -66,6 +66,69 @@ experiment_results:
     assert config.experiment_results.local_root_dir == "edge-results"
 
 
+def test_experiment_run_config_is_loaded_and_normalized(tmp_path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+experiment_run:
+  experiment_id: suwon5a_weather
+  scenario: Rainy Scene
+  edge_count: 1
+  repeat: r02
+""",
+        encoding="utf-8",
+    )
+    config = load_runtime_config(path)
+
+    assert config.experiment_run.experiment_id == "suwon5a_weather"
+    assert config.experiment_run.scenario == "rainy-scene"
+    assert config.experiment_run.edge_count == 1
+    assert config.experiment_run.repeat == 2
+
+
+def test_experiment_run_defaults_do_not_force_specific_scenario(tmp_path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text("", encoding="utf-8")
+
+    config = load_runtime_config(path)
+
+    assert config.experiment_run.experiment_id == "default_experiment"
+    assert config.experiment_run.scenario == ""
+    assert config.experiment_run.edge_count == 1
+    assert config.experiment_run.repeat == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("experiment_id", '""', "experiment_run.experiment_id"),
+        ("edge_count", "0", "edge_count must be a positive integer"),
+        ("repeat", "0", "repeat must be a positive integer"),
+    ],
+)
+def test_experiment_run_config_is_validated(
+    tmp_path,
+    field: str,
+    value: str,
+    message: str,
+) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        f"""
+experiment_run:
+  experiment_id: suwon5a_weather
+  scenario: sunny
+  edge_count: 1
+  repeat: 1
+  {field}: {value}
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        load_runtime_config(path)
+
+
 def test_removed_experiment_result_config_fields_are_rejected(tmp_path) -> None:
     path = tmp_path / "config.yaml"
     path.write_text(

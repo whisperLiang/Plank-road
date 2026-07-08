@@ -53,7 +53,7 @@ Formal experiment runs are archived through a shutdown-only side channel under:
 results/experiments/{experiment_id}/
   manifest.yaml
   raw_logs/
-    scenario={scenario_slug}/edges=n{edge_count}/repeat=r{repeat}/method={method}/
+    {scenario_slug}_n{edge_count}_r{repeat}_{method}/
       cloud/
       edge_{edge_id}/
   normalized/
@@ -61,15 +61,25 @@ results/experiments/{experiment_id}/
 ```
 
 `experiment_results.root_dir` is the cloud repository and
-`experiment_results.local_root_dir` is the edge staging directory. Use the same
-`--experiment_id`, `--scenario`, `--edge_count`, and `--repeat` on participating
-cloud and edge processes. `--run_id` is optional; if omitted it is generated from
-those dimensions and the method.
+`experiment_results.local_root_dir` is the edge staging directory. The shared
+run identity can be configured once at the top of `config/config.yaml`:
+
+```yaml
+experiment_run:
+  experiment_id: suwon5a_weather
+  scenario: sunny
+  edge_count: 1
+  repeat: 1
+```
+
+CLI values such as `--scenario` and `--repeat` override `experiment_run`.
+`--run_id` is optional; if omitted it is generated from those dimensions and the
+method.
 
 ```shell
-python cloud_server.py --experiment_id suwon5a_weather --scenario sunny --edge_count 2 --repeat 1
+python cloud_server.py
 python edge_client.py --headless --mode main \
-  --experiment_id suwon5a_weather --scenario sunny --edge_count 2 --repeat 1 --edge_id 1
+  --edge_id 1
 ```
 
 After the required methods for a scenario have produced their staged result
@@ -472,7 +482,7 @@ matching frame ranges per scenario.
 results/experiments/{experiment_id}/
   manifest.yaml
   raw_logs/
-    scenario={scenario_slug}/edges=n{edge_count}/repeat=r{repeat}/method={method}/
+    {scenario_slug}_n{edge_count}_r{repeat}_{method}/
   normalized/
   figures/
 ```
@@ -501,7 +511,8 @@ empty and skipped or partial figures are reported in `figures/plot_report.json`.
 
 Ekya-style raw logs can be consumed directly by the normalizer when the matrix
 manifest includes method `ekya_style_cloud_scheduling` and the raw files are in
-the generated `method=ekya_style_cloud_scheduling` directory. For ad hoc
+the generated `{scenario_slug}_n{edge_count}_r{repeat}_ekya_style_cloud_scheduling`
+directory. For ad hoc
 conversion, use
 `tools/convert_ekya_style_results_to_plot_schema.py`; it writes the same
 canonical method identity.

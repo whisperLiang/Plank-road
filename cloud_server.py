@@ -708,8 +708,8 @@ if __name__ == "__main__":
     parser.add_argument("--run_id", default=None, help="optional experiment run id override")
     parser.add_argument("--experiment_id", default=None, help="experiment id")
     parser.add_argument("--scenario", default=None, help="experiment scenario slug/name")
-    parser.add_argument("--edge_count", type=int, default=1, help="number of edge devices")
-    parser.add_argument("--repeat", default=1, help="repeat index, e.g. 1 or r01")
+    parser.add_argument("--edge_count", type=int, default=None, help="number of edge devices")
+    parser.add_argument("--repeat", default=None, help="repeat index, e.g. 1 or r01")
     parser.add_argument(
         "--experiment_results_root",
         default=None,
@@ -728,6 +728,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     config = load_runtime_config(args.yaml_path)
+    experiment_run = config.experiment_run
     server_config = config.server
     if args.experiment_results_root is not None:
         config.experiment_results.root_dir = args.experiment_results_root
@@ -752,10 +753,18 @@ if __name__ == "__main__":
         baseline_config=config.baseline,
         baseline_method=baseline_method,
         run_id=args.run_id or "",
-        experiment_id=args.experiment_id or "",
-        scenario=args.scenario or "",
-        edge_count=args.edge_count,
-        repeat=args.repeat,
+        experiment_id=(
+            args.experiment_id
+            if args.experiment_id is not None
+            else experiment_run.experiment_id
+        ),
+        scenario=args.scenario if args.scenario is not None else experiment_run.scenario,
+        edge_count=(
+            args.edge_count
+            if args.edge_count is not None
+            else experiment_run.edge_count
+        ),
+        repeat=args.repeat if args.repeat is not None else experiment_run.repeat,
         yaml_path=args.yaml_path,
         runtime_config=config,
     )

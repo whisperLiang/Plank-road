@@ -17,14 +17,7 @@ PLANK_RUN_ID = "road_n1_r01_plank_road"
 
 
 def _raw_dir(method: str, kind: str) -> Path:
-    return (
-        Path("raw_logs")
-        / "scenario=road"
-        / "edges=n1"
-        / "repeat=r01"
-        / f"method={method}"
-        / kind
-    )
+    return Path("raw_logs") / f"road_n1_r01_{method}" / kind
 
 
 def _write_manifest(

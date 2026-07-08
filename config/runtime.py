@@ -8,6 +8,12 @@ from typing import Any, Mapping
 
 import yaml
 
+from common.experiment_results import (
+    normalize_edge_count,
+    normalize_repeat,
+    normalize_scenario_slug,
+    sanitize_component,
+)
 from config.baseline import validate_baseline_method
 
 
@@ -328,6 +334,14 @@ class ExperimentResultsConfig(ConfigSection):
 
 
 @dataclass
+class ExperimentRunConfig(ConfigSection):
+    experiment_id: str = "default_experiment"
+    scenario: str = ""
+    edge_count: int = 1
+    repeat: int | str = 1
+
+
+@dataclass
 class DASConfig(ConfigSection):
     enabled: bool = False
     bn_only: bool = False
@@ -534,6 +548,7 @@ class ServerConfig(ConfigSection):
 
 @dataclass
 class RuntimeConfig(ConfigSection):
+    experiment_run: ExperimentRunConfig = field(default_factory=ExperimentRunConfig)
     client: ClientConfig = field(default_factory=ClientConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     sample_pool: SamplePoolConfig = field(default_factory=SamplePoolConfig)
@@ -689,6 +704,10 @@ def _section(section_cls, value: Mapping[str, Any] | None):
             known.get("accuracy_trigger_cloud_retraining"),
         )
     elif section_cls is RuntimeConfig:
+        known["experiment_run"] = _section(
+            ExperimentRunConfig,
+            known.get("experiment_run"),
+        )
         sample_pool = _section(SamplePoolConfig, known.get("sample_pool"))
         experiment_results = _section(
             ExperimentResultsConfig,
@@ -853,7 +872,7 @@ def _reject_removed_config_fields(config: RuntimeConfig) -> None:
         raise ValueError(
             "These config fields were removed by the current experiment layout: "
             + ", ".join(removed)
-            + ". Use CLI experiment identity fields instead."
+            + ". Use experiment_run or CLI experiment identity fields instead."
         )
 
 
@@ -975,6 +994,17 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             raise ValueError(message)
 
     _validate_sample_pool_config("sample_pool", config.sample_pool)
+    experiment_run = config.experiment_run
+    if not str(experiment_run.experiment_id or "").strip():
+        raise ValueError("experiment_run.experiment_id must be non-empty")
+    try:
+        experiment_run.experiment_id = sanitize_component(experiment_run.experiment_id)
+        if str(experiment_run.scenario or "").strip():
+            experiment_run.scenario = normalize_scenario_slug(experiment_run.scenario)
+        experiment_run.edge_count = normalize_edge_count(experiment_run.edge_count)
+        experiment_run.repeat = normalize_repeat(experiment_run.repeat)
+    except ValueError as exc:
+        raise ValueError(f"experiment_run: {exc}") from exc
     experiment_results = config.experiment_results
     for name in ("enabled",):
         if not isinstance(getattr(experiment_results, name), bool):
