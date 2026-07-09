@@ -31,23 +31,28 @@ class TeacherLabeler:
         teacher = self._ensure_teacher()
         frames = [record.decoded_frame_bgr for record in window.records]
         labels: dict[int, dict[str, Any]] = {}
-        if hasattr(teacher, "large_inference_batch"):
-            predictions = teacher.large_inference_batch(
-                frames,
-                threshold=float(self.config.teacher_labeling.score_threshold),
-            )
-        else:
-            predictions = [
-                teacher.large_inference(
-                    frame,
-                    threshold=float(self.config.teacher_labeling.score_threshold),
-                )
-                for frame in frames
-            ]
+        predictions = self._label_frames(teacher, frames)
         for record, prediction in zip(window.records, predictions):
             labels[int(record.frame_idx)] = _prediction_to_labels(prediction)
         self._write_labels(window, labels)
         return labels, time.perf_counter() - started
+
+    def _label_frames(self, teacher: Any, frames: list[Any]) -> list[Any]:
+        batch_size = max(1, int(self.config.teacher_labeling.batch_size))
+        threshold = float(self.config.teacher_labeling.score_threshold)
+        predictions: list[Any] = []
+        if hasattr(teacher, "large_inference_batch"):
+            for offset in range(0, len(frames), batch_size):
+                predictions.extend(
+                    teacher.large_inference_batch(
+                        frames[offset : offset + batch_size],
+                        threshold=threshold,
+                    )
+                )
+            return predictions
+        for frame in frames:
+            predictions.append(teacher.large_inference(frame, threshold=threshold))
+        return predictions
 
     def _write_labels(
         self,

@@ -398,6 +398,118 @@ def test_split_and_subsample_samples_are_deterministic() -> None:
     ]
 
 
+def test_controller_training_window_includes_previous_decision_window(
+    tmp_path: Path,
+) -> None:
+    from cloud.baselines.ekya_style_cloud_scheduling.controller import (
+        EkyaStyleCloudSchedulingController,
+        TrainingCandidate,
+    )
+
+    runtime = _runtime(tmp_path)
+    runtime.baseline.training.training_frame_count = 4
+    cfg = parse_ekya_style_config(runtime, run_id="run")
+    controller = EkyaStyleCloudSchedulingController(
+        cfg,
+        detector=SimpleNamespace(model=_TinyTrainModelFactory()()),
+    )
+
+    previous_records = (_decoded_record(1), _decoded_record(2))
+    current_records = (_decoded_record(3), _decoded_record(4))
+    previous = CompletedFrameWindow(
+        task_id=0,
+        window_id="previous",
+        start_frame=1,
+        end_frame=2,
+        records=previous_records,
+        edge_id=1,
+        camera_id=0,
+    )
+    current = CompletedFrameWindow(
+        task_id=1,
+        window_id="current",
+        start_frame=3,
+        end_frame=4,
+        records=current_records,
+        edge_id=1,
+        camera_id=0,
+    )
+    for record in previous.records:
+        record.teacher_labels = _teacher_labels(record.frame_idx)[record.frame_idx]
+    with controller.frame_buffer._lock:
+        controller.frame_buffer._completed_windows[previous.window_id] = previous
+
+    decision = _training_decision(task_id=1)
+    candidate = TrainingCandidate(
+        edge_id=1,
+        camera_id=0,
+        task_id=1,
+        window_id=current.window_id,
+        score=0.1,
+        microprofile_result=_microprofile_result(1),
+        decision=decision,
+        window=current,
+        teacher_labels=_teacher_labels(3, 4),
+        base_state_dict={},
+        model_builder=_TinyTrainModelFactory(),
+        created_at=1.0,
+        teacher_labeling_time_s=0.0,
+        microprofile_time_s=0.0,
+        frame_scores=({"foreground_f1": 1.0, "map50": 1.0, "map": 1.0},),
+        scheduler_row={"edge_id": 1, "camera_id": 0, **decision.as_dict()},
+    )
+
+    training_window, labels = controller._training_window_and_labels_for(
+        candidate.window,
+        candidate.teacher_labels,
+    )
+
+    assert training_window.frame_indices == (1, 2, 3, 4)
+    assert training_window.task_id == 1
+    assert training_window.start_frame == 1
+    assert training_window.end_frame == 4
+    assert sorted(labels) == [1, 2, 3, 4]
+
+
+def test_controller_training_window_rejects_unlabeled_previous_window(
+    tmp_path: Path,
+) -> None:
+    from cloud.baselines.ekya_style_cloud_scheduling.controller import (
+        EkyaStyleCloudSchedulingController,
+    )
+
+    runtime = _runtime(tmp_path)
+    runtime.baseline.training.training_frame_count = 4
+    cfg = parse_ekya_style_config(runtime, run_id="run")
+    controller = EkyaStyleCloudSchedulingController(
+        cfg,
+        detector=SimpleNamespace(model=_TinyTrainModelFactory()()),
+    )
+    previous = CompletedFrameWindow(
+        task_id=0,
+        window_id="previous",
+        start_frame=1,
+        end_frame=2,
+        records=(_decoded_record(1), _decoded_record(2)),
+        edge_id=1,
+        camera_id=0,
+    )
+    current = CompletedFrameWindow(
+        task_id=1,
+        window_id="current",
+        start_frame=3,
+        end_frame=4,
+        records=(_decoded_record(3), _decoded_record(4)),
+        edge_id=1,
+        camera_id=0,
+    )
+    with controller.frame_buffer._lock:
+        controller.frame_buffer._completed_windows[previous.window_id] = previous
+
+    with pytest.raises(RuntimeError, match="previous decision window"):
+        controller._training_window_and_labels_for(current, _teacher_labels(3, 4))
+
+
 def test_ekya_config_validation_rejects_wrong_default_student(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
     runtime.server.baselines.ekya_style_cloud_scheduling.student_model = "tinynext_s"
@@ -491,7 +603,7 @@ def test_ekya_config_inherits_shared_plank_road_settings() -> None:
     runtime.baseline.accuracy_trigger_cloud_retraining.agreement_iou_threshold = 0.6
     runtime.baseline.accuracy_trigger_cloud_retraining.training_strategy = "freeze"
     runtime.baseline.accuracy_trigger_cloud_retraining.trainable_param_ratio = 0.25
-    runtime.baseline.training.training_frame_count = 12
+    runtime.baseline.training.training_frame_count = 24
     runtime.baseline.training.microprofile_epochs = 3
     runtime.baseline.training.min_training_samples = 2
     runtime.baseline.training.optimizer_name = "sgd"
@@ -511,6 +623,7 @@ def test_ekya_config_inherits_shared_plank_road_settings() -> None:
     assert cfg.video_path == "./video_data/shared.mp4"
     assert cfg.num_frames == 120
     assert cfg.window_size == 12
+    assert cfg.training_frame_count == 24
     assert cfg.cloud_inference.score_threshold == pytest.approx(0.42)
     assert cfg.teacher_labeling.batch_size == 7
     assert cfg.teacher_labeling.score_threshold == pytest.approx(0.44)
@@ -530,6 +643,42 @@ def test_ekya_config_inherits_shared_plank_road_settings() -> None:
     assert cfg.fixed_training.test_batch_size == 5
     assert cfg.fixed_training.learning_rate == pytest.approx(2.0e-4)
     assert cfg.fixed_training.subsample == pytest.approx(1.0)
+
+
+def test_ekya_teacher_labeler_batches_window_by_configured_teacher_batch(
+    tmp_path: Path,
+) -> None:
+    from cloud.baselines.ekya_style_cloud_scheduling.teacher_labeler import TeacherLabeler
+
+    class BatchTeacher:
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+
+        def large_inference_batch(self, images, threshold=None):
+            self.calls.append(len(images))
+            return [
+                (
+                    [[0.0, 0.0, 1.0, 1.0]],
+                    [1],
+                    [float(threshold)],
+                )
+                for _image in images
+            ]
+
+    runtime = _runtime(tmp_path)
+    runtime.server.baselines.ekya_style_cloud_scheduling.teacher_labeling.batch_size = 2
+    cfg = parse_ekya_style_config(runtime, run_id="run")
+    teacher = BatchTeacher()
+
+    labels, _elapsed = TeacherLabeler(
+        cfg,
+        output_dir=tmp_path,
+        teacher=teacher,
+    ).label_window(_decoded_window())
+
+    assert teacher.calls == [2, 1]
+    assert sorted(labels) == [1, 2, 3]
+    assert labels[1]["scores"] == [pytest.approx(0.3)]
 
 
 def test_ekya_cloud_inference_config_passes_final_detection_threshold(

@@ -21,6 +21,7 @@ from cloud.baselines.ekya_style_cloud_scheduling.config import (
 from cloud.baselines.ekya_style_cloud_scheduling.frame_buffer import (
     CloudFrameBuffer,
     CompletedFrameWindow,
+    stable_window_id,
 )
 from cloud.baselines.ekya_style_cloud_scheduling.microprofiler import (
     DetectionMicroProfiler,
@@ -87,6 +88,8 @@ class TrainingCandidate:
     frame_scores: tuple[dict[str, float], ...]
     scheduler_row: dict[str, Any]
     training_admission_blocked: bool = False
+    training_window: CompletedFrameWindow | None = None
+    training_teacher_labels: dict[int, dict[str, Any]] | None = None
 
 
 class EkyaStyleCloudSchedulingController:
@@ -334,6 +337,10 @@ class EkyaStyleCloudSchedulingController:
                 **decision.as_dict(),
             }
             if decision.trains:
+                training_window, training_teacher_labels = self._training_window_and_labels_for(
+                    window,
+                    teacher_labels,
+                )
                 self._add_training_candidate(
                     TrainingCandidate(
                         edge_id=int(window.edge_id),
@@ -353,6 +360,8 @@ class EkyaStyleCloudSchedulingController:
                         frame_scores=tuple(frame_scores),
                         scheduler_row=scheduler_row,
                         training_admission_blocked=bool(training_admission_blocked),
+                        training_window=training_window,
+                        training_teacher_labels=training_teacher_labels,
                     )
                 )
             else:
@@ -498,10 +507,12 @@ class EkyaStyleCloudSchedulingController:
         training_result: TrainingResult | None = None
         adopted = False
         try:
+            training_window = candidate.training_window or candidate.window
+            training_labels = candidate.training_teacher_labels or candidate.teacher_labels
             training_result = self.trainer.train(
-                window=candidate.window,
+                window=training_window,
                 decision=candidate.decision,
-                teacher_labels=candidate.teacher_labels,
+                teacher_labels=training_labels,
                 previous_val_map=self._previous_val_map_snapshot(
                     candidate.edge_id,
                     candidate.camera_id,
@@ -532,6 +543,82 @@ class EkyaStyleCloudSchedulingController:
                 microprofile_time_s=candidate.microprofile_time_s,
                 teacher_labeling_time_s=candidate.teacher_labeling_time_s,
             )
+
+    def _training_window_and_labels_for(
+        self,
+        current: CompletedFrameWindow,
+        current_teacher_labels: Mapping[int, Mapping[str, Any]],
+    ) -> tuple[CompletedFrameWindow, dict[int, dict[str, Any]]]:
+        previous = self.frame_buffer.previous_completed_window(current)
+        if previous is None:
+            return current, _copy_teacher_labels(current_teacher_labels)
+
+        self._wait_for_window_pipeline_completion(previous.task_id)
+        if not _window_has_teacher_labels(previous):
+            raise RuntimeError(
+                "Ekya training requires the previous decision window to be labeled: "
+                f"current_window={current.window_id} previous_window={previous.window_id}"
+            )
+
+        records = list(previous.records) + list(current.records)
+        max_records = max(1, int(self.config.training_frame_count))
+        if len(records) > max_records:
+            records = records[-max_records:]
+        if not records:
+            return current, _copy_teacher_labels(current_teacher_labels)
+
+        labels: dict[int, dict[str, Any]] = {}
+        for record in records:
+            frame_idx = int(record.frame_idx)
+            if frame_idx in current_teacher_labels:
+                labels[frame_idx] = dict(current_teacher_labels.get(frame_idx) or {})
+                continue
+            stored_labels = getattr(record, "teacher_labels", None)
+            if stored_labels:
+                labels[frame_idx] = dict(stored_labels)
+        missing_labels = [
+            int(record.frame_idx)
+            for record in records
+            if not _has_teacher_labels(labels.get(int(record.frame_idx)))
+        ]
+        if missing_labels:
+            raise RuntimeError(
+                "Ekya training window is missing teacher labels: "
+                f"window={current.window_id} missing_frames={missing_labels[:8]}"
+            )
+
+        if len(records) == len(current.records) and records[0] is current.records[0]:
+            return current, labels or _copy_teacher_labels(current_teacher_labels)
+
+        start_frame = int(records[0].frame_idx)
+        end_frame = int(records[-1].frame_idx)
+        return (
+            CompletedFrameWindow(
+                task_id=int(current.task_id),
+                window_id=stable_window_id(
+                    int(current.task_id),
+                    start_frame,
+                    end_frame,
+                    edge_id=int(current.edge_id),
+                    camera_id=int(current.camera_id),
+                ),
+                start_frame=start_frame,
+                end_frame=end_frame,
+                records=tuple(records),
+                edge_id=int(current.edge_id),
+                camera_id=int(current.camera_id),
+            ),
+            labels,
+        )
+
+    def _wait_for_window_pipeline_completion(self, task_id: int) -> None:
+        task_id = int(task_id)
+        while True:
+            with self._candidate_lock:
+                active = self._active_window_pipelines_by_task.get(task_id, 0)
+            if active <= 0:
+                return
+            time.sleep(0.05)
 
     def _record_window_metrics(
         self,
@@ -749,6 +836,22 @@ class EkyaStyleCloudSchedulingController:
 def _mean(values) -> float | None:
     numbers = [float(value) for value in values if value is not None]
     return sum(numbers) / len(numbers) if numbers else None
+
+
+def _copy_teacher_labels(
+    labels: Mapping[int, Mapping[str, Any]],
+) -> dict[int, dict[str, Any]]:
+    return {int(frame_idx): dict(value or {}) for frame_idx, value in dict(labels or {}).items()}
+
+
+def _window_has_teacher_labels(window: CompletedFrameWindow) -> bool:
+    return all(_has_teacher_labels(record.teacher_labels) for record in window.records)
+
+
+def _has_teacher_labels(labels: Mapping[str, Any] | None) -> bool:
+    if not isinstance(labels, Mapping):
+        return False
+    return any(key in labels for key in ("boxes", "labels", "scores"))
 
 
 def _sort_training_candidates(

@@ -1066,9 +1066,10 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         allow_zero=True,
     )
     training_frame_count = int(baseline_training.training_frame_count)
+    trigger_window_size = int(accuracy_cfg.trigger_window_size)
     resolved_window_size = _configured_value(
         ekya_cfg.window_size,
-        training_frame_count,
+        trigger_window_size,
     )
     resolved_num_frames = _configured_value(
         ekya_cfg.num_frames,
@@ -1078,10 +1079,10 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         "server.baselines.ekya_style_cloud_scheduling.window_size",
         int(resolved_window_size),
     )
-    if int(resolved_window_size) != training_frame_count:
+    if training_frame_count < int(resolved_window_size):
         raise ValueError(
-            "server.baselines.ekya_style_cloud_scheduling.window_size must equal "
-            "baseline.training.training_frame_count"
+            "baseline.training.training_frame_count must be >= "
+            "server.baselines.ekya_style_cloud_scheduling.window_size"
         )
     if int(resolved_num_frames) < int(resolved_window_size):
         raise ValueError(

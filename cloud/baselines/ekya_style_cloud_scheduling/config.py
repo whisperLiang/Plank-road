@@ -110,6 +110,7 @@ class EkyaStyleCloudSchedulingConfig:
     video_name: str
     num_frames: int
     window_size: int
+    training_frame_count: int
     seed: int
     class_names: tuple[str, ...]
     result_root: Path
@@ -138,6 +139,14 @@ class EkyaStyleCloudSchedulingConfig:
             )
         if self.window_size <= 0:
             raise ValueError("ekya_style_cloud_scheduling.window_size must be positive")
+        if self.training_frame_count <= 0:
+            raise ValueError(
+                "ekya_style_cloud_scheduling.training_frame_count must be positive"
+            )
+        if self.training_frame_count < self.window_size:
+            raise ValueError(
+                "ekya_style_cloud_scheduling.training_frame_count must be >= window_size"
+            )
         if self.num_frames < self.window_size:
             raise ValueError("ekya_style_cloud_scheduling.num_frames must be >= window_size")
         self.fixed_training.validate()
@@ -257,12 +266,8 @@ def parse_ekya_style_config(
     accuracy_cfg = _get(baseline, "accuracy_trigger_cloud_retraining", None)
     baseline_training = _get(baseline, "training", None)
     training_frame_count = int(_get(baseline_training, "training_frame_count", 128))
+    trigger_window_size = int(_get(accuracy_cfg, "trigger_window_size", training_frame_count))
     configured_window_size = _get(section, "window_size", None)
-    if configured_window_size not in (None, "") and int(configured_window_size) != training_frame_count:
-        raise ValueError(
-            "ekya_style_cloud_scheduling.window_size must equal "
-            "baseline.training.training_frame_count"
-        )
     config = EkyaStyleCloudSchedulingConfig(
         run_id=resolved_run_id,
         student_model=student_model,
@@ -281,11 +286,12 @@ def parse_ekya_style_config(
             _required_value(
                 _configured_value(
                     configured_window_size,
-                    training_frame_count,
+                    trigger_window_size,
                 ),
                 "ekya_style_cloud_scheduling.window_size",
             )
         ),
+        training_frame_count=int(training_frame_count),
         seed=int(_get(section, "seed", 42)),
         class_names=tuple(str(value) for value in list(_get(client, "class_names", []) or [])),
         result_root=resolved_result_root,

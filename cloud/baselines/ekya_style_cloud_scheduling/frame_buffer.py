@@ -137,6 +137,22 @@ class CloudFrameBuffer:
         with self._lock:
             return [self._records[key] for key in sorted(self._records)]
 
+    def previous_completed_window(
+        self,
+        window: CompletedFrameWindow,
+    ) -> CompletedFrameWindow | None:
+        with self._lock:
+            candidates = [
+                candidate
+                for candidate in self._completed_windows.values()
+                if int(candidate.edge_id) == int(window.edge_id)
+                and int(candidate.camera_id) == int(window.camera_id)
+                and int(candidate.end_frame) < int(window.start_frame)
+            ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda candidate: int(candidate.end_frame))
+
     def completed_windows(self) -> list[CompletedFrameWindow]:
         with self._lock:
             groups: dict[tuple[int, int, int, int], list[UploadedFrameRecord]] = {}
