@@ -4,15 +4,24 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import time
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback.
+    fcntl = None
 
 
 _STATE_FILE = "recent_training_window.json"
 _SEQUENCE_KEY = "__recent_window_sequence"
 _ADDED_AT_KEY = "__recent_window_added_at"
+_THREAD_LOCKS: dict[str, threading.RLock] = {}
+_THREAD_LOCKS_GUARD = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -45,49 +54,50 @@ class RecentTrainingWindowStore:
         *,
         sample_source: str = "",
     ) -> RecentWindowAppendStats:
-        state = self._load_state()
-        existing = {
-            str(sample.get("sample_id") or ""): dict(sample)
-            for sample in list(state.get("samples", []) or [])
-            if isinstance(sample, Mapping) and str(sample.get("sample_id") or "")
-        }
-        next_sequence = int(state.get("next_sequence") or 0)
-        accepted = 0
-        replaced = 0
-        now = time.time()
-        for raw_sample in list(samples or []):
-            if not isinstance(raw_sample, Mapping):
-                continue
-            sample = dict(raw_sample)
-            sample_id = str(sample.get("sample_id") or "").strip()
-            if not sample_id:
-                continue
-            if sample_id in existing:
-                replaced += 1
-            sample[_SEQUENCE_KEY] = next_sequence
-            sample[_ADDED_AT_KEY] = now
-            if sample_source and not sample.get("sample_source"):
-                sample["sample_source"] = str(sample_source)
-            existing[sample_id] = sample
-            next_sequence += 1
-            accepted += 1
+        with self._locked():
+            state = self._load_state()
+            existing = {
+                str(sample.get("sample_id") or ""): dict(sample)
+                for sample in list(state.get("samples", []) or [])
+                if isinstance(sample, Mapping) and str(sample.get("sample_id") or "")
+            }
+            next_sequence = int(state.get("next_sequence") or 0)
+            accepted = 0
+            replaced = 0
+            now = time.time()
+            for raw_sample in list(samples or []):
+                if not isinstance(raw_sample, Mapping):
+                    continue
+                sample = dict(raw_sample)
+                sample_id = str(sample.get("sample_id") or "").strip()
+                if not sample_id:
+                    continue
+                if sample_id in existing:
+                    replaced += 1
+                sample[_SEQUENCE_KEY] = next_sequence
+                sample[_ADDED_AT_KEY] = now
+                if sample_source and not sample.get("sample_source"):
+                    sample["sample_source"] = str(sample_source)
+                existing[sample_id] = sample
+                next_sequence += 1
+                accepted += 1
 
-        ordered = sorted(
-            existing.values(),
-            key=lambda sample: (
-                int(sample.get(_SEQUENCE_KEY) or 0),
-                str(sample.get("sample_id") or ""),
-            ),
-        )
-        dropped_old = max(0, len(ordered) - self.max_samples)
-        retained = ordered[-self.max_samples :]
-        self._write_state({"next_sequence": next_sequence, "samples": retained})
-        return RecentWindowAppendStats(
-            accepted=accepted,
-            replaced=replaced,
-            retained=len(retained),
-            dropped_old=dropped_old,
-        )
+            ordered = sorted(
+                existing.values(),
+                key=lambda sample: (
+                    int(sample.get(_SEQUENCE_KEY) or 0),
+                    str(sample.get("sample_id") or ""),
+                ),
+            )
+            dropped_old = max(0, len(ordered) - self.max_samples)
+            retained = ordered[-self.max_samples :]
+            self._write_state({"next_sequence": next_sequence, "samples": retained})
+            return RecentWindowAppendStats(
+                accepted=accepted,
+                replaced=replaced,
+                retained=len(retained),
+                dropped_old=dropped_old,
+            )
 
     def latest_samples(self, count: int | None = None) -> list[dict[str, object]]:
         limit = self.max_samples if count in (None, 0) else max(1, int(count))
@@ -110,7 +120,26 @@ class RecentTrainingWindowStore:
         return len(self.latest_samples(self.max_samples))
 
     def reset(self) -> None:
-        shutil.rmtree(self.root_dir, ignore_errors=True)
+        with self._locked():
+            shutil.rmtree(self.root_dir, ignore_errors=True)
+
+    def _lock_path(self) -> str:
+        return f"{self.root_dir}.lock"
+
+    @contextmanager
+    def _locked(self):
+        lock_path = self._lock_path()
+        thread_lock = _thread_lock_for_path(lock_path)
+        with thread_lock:
+            os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+            with open(lock_path, "a+", encoding="utf-8") as handle:
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    if fcntl is not None:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def _load_state(self) -> dict[str, Any]:
         try:
@@ -145,6 +174,15 @@ def _strip_internal_fields(sample: Mapping[str, object]) -> dict[str, object]:
     clean.pop(_SEQUENCE_KEY, None)
     clean.pop(_ADDED_AT_KEY, None)
     return clean
+
+
+def _thread_lock_for_path(path: str) -> threading.RLock:
+    with _THREAD_LOCKS_GUARD:
+        lock = _THREAD_LOCKS.get(path)
+        if lock is None:
+            lock = threading.RLock()
+            _THREAD_LOCKS[path] = lock
+        return lock
 
 
 __all__ = ["RecentTrainingWindowStore", "RecentWindowAppendStats"]

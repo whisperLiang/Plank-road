@@ -66,7 +66,7 @@ class DistributedBaselineController:
         self.tinynext_input_size = tinynext_input_size
         self.training_frame_count = max(
             1,
-            int(_config_value(baseline_training_config, "training_frame_count", 120)),
+            int(_config_value(baseline_training_config, "training_frame_count", 128)),
         )
         self.strict_run_id = bool(strict_run_id)
         self.teacher_annotator = teacher_annotator
@@ -639,5 +639,5 @@ def _training_config_dict(config: object | dict[str, Any] | None) -> dict[str, A
     result.setdefault("learning_rate", 1e-3)
     result.setdefault("min_training_samples", 1)
     result.setdefault("training_window_size", 8)
-    result.setdefault("training_frame_count", 120)
+    result.setdefault("training_frame_count", 128)
     return result

@@ -94,7 +94,7 @@ class OrchestrationSettings:
             if cl_cfg
             else False,
             log_internal_ids=bool(getattr(cl_cfg, "log_internal_ids", False)) if cl_cfg else False,
-            training_frame_count=max(1, int(getattr(config, "training_frame_count", 120))),
+            training_frame_count=max(1, int(getattr(config, "training_frame_count", 128))),
             recent_training_window_root=os.path.abspath(
                 str(
                     getattr(

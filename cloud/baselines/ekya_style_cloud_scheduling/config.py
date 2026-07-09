@@ -256,7 +256,7 @@ def parse_ekya_style_config(
     microprofile_section = _get(section, "microprofile", None)
     accuracy_cfg = _get(baseline, "accuracy_trigger_cloud_retraining", None)
     baseline_training = _get(baseline, "training", None)
-    training_frame_count = int(_get(baseline_training, "training_frame_count", 120))
+    training_frame_count = int(_get(baseline_training, "training_frame_count", 128))
     configured_window_size = _get(section, "window_size", None)
     if configured_window_size not in (None, "") and int(configured_window_size) != training_frame_count:
         raise ValueError(

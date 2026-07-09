@@ -246,7 +246,7 @@ def test_baseline_defaults_to_freeze_and_disabled_edge_split_runtime() -> None:
         == pytest.approx(0.3)
     )
     assert config.baseline.accuracy_trigger_cloud_retraining.training_failure_backoff_sec == 30.0
-    assert config.baseline.accuracy_trigger_cloud_retraining.trigger_window_size == 8
+    assert config.baseline.accuracy_trigger_cloud_retraining.trigger_window_size == 64
     assert config.baseline.accuracy_trigger_cloud_retraining.min_history_windows == 2
     assert config.baseline.accuracy_trigger_cloud_retraining.accuracy_drop_sigma == pytest.approx(
         1.0
@@ -267,7 +267,7 @@ def test_baseline_defaults_to_freeze_and_disabled_edge_split_runtime() -> None:
         pytest.approx(0.6)
     )
     assert config.baseline.edge.split_runtime_policy == "disabled"
-    assert config.baseline.training.training_frame_count == 120
+    assert config.baseline.training.training_frame_count == 128
 
 
 def test_removed_sample_pool_config_is_rejected(tmp_path) -> None:

@@ -258,7 +258,7 @@ class AccuracyTriggerBaselineConfig(ConfigSection):
     trainable_param_ratio: float = 0.3
     training_failure_backoff_sec: float = 30.0
     return_model_update: bool = True
-    trigger_window_size: int = 8
+    trigger_window_size: int = 64
     min_history_windows: int = 2
     accuracy_drop_sigma: float = 1.0
     history_decay: float = 0.9
@@ -286,7 +286,7 @@ class BaselineTrainingConfig(ConfigSection):
     weight_decay: float = 0.0
     min_training_samples: int = 1
     training_window_size: int = 8
-    training_frame_count: int = 120
+    training_frame_count: int = 128
     microprofile_epochs: int = 1
     device: str = "auto"
     worker_infra_failure_backoff_sec: float = 10.0

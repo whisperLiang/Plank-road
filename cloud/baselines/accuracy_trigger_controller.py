@@ -218,6 +218,12 @@ class AccuracyTriggerCommandRecord:
 
 
 @dataclass
+class _PendingAccuracyTrigger:
+    window: AccuracyTriggerWindow
+    buffered_window_count: int
+
+
+@dataclass
 class _ModelAccuracyState:
     history: list[float] = field(default_factory=list)
     buffer_samples: list[AccuracyTriggerFrame] = field(default_factory=list)
@@ -225,7 +231,7 @@ class _ModelAccuracyState:
     pending_jobs: dict[str, AccuracyTriggerPendingJob] = field(default_factory=dict)
     last_decision: AccuracyTriggerWindow | None = None
     last_failure_message: str = ""
-    pending_trigger_reason: str = ""
+    pending_trigger: _PendingAccuracyTrigger | None = None
 
 
 class AccuracyTriggerController:
@@ -238,7 +244,7 @@ class AccuracyTriggerController:
         self.config = config
         self.trigger_window_size = max(
             1,
-            int(_config_value(config, "trigger_window_size", 8)),
+            int(_config_value(config, "trigger_window_size", 64)),
         )
         self.min_history_windows = max(
             1,
@@ -698,10 +704,13 @@ class AccuracyTriggerController:
             source_frame_count,
             uploaded_keyframe_count,
         )
-        if triggered:
-            state.pending_trigger_reason = str(trigger_reason or "adaptive_drop")
-        pending_trigger_reason = str(state.pending_trigger_reason or "")
-        if not pending_trigger_reason:
+        if triggered and state.pending_trigger is None:
+            state.pending_trigger = _PendingAccuracyTrigger(
+                window=window,
+                buffered_window_count=prior_buffered_window_count,
+            )
+        pending_trigger = state.pending_trigger
+        if pending_trigger is None:
             return None
         if len(state.buffer_samples) < int(self.training_frame_count):
             logger.info(
@@ -710,38 +719,47 @@ class AccuracyTriggerController:
                 key[1],
                 len(state.buffer_samples),
                 self.training_frame_count,
-                pending_trigger_reason,
+                pending_trigger.window.trigger_reason,
             )
             return None
         training_samples = tuple(state.buffer_samples[-int(self.training_frame_count) :])
-        state.pending_trigger_reason = ""
+        trigger_window = pending_trigger.window
+        state.pending_trigger = None
         return AccuracyTriggerSubmission(
             model_key=key,
             run_id=key[0],
             edge_id=key[1],
             model_name=key[2],
             model_version=key[3],
-            video_source=str(samples[-1].video_source if samples else ""),
-            window_id=window_id,
-            source_window_id=int(source_window_id),
-            source_start_frame_idx=int(source_start_frame_idx),
-            source_end_frame_idx=int(source_end_frame_idx),
-            source_frame_count=int(source_frame_count),
-            uploaded_keyframe_count=int(uploaded_keyframe_count),
-            trigger_window_frame_ids=tuple(int(sample.frame_id) for sample in samples),
+            video_source=str(
+                trigger_window.samples[-1].video_source
+                if trigger_window.samples
+                else samples[-1].video_source
+                if samples
+                else ""
+            ),
+            window_id=trigger_window.window_id,
+            source_window_id=int(trigger_window.source_window_id),
+            source_start_frame_idx=int(trigger_window.source_start_frame_idx),
+            source_end_frame_idx=int(trigger_window.source_end_frame_idx),
+            source_frame_count=int(trigger_window.source_frame_count),
+            uploaded_keyframe_count=int(trigger_window.uploaded_keyframe_count),
+            trigger_window_frame_ids=tuple(
+                int(sample.frame_id) for sample in trigger_window.samples
+            ),
             training_samples=training_samples,
-            window_accuracy=accuracy,
-            foreground_accuracy=foreground_accuracy,
-            agreement_stats=agreement_stats,
-            history_len=history_len,
-            history_ready=history_ready,
-            history_mean_accuracy=mean,
-            history_std_accuracy=std,
-            accuracy_drop_threshold=threshold,
-            accuracy_gap=accuracy_gap,
-            active_pending=active_pending,
-            trigger_reason=pending_trigger_reason,
-            buffered_window_count=prior_buffered_window_count,
+            window_accuracy=trigger_window.accuracy,
+            foreground_accuracy=trigger_window.foreground_accuracy,
+            agreement_stats=trigger_window.agreement_stats,
+            history_len=trigger_window.history_len,
+            history_ready=trigger_window.history_ready,
+            history_mean_accuracy=trigger_window.history_mean_accuracy,
+            history_std_accuracy=trigger_window.history_std_accuracy,
+            accuracy_drop_threshold=trigger_window.accuracy_drop_threshold,
+            accuracy_gap=trigger_window.accuracy_gap,
+            active_pending=trigger_window.active_pending,
+            trigger_reason=trigger_window.trigger_reason,
+            buffered_window_count=pending_trigger.buffered_window_count,
         )
 
     def _create_model_update_command_locked(

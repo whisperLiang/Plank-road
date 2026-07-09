@@ -492,7 +492,12 @@ def test_controller_waits_for_training_frame_count_after_trigger() -> None:
 
     assert ready is not None
     assert ready.trigger_reason == "adaptive_drop"
+    assert ready.window_id == "window-3"
+    assert ready.trigger_window_frame_ids == (3,)
     assert ready.training_frame_ids == (1, 2, 3, 4)
+    assert ready.window_accuracy == pytest.approx(0.0)
+    assert ready.trigger_metadata()["trigger_window_frame_ids"] == [3]
+    assert ready.trigger_metadata()["agreement_stats"]["teacher_only_count"] == 1
 
 
 def test_controller_buffer_accumulates_until_training_frame_count() -> None:

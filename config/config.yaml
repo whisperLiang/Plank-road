@@ -21,7 +21,7 @@ baseline:
   learning_rate: 1e-3
   optimizer_name: adam
   weight_decay: 0.0
-  training_frame_count: 120
+  training_frame_count: 128
  pure_edge_local_updating:
   training_strategy: surgeon_tta
   quality_mode: output_only_when_no_boundary
@@ -35,7 +35,7 @@ baseline:
   # Number of source video frames per fixed trigger window.
   # Filtering only affects how many keyframes are uploaded inside this
   # source-frame window.
-  trigger_window_size: 60
+  trigger_window_size: 64
   agreement_empty_empty_policy: exclude
   absolute_accuracy_floor: null
 

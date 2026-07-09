@@ -345,7 +345,7 @@ baseline:
     learning_rate: 1.0e-3
     optimizer_name: adam
     weight_decay: 0.0
-    training_frame_count: 120
+    training_frame_count: 128
 ```
 
 `accuracy_trigger_cloud_retraining` uses edge predictions only for trigger and

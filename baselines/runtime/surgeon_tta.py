@@ -346,7 +346,7 @@ class SurgeonLocalTTAUpdater:
 
         self.training_frame_count = max(
             1,
-            int(getattr(self.training_cfg, "training_frame_count", 120)),
+            int(getattr(self.training_cfg, "training_frame_count", 128)),
         )
         configured_num_epoch = getattr(self.training_cfg, "num_epoch", 1)
         self.num_epoch = max(1, int(configured_num_epoch))

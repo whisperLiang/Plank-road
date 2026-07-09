@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 from cloud.orchestration.recent_training_window import RecentTrainingWindowStore
 
 
@@ -74,3 +76,19 @@ def test_recent_training_window_reset_clears_initial_model_state(tmp_path) -> No
 
     assert store.latest_samples(2) == []
     assert store.sample_count() == 0
+
+
+def test_recent_training_window_concurrent_appends_do_not_drop_samples(tmp_path) -> None:
+    root = str(tmp_path / "window")
+    sample_count = 40
+
+    def append_one(index: int) -> None:
+        store = RecentTrainingWindowStore(root, max_samples=sample_count)
+        store.append_samples([_sample(f"frame-{index}", index)])
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(append_one, range(sample_count)))
+
+    store = RecentTrainingWindowStore(root, max_samples=sample_count)
+    sample_ids = {str(sample["sample_id"]) for sample in store.latest_samples(sample_count)}
+    assert sample_ids == {f"frame-{index}" for index in range(sample_count)}
