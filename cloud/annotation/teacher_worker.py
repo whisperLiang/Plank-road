@@ -225,14 +225,6 @@ class TeacherAnnotationWorker:
                     )
                 )
             self._condition.notify_all()
-        logger.info(
-            "[TeacherAnnotation][Submit] requested_samples={} submitted={} "
-            "duplicate={} failed_count={}",
-            len(requested),
-            submitted,
-            duplicates,
-            failures,
-        )
         return TeacherAnnotationSubmitResult(
             requested_samples=len(requested),
             submitted=submitted,
@@ -509,8 +501,3 @@ class TeacherAnnotationWorker:
                 self._failed.pop(cache_key, None)
                 self._retryable_failures[cache_key] = str(error)
             self._condition.notify_all()
-        logger.info(
-            "[TeacherAnnotation][Worker] annotation deferred: samples={} reason={}.",
-            len(chunk),
-            safe_error_summary(error),
-        )

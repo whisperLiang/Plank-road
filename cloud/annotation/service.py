@@ -3,8 +3,6 @@ from __future__ import annotations
 import time
 from collections.abc import Sequence
 
-from loguru import logger
-
 from cloud.annotation.label_cache import TeacherLabelCache
 from cloud.annotation.teacher_worker import TeacherAnnotationWorker
 from cloud.annotation.types import (
@@ -83,17 +81,6 @@ class TeacherAnnotationService:
             for result in lookup.results
             if result.status == TeacherAnnotationStatus.CACHE_HIT
         ] + worker_results
-        if lookup.cache_misses or submitted or failed_count:
-            logger.info(
-                "[TeacherAnnotation][Submit] requested_samples={} cache_hits={} cache_misses={} "
-                "submitted={} duplicate={} failed_count={}",
-                len(requested),
-                lookup.cache_hits,
-                lookup.cache_misses,
-                submitted,
-                duplicate,
-                failed_count,
-            )
         return TeacherAnnotationSubmitResult(
             requested_samples=len(requested),
             cache_hits=lookup.cache_hits,
@@ -211,32 +198,4 @@ class TeacherAnnotationService:
             results=results,
             unresolved_requests=unresolved_requests,
         )
-        if (
-            ensure_result.cache_misses
-            or ensure_result.submitted
-            or ensure_result.unresolved_count
-            or ensure_result.failed_count
-            or ensure_result.oom_retry_count
-        ):
-            logger.info(
-                "[TeacherAnnotation][Ensure] requested={} cache_hits={} cache_misses={} "
-                "submitted={} waited_sec={:.3f} unresolved={} "
-                "teacher_batch_size={} teacher_batches={} batch_fallback_count={} "
-                "oom_retry_count={} failed_count={} annotation_time={:.3f}s "
-                "cache_read_time={:.3f}s cache_write_time={:.3f}s",
-                ensure_result.requested_samples,
-                ensure_result.cache_hits,
-                ensure_result.cache_misses,
-                ensure_result.submitted,
-                ensure_result.waited_sec,
-                ensure_result.unresolved_count,
-                ensure_result.teacher_batch_size,
-                ensure_result.teacher_batches,
-                ensure_result.batch_fallback_count,
-                ensure_result.oom_retry_count,
-                ensure_result.failed_count,
-                ensure_result.annotation_time,
-                ensure_result.cache_read_time,
-                ensure_result.cache_write_time,
-            )
         return ensure_result
