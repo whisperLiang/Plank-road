@@ -14,7 +14,6 @@ from cloud.annotation.types import (
     TeacherAnnotationStatus,
     TeacherAnnotationSubmitResult,
 )
-from common.logging_sanitizer import log_diagnostic_debug
 
 
 class TeacherAnnotationService:
@@ -39,12 +38,6 @@ class TeacherAnnotationService:
             1 for result in results if result.status == TeacherAnnotationStatus.CACHE_HIT
         )
         cache_misses = len(results) - cache_hits
-        if cache_misses:
-            logger.info(
-                "[TeacherAnnotation][CacheMiss] requested_samples={} cache_misses={}",
-                len(requested),
-                cache_misses,
-            )
         return TeacherAnnotationSubmitResult(
             requested_samples=len(requested),
             cache_hits=cache_hits,
@@ -245,15 +238,5 @@ class TeacherAnnotationService:
                 ensure_result.annotation_time,
                 ensure_result.cache_read_time,
                 ensure_result.cache_write_time,
-            )
-        if ensure_result.unresolved_count:
-            logger.warning(
-                "[TeacherAnnotation][Ensure] unresolved_count={}.",
-                ensure_result.unresolved_count,
-            )
-            log_diagnostic_debug(
-                self,
-                "[TeacherAnnotation][Ensure] unresolved diagnostics",
-                lambda: {"sample_ids_preview": ensure_result.unresolved_sample_ids[:10]},
             )
         return ensure_result
