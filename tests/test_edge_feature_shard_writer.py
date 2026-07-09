@@ -111,6 +111,7 @@ def test_high_quality_feature_label_shard_writes_runtime_contract_feature_abi(tm
         split_context={
             "model_id": contract.model_id,
             "model_version": "v1",
+            "edge_session_id": "session-a",
             "front_version": contract.front_version,
             "split_config_id": contract.split_config_id,
             "canonical_split_key": contract.canonical_split_key,
@@ -136,6 +137,8 @@ def test_high_quality_feature_label_shard_writes_runtime_contract_feature_abi(tm
             os.remove(zip_path)
 
     assert manifest["feature_abi_id"] == contract.feature_abi_id
+    assert manifest["edge_session_id"] == "session-a"
+    assert bundle_manifest["edge_session_id"] == "session-a"
     assert bundle_manifest["runtime_contract"]["feature_abi_id"] == contract.feature_abi_id
     assert index_payload["feature_abi_id"] == contract.feature_abi_id
     assert meta_payload["feature_abi_id"] == contract.feature_abi_id

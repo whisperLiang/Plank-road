@@ -762,6 +762,7 @@ class HighQualitySampleSyncer:
                 getattr(first_record, "model_version", ""),
                 provider_context.get("model_version"),
             ),
+            "edge_session_id": str(provider_context.get("edge_session_id") or "").strip(),
             "front_version": _first_nonempty(
                 getattr(first_record, "front_version", ""),
                 provider_context.get("front_version"),

@@ -23,11 +23,13 @@ JOB_STATUS_QUEUED = "QUEUED"
 JOB_STATUS_RUNNING = "RUNNING"
 JOB_STATUS_SUCCEEDED = "SUCCEEDED"
 JOB_STATUS_FAILED = "FAILED"
+JOB_STATUS_WAITING_FOR_SAMPLES = "WAITING_FOR_SAMPLES"
 JOB_STATUS_STALE = "STALE"
 JOB_STATUS_CANCELLED = "CANCELLED"
 TERMINAL_JOB_STATUSES = {
     JOB_STATUS_SUCCEEDED,
     JOB_STATUS_FAILED,
+    JOB_STATUS_WAITING_FOR_SAMPLES,
     JOB_STATUS_STALE,
     JOB_STATUS_CANCELLED,
 }
@@ -394,7 +396,11 @@ class TrainingJobManager:
             job = self._jobs.get(job_id)
             if job is None:
                 return
-            job.status = JOB_STATUS_SUCCEEDED if success else JOB_STATUS_FAILED
+            job.status = _status_for_job_result(
+                success=success,
+                model_data=model_data,
+                message=message,
+            )
             job.model_data = model_data or ""
             job.message = str(message or "")
             job.finished_at_ms = _now_ms()
@@ -536,6 +542,20 @@ def _next_model_version(base_model_version: str) -> str:
 
 def _baseline_training_job_type() -> int:
     return int(getattr(message_transmission_pb2, "TRAINING_JOB_TYPE_BASELINE_TRAINING", 4))
+
+
+def _status_for_job_result(*, success: bool, model_data: str, message: str) -> str:
+    if success:
+        return JOB_STATUS_SUCCEEDED
+    if _is_waiting_for_samples_result(model_data=model_data, message=message):
+        return JOB_STATUS_WAITING_FOR_SAMPLES
+    return JOB_STATUS_FAILED
+
+
+def _is_waiting_for_samples_result(*, model_data: str, message: str) -> bool:
+    if str(model_data or ""):
+        return False
+    return str(message or "").startswith("Waiting for enough recent training samples:")
 
 
 def _baseline_strategy_from_workspace(workspace: str) -> str:

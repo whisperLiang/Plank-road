@@ -445,7 +445,7 @@ class PipelineLifecycleMixin:
         self._training_slots = threading.BoundedSemaphore(self.max_concurrent_jobs)
         self._teacher_queue_state = _GLOBAL_TEACHER_ANNOTATION_QUEUE
         self._initial_state_reset_lock = threading.Lock()
-        self._initial_state_reset_sessions: set[str] = set()
+        self._initial_state_reset_sessions: dict[str, str] = {}
         self._teacher_weights_fingerprint_cache: str | None = None
         self.teacher_label_cache = TeacherLabelCache(
             self.teacher_annotation_cache_root,

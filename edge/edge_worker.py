@@ -2334,6 +2334,25 @@ class EdgeWorker:
                             )
                         break
 
+                    if status == "WAITING_FOR_SAMPLES":
+                        terminal_message = str(
+                            reply.message or "Training job skipped while waiting for samples."
+                        )
+                        logger.info(
+                            "[EdgeCL] cloud training waiting for samples: {}.",
+                            safe_error_summary(terminal_message),
+                        )
+                        self._record_experiment_metric(
+                            "training_job_waiting_for_samples",
+                            timestamp_ms=int(
+                                getattr(reply, "finished_at_ms", 0)
+                                or time.time() * 1000
+                            ),
+                            job_id=job_id,
+                            status=status,
+                        )
+                        break
+
                     terminal_message = str(
                         reply.message or f"Training job ended with status {status}"
                     )
@@ -2398,7 +2417,7 @@ class EdgeWorker:
                             "error": repr(error),
                         },
                     )
-            elif not self._stop_event.is_set():
+            elif not self._stop_event.is_set() and last_status != "WAITING_FOR_SAMPLES":
                 logger.error(
                     "[EdgeCL] cloud continual learning failed: {}.",
                     safe_error_summary(terminal_message),

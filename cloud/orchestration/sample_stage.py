@@ -310,7 +310,7 @@ class SampleStageMixin:
                 manifest=manifest,
                 model_name=str(manifest.get("model_id") or model_id or self.edge_model_name),
                 fallback_model_version=model_version,
-                allow_without_session=False,
+                allow_without_session=True,
             )
             recent_window = self._recent_training_window_for_manifest(
                 edge_id=edge_id,

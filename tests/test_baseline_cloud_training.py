@@ -24,7 +24,11 @@ from cloud.training.parameter_freeze import (
 )
 from cloud.training.strategies.baseline_freeze import CloudBaselineFreezeTrainingStrategy
 from grpc_server import message_transmission_pb2
-from grpc_server.training_jobs import JOB_STATUS_SUCCEEDED, TrainingJobManager
+from grpc_server.training_jobs import (
+    JOB_STATUS_SUCCEEDED,
+    JOB_STATUS_WAITING_FOR_SAMPLES,
+    TrainingJobManager,
+)
 from model_management.detection_box_projection import ORIGINAL_XYXY
 from model_management.detectors import legacy_split_model_adapters as split_adapters
 
@@ -409,6 +413,38 @@ def test_baseline_manager_dedupes_exact_request_id_only(tmp_path: Path) -> None:
         manager.close()
 
 
+def test_continual_learning_waiting_for_samples_is_not_failed(tmp_path: Path) -> None:
+    learner = SimpleNamespace(
+        worker_id="worker-test",
+        get_ground_truth_and_fixed_split_retrain=lambda _edge_id, _workspace: (
+            False,
+            "",
+            "Waiting for enough recent training samples: available=64, required=128.",
+        ),
+    )
+    manager = TrainingJobManager(
+        continual_learner=learner,
+        max_concurrent_jobs=1,
+    )
+    try:
+        job, created = manager.submit(
+            edge_id=1,
+            request_id="continual:wait-for-samples",
+            job_type=message_transmission_pb2.TRAINING_JOB_TYPE_CONTINUAL_LEARNING,
+            workspace=str(tmp_path),
+            workspace_root=str(tmp_path),
+        )
+
+        assert created is True
+        _wait_for_status(manager, 1, job.job_id, JOB_STATUS_WAITING_FOR_SAMPLES)
+        job = manager.get_job(edge_id=1, job_id=job.job_id)
+        assert job is not None
+        assert job.model_data == ""
+        assert job.message.startswith("Waiting for enough recent training samples:")
+    finally:
+        manager.close()
+
+
 class TinyRawDetectionModel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -556,10 +592,21 @@ def _fake_update_serializer(model, **kwargs) -> bytes:
 
 
 def _wait_for_success(manager: TrainingJobManager, edge_id: int, job_id: str) -> None:
+    _wait_for_status(manager, edge_id, job_id, JOB_STATUS_SUCCEEDED)
+
+
+def _wait_for_status(
+    manager: TrainingJobManager,
+    edge_id: int,
+    job_id: str,
+    expected_status: str,
+) -> None:
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
         job = manager.get_job(edge_id=edge_id, job_id=job_id)
-        if job is not None and job.status == JOB_STATUS_SUCCEEDED:
+        if job is not None and job.status == expected_status:
             return
         time.sleep(0.02)
-    raise AssertionError(f"job did not succeed: edge={edge_id} job={job_id}")
+    raise AssertionError(
+        f"job did not reach {expected_status}: edge={edge_id} job={job_id}"
+    )

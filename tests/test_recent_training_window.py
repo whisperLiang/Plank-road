@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 
+import threading
+
 from cloud.orchestration.recent_training_window import RecentTrainingWindowStore
+from cloud.orchestration.request_context import RequestContextMixin
 
 
 def _sample(sample_id: str, frame_id: int) -> dict[str, object]:
@@ -76,6 +79,109 @@ def test_recent_training_window_reset_clears_initial_model_state(tmp_path) -> No
 
     assert store.latest_samples(2) == []
     assert store.sample_count() == 0
+
+
+def test_initial_reset_does_not_clear_samples_on_later_session_manifest(tmp_path) -> None:
+    class Context(RequestContextMixin):
+        pass
+
+    context = Context()
+    context.recent_training_window_root = str(tmp_path / "recent_training_windows")
+    context.split_contract_root = str(tmp_path / "split_contracts")
+    context.edge_model_name = "rfdetr_nano"
+    context.training_frame_count = 128
+    context.log_internal_ids = False
+    context._initial_state_reset_lock = threading.Lock()
+    context._initial_state_reset_sessions = {}
+
+    manifest = {
+        "model": {"model_id": "rfdetr_nano", "model_version": "0"},
+        "front_version": "0",
+        "split_config_id": "split-a",
+    }
+    context._reset_initial_cloud_state_if_needed(
+        edge_id=1,
+        manifest=manifest,
+        model_name="rfdetr_nano",
+        fallback_model_version="0",
+        allow_without_session=True,
+    )
+    store = context._recent_training_window_for_manifest(edge_id=1, manifest=manifest)
+    store.append_samples(
+        [
+            {
+                "sample_id": "sample-1",
+                "frame_id": 1,
+                "timestamp_ms": 1000,
+                "raw_path": "/tmp/frame.jpg",
+            }
+        ],
+        sample_source="high_quality",
+    )
+
+    session_manifest = dict(manifest)
+    session_manifest["edge_session_id"] = "session-a"
+    context._reset_initial_cloud_state_if_needed(
+        edge_id=1,
+        manifest=session_manifest,
+        model_name="rfdetr_nano",
+        fallback_model_version="0",
+        allow_without_session=True,
+    )
+
+    assert [sample["sample_id"] for sample in store.latest_samples(2)] == ["sample-1"]
+
+
+def test_initial_reset_clears_window_for_new_session(tmp_path) -> None:
+    class Context(RequestContextMixin):
+        pass
+
+    context = Context()
+    context.recent_training_window_root = str(tmp_path / "recent_training_windows")
+    context.split_contract_root = str(tmp_path / "split_contracts")
+    context.edge_model_name = "rfdetr_nano"
+    context.training_frame_count = 128
+    context.log_internal_ids = False
+    context._initial_state_reset_lock = threading.Lock()
+    context._initial_state_reset_sessions = {}
+
+    manifest = {
+        "model": {"model_id": "rfdetr_nano", "model_version": "0"},
+        "front_version": "0",
+        "split_config_id": "split-a",
+        "edge_session_id": "session-a",
+    }
+    context._reset_initial_cloud_state_if_needed(
+        edge_id=1,
+        manifest=manifest,
+        model_name="rfdetr_nano",
+        fallback_model_version="0",
+        allow_without_session=True,
+    )
+    store = context._recent_training_window_for_manifest(edge_id=1, manifest=manifest)
+    store.append_samples(
+        [
+            {
+                "sample_id": "sample-1",
+                "frame_id": 1,
+                "timestamp_ms": 1000,
+                "raw_path": "/tmp/frame.jpg",
+            }
+        ],
+        sample_source="high_quality",
+    )
+
+    new_session_manifest = dict(manifest)
+    new_session_manifest["edge_session_id"] = "session-b"
+    context._reset_initial_cloud_state_if_needed(
+        edge_id=1,
+        manifest=new_session_manifest,
+        model_name="rfdetr_nano",
+        fallback_model_version="0",
+        allow_without_session=True,
+    )
+
+    assert store.latest_samples(2) == []
 
 
 def test_recent_training_window_concurrent_appends_do_not_drop_samples(tmp_path) -> None:

@@ -351,18 +351,13 @@ class RequestContextMixin:
         if not edge_session_id and not allow_without_session:
             return
 
-        reset_key = (
-            _stable_json_dumps(
-                {
-                    "edge_id": str(edge_id),
-                    "model_id": model_id,
-                    "front_version": front_version,
-                    "split_config_id": split_config_id,
-                    "edge_session_id": edge_session_id,
-                }
-            )
-            if edge_session_id
-            else ""
+        base_reset_key = _stable_json_dumps(
+            {
+                "edge_id": str(edge_id),
+                "model_id": model_id,
+                "front_version": front_version,
+                "split_config_id": split_config_id,
+            }
         )
         edge_segment = f"edge_{_sanitize_cache_segment(edge_id)}"
         model_segment = _sanitize_cache_segment(model_id)
@@ -382,7 +377,17 @@ class RequestContextMixin:
         deleted_labels: list[str] = []
 
         with self._initial_state_reset_lock:
-            if reset_key and reset_key in self._initial_state_reset_sessions:
+            reset_sessions = self._initial_state_reset_sessions
+            if not isinstance(reset_sessions, dict):
+                reset_sessions = {str(key): "" for key in reset_sessions if str(key)}
+                self._initial_state_reset_sessions = reset_sessions
+            previous_session = str(reset_sessions.get(base_reset_key, ""))
+            if previous_session:
+                if not edge_session_id or previous_session == edge_session_id:
+                    return
+            elif base_reset_key in reset_sessions:
+                if edge_session_id:
+                    reset_sessions[base_reset_key] = edge_session_id
                 return
             reset_paths = [
                 (
@@ -408,8 +413,7 @@ class RequestContextMixin:
             for path, root, label in reset_paths:
                 if self._remove_reset_path_if_safe(path=path, root=root, label=label):
                     deleted_labels.append(label)
-            if reset_key:
-                self._initial_state_reset_sessions.add(reset_key)
+            reset_sessions[base_reset_key] = edge_session_id
 
         logger.info(
             "[FixedSplitCL][InitialReset] edge={} model={} front_version={} cleared={}.",
@@ -424,6 +428,7 @@ class RequestContextMixin:
             lambda: {
                 "split_config_id": split_config_id,
                 "session_id": edge_session_id,
+                "base_reset_key": base_reset_key,
                 "window_front_dir": window_front_dir,
                 "stale_contract_dir": stale_contract_dir,
             },
