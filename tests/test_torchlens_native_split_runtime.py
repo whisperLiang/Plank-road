@@ -10,6 +10,7 @@ import pytest
 import torch
 from torch import nn
 
+import model_management.fixed_split as fixed_split_module
 import model_management.split_runtime.template as runtime_template_module
 from model_management.fixed_split import (
     SplitConstraints,
@@ -623,6 +624,89 @@ def test_fixed_split_uses_configured_training_batch_when_validation_batches_omit
     assert constraints.configured_training_batch == 4
     assert splitter.validated == [(1, 4)]
     assert plan.validation["validation_batches"] == [1, 4]
+
+
+def test_fixed_split_recomputes_stale_cache_with_initially_untraced_splitter(
+    tmp_path, monkeypatch
+) -> None:
+    class TraceGraph:
+        graph_shape_hash = "new-trace"
+
+    class RuntimeObject:
+        trace_graph = TraceGraph()
+
+    class FakeSplitter:
+        def __init__(self) -> None:
+            self.runtime = None
+            self.model = None
+            self.trace_calls = 0
+
+        def trace(self, model, sample_input, **kwargs):
+            del sample_input, kwargs
+            self.model = model
+            self.runtime = RuntimeObject()
+            self.trace_calls += 1
+            return self
+
+    def split_plan(split_config_id: str, trace_signature: str) -> fixed_split_module.SplitPlan:
+        constraints = SplitConstraints(validate_candidates=False)
+        return fixed_split_module.SplitPlan(
+            split_config_id=split_config_id,
+            canonical_split_key="after:cached",
+            edge_split_id="after:cached",
+            model_name="tiny",
+            candidate_id="after:cached",
+            split_index=0,
+            split_label="after:cached",
+            boundary_tensor_labels=["x"],
+            runtime_contract={
+                "logical_split_id": "after:cached",
+                "model_version": "0",
+            },
+            input_tensor_shape=[1, 4],
+            input_resize_mode="direct_resize",
+            front_version="0",
+            payload_bytes=1,
+            privacy_metric=0.0,
+            privacy_risk=0.0,
+            layer_freezing_ratio=0.0,
+            constraints=fixed_split_module._constraints_payload(constraints),
+            trace_signature=trace_signature,
+        )
+
+    cache_path = tmp_path / "fixed_split_plan.json"
+    fixed_split_module.persist_split_plan(str(cache_path), split_plan("stale", "old-trace"))
+    recomputed_plan = split_plan("recomputed", "new-trace")
+    compute_calls = []
+
+    def fake_compute_fixed_split_for_model(*args, **kwargs):
+        compute_calls.append((args, kwargs))
+        assert kwargs["splitter"].runtime is not None
+        return recomputed_plan
+
+    monkeypatch.setattr(
+        fixed_split_module,
+        "compute_fixed_split_for_model",
+        fake_compute_fixed_split_for_model,
+    )
+
+    splitter = FakeSplitter()
+    result = fixed_split_module.load_or_compute_fixed_split_plan(
+        TinySplitModel(),
+        SplitConstraints(validate_candidates=False),
+        sample_input=torch.zeros(1, 4),
+        model_name="tiny",
+        cache_path=str(cache_path),
+        splitter=splitter,
+        validate_cached_plan=False,
+    )
+
+    cached_after_recompute = fixed_split_module.load_split_plan(str(cache_path))
+    assert result.split_config_id == "recomputed"
+    assert splitter.trace_calls == 1
+    assert len(compute_calls) == 1
+    assert cached_after_recompute is not None
+    assert cached_after_recompute.split_config_id == "recomputed"
 
 
 def test_rfdetr_aux_outputs_pack_uses_tensor_marker_for_split_replay() -> None:

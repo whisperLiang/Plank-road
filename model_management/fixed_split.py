@@ -833,6 +833,29 @@ def validate_split_plan(splitter: UniversalModelSplitter, plan: SplitPlan) -> di
     return report
 
 
+def _ensure_fixed_split_runtime_traced(
+    runtime: UniversalModelSplitter,
+    model: torch.nn.Module,
+    sample_input: Any,
+    *,
+    sample_kwargs: Mapping[str, Any] | None = None,
+    model_name: str | None = None,
+) -> None:
+    if sample_kwargs:
+        raise RuntimeError("TorchLens fixed split planning expects positional example inputs.")
+    if runtime.runtime is not None and runtime.model is not None:
+        return
+    runtime.trace(
+        model,
+        sample_input,
+        boundary="auto",
+        model_name=model_name,
+        enable_dynamic_batch=True,
+        dynamic_batch_min=1,
+        dynamic_batch_max=FIXED_SPLIT_DYNAMIC_BATCH_MAX,
+    )
+
+
 def compute_fixed_split_for_model(
     model: torch.nn.Module,
     constraints: SplitConstraints,
@@ -850,19 +873,14 @@ def compute_fixed_split_for_model(
     blacklisted_candidate_ids: set[str] | None = None,
 ) -> SplitPlan:
     del cache_path
-    if sample_kwargs:
-        raise RuntimeError("TorchLens fixed split planning expects positional example inputs.")
     runtime = splitter or UniversalModelSplitter(device=device)
-    if runtime.runtime is None or runtime.model is None:
-        runtime.trace(
-            model,
-            sample_input,
-            boundary="auto",
-            model_name=model_name,
-            enable_dynamic_batch=True,
-            dynamic_batch_min=1,
-            dynamic_batch_max=FIXED_SPLIT_DYNAMIC_BATCH_MAX,
-        )
+    _ensure_fixed_split_runtime_traced(
+        runtime,
+        model,
+        sample_input,
+        sample_kwargs=sample_kwargs,
+        model_name=model_name,
+    )
     eligible, enumeration_stats = _enumerate_feasible_candidates(runtime, constraints)
     resolved_validation_batches = _resolve_validation_batches(
         constraints,
@@ -977,11 +995,15 @@ def load_or_compute_fixed_split_plan(
     validation_inputs = _validation_sample_inputs(sample_input, resolved_validation_batches)
     blacklisted_candidate_ids: set[str] = set()
     cached = load_split_plan(cache_path) if cache_path else None
-    if (
-        runtime.runtime is not None
-        and runtime.model is not None
-        and cached is not None
-    ):
+    cached_invalidated = False
+    if cached is not None:
+        _ensure_fixed_split_runtime_traced(
+            runtime,
+            model,
+            sample_input,
+            sample_kwargs=sample_kwargs,
+            model_name=model_key,
+        )
         cache_matches = cached.matches(
             model_name=model_key,
             constraints=constraints,
