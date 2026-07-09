@@ -108,6 +108,96 @@ def test_experiment_run_defaults_do_not_force_specific_scenario(tmp_path) -> Non
     assert config.client.source.max_count == 1000
 
 
+def test_pure_edge_training_frame_count_override_does_not_change_shared_baseline(
+    tmp_path,
+) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+baseline:
+  training:
+    training_frame_count: 128
+  pure_edge_local_updating:
+    training_frame_count: 32
+""",
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(path)
+
+    assert config.baseline.training.training_frame_count == 128
+    assert config.baseline.pure_edge_local_updating.training_frame_count == 32
+
+
+def test_pure_edge_train_sample_count_does_not_change_shared_baseline(
+    tmp_path,
+) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+baseline:
+  training:
+    training_frame_count: 128
+  pure_edge_local_updating:
+    train_sample_count: 32
+""",
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(path)
+
+    assert config.baseline.training.training_frame_count == 128
+    assert config.baseline.pure_edge_local_updating.train_sample_count == 32
+
+
+def test_pure_edge_training_frame_count_override_requires_positive_value(
+    tmp_path,
+) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+baseline:
+  pure_edge_local_updating:
+    training_frame_count: 0
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="baseline.pure_edge_local_updating.training_frame_count",
+    ):
+        load_runtime_config(path)
+
+
+@pytest.mark.parametrize(
+    ("yaml_value", "message"),
+    [
+        ("0", "baseline.pure_edge_local_updating.train_sample_count"),
+        ("129", "train_sample_count must be <="),
+    ],
+)
+def test_pure_edge_train_sample_count_is_validated(
+    tmp_path,
+    yaml_value: str,
+    message: str,
+) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        f"""
+baseline:
+  training:
+    training_frame_count: 128
+  pure_edge_local_updating:
+    train_sample_count: {yaml_value}
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        load_runtime_config(path)
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [

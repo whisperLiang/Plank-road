@@ -26,6 +26,7 @@ baseline:
   training_strategy: surgeon_tta
   quality_mode: output_only_when_no_boundary
   trainable_scope: norm_affine
+  train_sample_count: 32
   consistency_weight: 0.01
   entropy_margin_ratio: 0.4
  accuracy_trigger_cloud_retraining:

@@ -344,9 +344,28 @@ class SurgeonLocalTTAUpdater:
             persistence_windows=int(getattr(drift_cfg, "persistence_windows", 3)),
         )
 
-        self.training_frame_count = max(
+        configured_training_frame_count = getattr(
+            self.method_cfg,
+            "training_frame_count",
+            None,
+        )
+        if configured_training_frame_count is None:
+            configured_training_frame_count = getattr(
+                self.training_cfg,
+                "training_frame_count",
+                128,
+            )
+        self.training_frame_count = max(1, int(configured_training_frame_count))
+        configured_train_sample_count = getattr(
+            self.method_cfg,
+            "train_sample_count",
+            None,
+        )
+        if configured_train_sample_count is None:
+            configured_train_sample_count = self.training_frame_count
+        self.train_sample_count = max(
             1,
-            int(getattr(self.training_cfg, "training_frame_count", 128)),
+            min(int(configured_train_sample_count), int(self.training_frame_count)),
         )
         configured_num_epoch = getattr(self.training_cfg, "num_epoch", 1)
         self.num_epoch = max(1, int(configured_num_epoch))
@@ -381,9 +400,10 @@ class SurgeonLocalTTAUpdater:
         self._edge = edge
         logger.info(
             "[PureEdgeSURGEON] attached training_frame_count={} "
-            "num_epoch={} batch_size={} quality_mode={} "
+            "train_sample_count={} num_epoch={} batch_size={} quality_mode={} "
             "das_enabled={}",
             self.training_frame_count,
+            self.train_sample_count,
             self.num_epoch,
             self.batch_size,
             self.quality_mode,
@@ -431,11 +451,13 @@ class SurgeonLocalTTAUpdater:
                 return
             if self._pending_local_update is not None:
                 return
-            selected = list(self._buffer)[-int(self.training_frame_count) :]
+            selected = list(self._buffer)[-int(self.train_sample_count) :]
             logger.info(
                 "[PureEdgeSURGEON] local TTA triggered: low_quality={} "
-                "training_frame_count={} mini_batch_size={} trigger_frame={}",
+                "training_frame_count={} train_sample_count={} "
+                "mini_batch_size={} trigger_frame={}",
                 len(self._buffer),
+                self.training_frame_count,
                 len(selected),
                 self.batch_size,
                 int(frame_index),
@@ -445,7 +467,8 @@ class SurgeonLocalTTAUpdater:
                 frame_id=int(frame_index),
                 low_quality_sample_count=len(self._buffer),
                 batch_size=int(self.batch_size),
-                training_frame_count=len(selected),
+                training_frame_count=int(self.training_frame_count),
+                train_sample_count=len(selected),
             )
             self._running_thread = threading.Thread(
                 target=self._run_tta_task,

@@ -245,6 +245,8 @@ class PureEdgeBaselineConfig(ConfigSection):
     training_strategy: str = "surgeon_tta"
     quality_mode: str = "output_only_when_no_boundary"
     trainable_scope: str = "norm_affine"
+    training_frame_count: int | None = None
+    train_sample_count: int | None = None
     consistency_weight: float = 0.01
     entropy_margin_ratio: float = 0.4
 
@@ -1238,6 +1240,26 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             "baseline.pure_edge_local_updating.trainable_scope must be norm_affine"
         )
     pure_edge.trainable_scope = trainable_scope
+    if pure_edge.training_frame_count is not None:
+        _validate_positive(
+            "baseline.pure_edge_local_updating.training_frame_count",
+            int(pure_edge.training_frame_count),
+        )
+    effective_pure_edge_training_frame_count = (
+        pure_edge.training_frame_count
+        if pure_edge.training_frame_count is not None
+        else baseline_training.training_frame_count
+    )
+    if pure_edge.train_sample_count is not None:
+        _validate_positive(
+            "baseline.pure_edge_local_updating.train_sample_count",
+            int(pure_edge.train_sample_count),
+        )
+        if int(pure_edge.train_sample_count) > int(effective_pure_edge_training_frame_count):
+            raise ValueError(
+                "baseline.pure_edge_local_updating.train_sample_count must be <= "
+                "the effective pure-edge training_frame_count"
+            )
     legacy_tta_steps = (getattr(pure_edge, "_extras", {}) or {}).get("tta_steps")
     if legacy_tta_steps is not None:
         _validate_positive(

@@ -369,6 +369,47 @@ def test_low_quality_samples_trigger_local_tta_and_update_model_version(tmp_path
         adapter.close()
 
 
+def test_local_tta_can_trigger_on_larger_window_but_train_recent_subset(tmp_path) -> None:
+    model = ToyTTAModel()
+    model.eval()
+    edge = FakeEdge(model)
+    config = _config(tmp_path)
+    config.baseline.training.training_frame_count = 4
+    config.baseline.pure_edge_local_updating.train_sample_count = 2
+    adapter = BaselineEdgeAdapter(
+        config=config,
+        baseline_method="pure_edge_local_updating",
+        run_id="pure-surgeon-subset-test",
+        edge_id=1,
+        transport=None,
+    )
+    try:
+        adapter.before_video_start(edge)
+        for frame_id in range(1, 4):
+            _sample(adapter, frame_id)
+        assert adapter._surgeon_tta is not None
+        assert adapter._surgeon_tta._running_thread is None
+
+        _sample(adapter, 4)
+        assert adapter._surgeon_tta.wait_for_idle(timeout=5.0)
+        assert adapter._surgeon_tta._pending_local_update is not None
+
+        rows = _metrics(adapter)
+        triggered = next(row for row in rows if row["event"] == "surgeon_tta_triggered")
+        started = next(row for row in rows if row["event"] == "surgeon_tta_started")
+        train_started = next(
+            row for row in rows if row["event"] == "surgeon_tta_shadow_train_started"
+        )
+        assert triggered["low_quality_sample_count"] == 4
+        assert triggered["training_frame_count"] == 4
+        assert triggered["train_sample_count"] == 2
+        assert started["low_quality_sample_count"] == 2
+        assert started["batch_size"] == 2
+        assert train_started["batch_size"] == 2
+    finally:
+        adapter.close()
+
+
 def test_shadow_training_does_not_hold_live_model_lock(tmp_path) -> None:
     model = BlockingToyTTAModel()
     model.eval()
