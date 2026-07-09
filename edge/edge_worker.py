@@ -1,5 +1,6 @@
 import base64
 import io
+import json
 import os
 import threading
 import time
@@ -85,6 +86,38 @@ def _timeout_deadline(timeout: float | None) -> float | None:
 
 def _remaining_timeout(deadline: float | None) -> float | None:
     return None if deadline is None else max(0.0, deadline - time.monotonic())
+
+
+def _parse_json_message_field(message: str, field_name: str) -> object | None:
+    marker = f"{field_name}="
+    text = str(message or "")
+    start = text.find(marker)
+    if start < 0:
+        return None
+    raw_value = text[start + len(marker) :].strip()
+    try:
+        return json.loads(raw_value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _accepted_uploaded_sample_ids(message: str, uploaded_sample_ids: list[str]) -> list[str]:
+    uploaded = [str(sample_id) for sample_id in uploaded_sample_ids if str(sample_id)]
+    if not uploaded:
+        return []
+    payload = _parse_json_message_field(message, "accepted_low_quality_sample_ids_json")
+    if not isinstance(payload, list):
+        return []
+    uploaded_set = set(uploaded)
+    accepted: list[str] = []
+    seen: set[str] = set()
+    for value in payload:
+        sample_id = str(value or "")
+        if not sample_id or sample_id not in uploaded_set or sample_id in seen:
+            continue
+        accepted.append(sample_id)
+        seen.add(sample_id)
+    return accepted
 
 
 def _coerce_positive_int(value: object) -> int | None:
@@ -1435,6 +1468,46 @@ class EdgeWorker:
         self._drift_probe_active = False
         self._retrain_requested.clear()
 
+    def _delete_uploaded_low_quality_samples(
+        self,
+        sample_ids: list[str],
+    ) -> int:
+        sample_store = getattr(self, "sample_store", None)
+        if sample_store is None or not sample_ids:
+            return 0
+        deleted = int(sample_store.delete_samples(sample_ids, quality_bucket=LOW_QUALITY))
+        if deleted:
+            logger.info(
+                "[EdgeCL] deleted uploaded low-quality samples from edge cache: "
+                "deleted={} requested={}.",
+                deleted,
+                len(sample_ids),
+            )
+        return deleted
+
+    def _delete_cloud_accepted_low_quality_samples(
+        self,
+        message: str,
+        uploaded_sample_ids: list[str],
+        *,
+        job_id: str,
+    ) -> int:
+        accepted_sample_ids = _accepted_uploaded_sample_ids(message, uploaded_sample_ids)
+        if uploaded_sample_ids and not accepted_sample_ids:
+            logger.warning(
+                "[EdgeCL] cloud did not return accepted low-quality sample ids; "
+                "keeping uploaded samples for retry."
+            )
+        deleted = self._delete_uploaded_low_quality_samples(accepted_sample_ids)
+        if deleted:
+            self._record_experiment_metric(
+                "uploaded_low_quality_samples_deleted",
+                timestamp_ms=int(time.time() * 1000),
+                job_id=job_id,
+                deleted_sample_count=deleted,
+            )
+        return deleted
+
     def apply_model_update(
         self,
         model_b64: str,
@@ -2121,6 +2194,7 @@ class EdgeWorker:
             model_b64 = ""
             terminal_message = ""
             last_status = ""
+            uploaded_low_quality_sample_ids: list[str] = []
             training_channel = grpc.insecure_channel(
                 self.config.server_ip,
                 options=grpc_message_options(),
@@ -2142,7 +2216,12 @@ class EdgeWorker:
                         "continual learning upload."
                     )
                 upload_metrics: dict[str, Any] = {}
-                accepted, job_id, msg = submit_continual_learning_job(
+                (
+                    accepted,
+                    job_id,
+                    msg,
+                    uploaded_low_quality_sample_ids,
+                ) = submit_continual_learning_job(
                     self.config.server_ip,
                     edge_id=self.edge_id,
                     sample_store=self.sample_store,
@@ -2301,6 +2380,11 @@ class EdgeWorker:
                             job_id=job_id,
                             status=status,
                         )
+                        self._delete_cloud_accepted_low_quality_samples(
+                            str(reply.message or ""),
+                            uploaded_low_quality_sample_ids,
+                            job_id=job_id,
+                        )
                         download_started = time.perf_counter()
                         success, model_b64, terminal_message = download_trained_model(
                             self.config.server_ip,
@@ -2351,10 +2435,20 @@ class EdgeWorker:
                             job_id=job_id,
                             status=status,
                         )
+                        self._delete_cloud_accepted_low_quality_samples(
+                            terminal_message,
+                            uploaded_low_quality_sample_ids,
+                            job_id=job_id,
+                        )
                         break
 
                     terminal_message = str(
                         reply.message or f"Training job ended with status {status}"
+                    )
+                    self._delete_cloud_accepted_low_quality_samples(
+                        terminal_message,
+                        uploaded_low_quality_sample_ids,
+                        job_id=job_id,
                     )
                     logger.error(
                         "[EdgeCL] cloud training failed: status={} reason={}.",

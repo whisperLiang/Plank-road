@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import time
 
 from loguru import logger
@@ -80,6 +81,7 @@ class FixedSplitPipeline(
 
         with self._training_job_scope(edge_id):
             total_round_started = time.perf_counter()
+            accepted_low_quality_ids_message = ""
             try:
                 stage_started = time.perf_counter()
                 materialized_manifest = materialize_low_quality_trigger_bundle(
@@ -284,6 +286,18 @@ class FixedSplitPipeline(
                     low_quality_staging_candidates,
                     sample_source="low_quality",
                 )
+                uploaded_low_quality_count = int(
+                    manifest.get("sample_count", len(low_quality_staging_candidates)) or 0
+                )
+                accepted_low_quality_sample_ids = [
+                    str(sample.get("sample_id") or "")
+                    for sample in low_quality_staging_candidates
+                    if str(sample.get("sample_id") or "")
+                ]
+                accepted_low_quality_ids_message = (
+                    "accepted_low_quality_sample_ids_json="
+                    f"{json.dumps(accepted_low_quality_sample_ids, separators=(',', ':'))}"
+                )
                 recent_samples = recent_window.latest_samples(self.training_frame_count)
                 self._log_stage_duration(
                     "feature readiness + recent training-window append",
@@ -305,7 +319,10 @@ class FixedSplitPipeline(
                     message = (
                         "Waiting for enough recent training samples: "
                         f"available={len(recent_samples)}, "
-                        f"required={int(self.training_frame_count)}."
+                        f"required={int(self.training_frame_count)}, "
+                        f"accepted_low_quality_samples={append_stats.accepted}, "
+                        f"uploaded_low_quality_samples={uploaded_low_quality_count}; "
+                        f"{accepted_low_quality_ids_message}"
                     )
                     logger.info("[FixedSplitCL] {}", message)
                     self._log_stage_duration("total round time", total_round_started)
@@ -362,7 +379,8 @@ class FixedSplitPipeline(
                         f"active_samples={active_sample_count}, "
                         f"train_samples={train_sample_count}, "
                         f"validation_samples={validation_sample_count}, "
-                        f"required_train_min={required_dynamic_batch_min}."
+                        f"required_train_min={required_dynamic_batch_min}; "
+                        f"{accepted_low_quality_ids_message}"
                     )
                     logger.warning("[FixedSplitCL] {}", message)
                     self._log_stage_duration("total round time", total_round_started)
@@ -420,7 +438,8 @@ class FixedSplitPipeline(
                     return (
                         True,
                         encoded,
-                        "Fixed split connectivity smoke successful; skipped full retraining",
+                        "Fixed split connectivity smoke successful; skipped full retraining; "
+                        f"{accepted_low_quality_ids_message}",
                     )
                 proxy_evaluator = self._fixed_split_proxy_evaluator()
                 proxy_eval_frame_cache = proxy_evaluator.new_frame_cache()
@@ -470,6 +489,7 @@ class FixedSplitPipeline(
                     )
                     if proxy_summary is not None:
                         message = f"{message}; {proxy_summary}"
+                    message = f"{message}; {accepted_low_quality_ids_message}"
                     logger.warning("[FixedSplitCL] {}", message)
                     return True, "", message
 
@@ -489,6 +509,7 @@ class FixedSplitPipeline(
                     if proxy_summary is not None
                     else "Fixed split retraining successful; proxy_mAP_50_95 skipped"
                 )
+                success_message = f"{success_message}; {accepted_low_quality_ids_message}"
                 logger.success(
                     "[FixedSplitCL] {} done for edge {} with {} train samples and "
                     "{} validation samples.",
@@ -513,4 +534,7 @@ class FixedSplitPipeline(
                     lambda error=exc: {"error": repr(error)},
                     runtime=True,
                 )
-                return False, "", f"{message}: {exc}"
+                detail = f"{message}: {exc}"
+                if accepted_low_quality_ids_message:
+                    detail = f"{detail}; {accepted_low_quality_ids_message}"
+                return False, "", detail

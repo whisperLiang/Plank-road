@@ -340,6 +340,47 @@ class EdgeSampleStore:
             self._records = {}
             self._results = {}
 
+    def delete_samples(
+        self,
+        sample_ids: Iterable[str],
+        *,
+        quality_bucket: str | None = None,
+    ) -> int:
+        requested_ids = {str(sample_id) for sample_id in sample_ids if str(sample_id)}
+        if not requested_ids:
+            return 0
+        with self._lock:
+            removed: list[StoredSampleRecord] = []
+            for sample_id in sorted(requested_ids):
+                record = self._records.get(sample_id)
+                if record is None:
+                    continue
+                if quality_bucket is not None and record.quality_bucket != quality_bucket:
+                    continue
+                removed.append(record)
+                self._records.pop(sample_id, None)
+                self._results.pop(sample_id, None)
+                self._counters.add(record, sign=-1)
+            if not removed:
+                return 0
+            self._counters.clamp()
+
+            protected_paths: set[str] = set()
+            for record in self._records.values():
+                protected_paths.update(self.iter_existing_paths(record))
+            for record in removed:
+                for path in self.iter_existing_paths(record):
+                    if path in protected_paths:
+                        continue
+                    try:
+                        os.remove(path)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        pass
+            self._rewrite_indexes_unlocked()
+            return len(removed)
+
     def _index_path(self, bucket: str) -> str:
         return os.path.join(self.index_dir, f"{bucket}.jsonl")
 
@@ -353,6 +394,22 @@ class EdgeSampleStore:
                 )
             )
             handle.write("\n")
+
+    def _rewrite_indexes_unlocked(self) -> None:
+        os.makedirs(self.index_dir, exist_ok=True)
+        for filename in os.listdir(self.index_dir):
+            if filename.endswith(".jsonl"):
+                try:
+                    os.remove(os.path.join(self.index_dir, filename))
+                except OSError:
+                    pass
+        records = sorted(
+            self._records.values(),
+            key=lambda item: (item.timestamp, item.sample_id),
+        )
+        for record in records:
+            self._append_index("all", record)
+            self._append_index(record.quality_bucket, record)
 
     def _existing_record_unlocked(self, sample_id: str) -> StoredSampleRecord | None:
         return self._records.get(str(sample_id))

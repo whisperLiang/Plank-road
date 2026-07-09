@@ -440,6 +440,7 @@ def pack_low_quality_trigger_bundle_to_file(
         "selection_policy": selection_policy,
         "shard_size": resolved_shard_size,
         "sample_count": len(selected),
+        "sample_ids": [str(record.sample_id) for record in selected],
         "raw_shards": [],
         "feature_shards": [],
     }
@@ -469,6 +470,7 @@ def pack_low_quality_trigger_bundle_to_file(
                 "shard_id": f"edge{int(edge_id)}_low_raw_{index:06d}",
                 "file": name,
                 "sample_count": len(sample_ids),
+                "sample_ids": list(sample_ids),
             }
             for index, (name, _payload, sample_ids) in enumerate(raw_shard_payloads, 1)
         ]
@@ -818,6 +820,9 @@ def submit_continual_learning_job(
             bundle_cap_bytes=bundle_cap_bytes,
             shard_size=trigger_shard_size,
         )
+        uploaded_sample_ids = [
+            str(value) for value in list(manifest.get("sample_ids", []) or [])
+        ]
         zip_payload_bytes = len(payload_zip)
         payload_metrics = measure_trigger_bundle_payload(payload_zip)
         selection_policy = dict(manifest.get("selection_policy", {}) or {})
@@ -885,7 +890,7 @@ def submit_continual_learning_job(
                 upload_mbps,
                 _format_bytes(zip_payload_bytes),
             )
-            return False, "", "submit_training_job failed"
+            return False, "", "submit_training_job failed", uploaded_sample_ids
         logger.info(
             "[EdgeUpload] low-quality trigger uploaded: edge={} samples={} version={} "
             "size={} elapsed={:.3f}s speed={:.3f}Mbps.",
@@ -906,7 +911,7 @@ def submit_continual_learning_job(
                 "session_id": edge_session_id,
             },
         )
-        return bool(reply.accepted), str(reply.job_id), str(reply.message)
+        return bool(reply.accepted), str(reply.job_id), str(reply.message), uploaded_sample_ids
     except Exception as exc:
         logger.error(
             "[EdgeUpload] continual-learning submission failed: {}.",
@@ -920,4 +925,4 @@ def submit_continual_learning_job(
                 "error": repr(error),
             },
         )
-        return False, "", str(exc)
+        return False, "", str(exc), []

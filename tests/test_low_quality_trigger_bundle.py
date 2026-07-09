@@ -188,6 +188,8 @@ def test_raw_feature_low_quality_bundle_imports_current_feature_ref(tmp_path) ->
     )
 
     assert manifest["upload_mode"] == "raw+feature"
+    assert manifest["sample_ids"] == ["low-1"]
+    assert manifest["raw_shards"][0]["sample_ids"] == ["low-1"]
     assert stats["feature_shard_count"] == 1
     assert manifest["feature_shards"]
 
@@ -209,3 +211,52 @@ def test_raw_feature_low_quality_bundle_imports_current_feature_ref(tmp_path) ->
     feature_ref = sample["feature_ref"]
     assert os.path.exists(fs_path(feature_ref["index_path"]))
     assert str(feature_ref["index_path"]).startswith(str(tmp_path / "cloud_features"))
+
+
+def test_uploaded_low_quality_samples_can_be_deleted_from_edge_store(tmp_path) -> None:
+    runtime_contract = _runtime_contract()
+    split_plan = _split_plan(runtime_contract)
+    store = EdgeSampleStore(str(tmp_path / "edge_store"))
+    payload = boundary_payload_from_tensors(
+        {"boundary": torch.ones((1, 2, 3), dtype=torch.float32)},
+        split_id="after:test",
+        graph_signature="raw-feature-test",
+        batch_size=1,
+    )
+    for index in range(1, 4):
+        store.store_sample(
+            sample_id=f"low-{index}",
+            frame_index=index,
+            confidence=0.1,
+            split_config_id="split-a",
+            model_id="yolo26n",
+            model_version="1",
+            quality_bucket=LOW_QUALITY,
+            inference_result={"boxes": [], "labels": [], "scores": []},
+            intermediate=payload,
+            raw_frame=np.zeros((32, 32, 3), dtype=np.uint8),
+            input_image_size=[32, 32],
+            input_tensor_shape=[1, 3, 32, 32],
+            input_resize_mode="direct_resize",
+            runtime_contract=runtime_contract,
+        )
+
+    assert store.delete_samples(["low-1", "low-2"], quality_bucket=LOW_QUALITY) == 2
+    assert store.stats()["low_quality_count"] == 1
+
+    zip_path, manifest, stats = pack_low_quality_trigger_bundle_to_file(
+        store,
+        edge_id=7,
+        send_low_conf_features=False,
+        split_plan=split_plan,
+        model_id="yolo26n",
+        model_version="1",
+        output_dir=str(tmp_path),
+    )
+
+    assert os.path.exists(zip_path)
+    assert stats["sample_count"] == 1
+    assert manifest["sample_ids"] == ["low-3"]
+    assert [record.sample_id for record in store.list_records(quality_bucket=LOW_QUALITY)] == [
+        "low-3"
+    ]

@@ -21,9 +21,11 @@ from edge.edge_worker import (
     SampleStatsDelta,
     SampleWriteJob,
     _FixedSplitRuntimeError,
+    _accepted_uploaded_sample_ids,
     _lower_current_thread_priority,
 )
 from edge.info import TASK_STATE
+from edge.sample_quality import LOW_QUALITY
 from edge.task import Task
 from edge_client import _write_buffered_task_result, _write_task_result
 from model_management import object_detection as object_detection_module
@@ -179,6 +181,78 @@ def test_inference_threads_reject_non_positive_value() -> None:
 
     with pytest.raises(ValueError, match="must be positive"):
         worker._configure_inference_replay_threads(torch.ones(1))
+
+
+def test_uploaded_low_quality_delete_helper_uses_low_quality_filter() -> None:
+    worker = EdgeWorker.__new__(EdgeWorker)
+    calls: list[tuple[list[str], str | None]] = []
+
+    class Store:
+        def delete_samples(self, sample_ids, *, quality_bucket=None):
+            calls.append((list(sample_ids), quality_bucket))
+            return len(sample_ids)
+
+    worker.sample_store = Store()
+
+    assert worker._delete_uploaded_low_quality_samples(["low-1", "low-2"]) == 2
+    assert calls == [(["low-1", "low-2"], LOW_QUALITY)]
+
+
+def test_cloud_accepted_low_quality_delete_helper_handles_failed_status_message() -> None:
+    worker = EdgeWorker.__new__(EdgeWorker)
+    calls: list[tuple[list[str], str | None]] = []
+    metrics = []
+
+    class Store:
+        def delete_samples(self, sample_ids, *, quality_bucket=None):
+            calls.append((list(sample_ids), quality_bucket))
+            return len(sample_ids)
+
+    worker.sample_store = Store()
+    worker._record_experiment_metric = (
+        lambda name, **payload: metrics.append((name, payload))
+    )
+
+    message = (
+        "fixed-split training failed: validation split unavailable; "
+        'accepted_low_quality_sample_ids_json=["low-2","low-1"]'
+    )
+
+    assert (
+        worker._delete_cloud_accepted_low_quality_samples(
+            message,
+            ["low-1", "low-2", "low-3"],
+            job_id="job-a",
+        )
+        == 2
+    )
+    assert calls == [(["low-2", "low-1"], LOW_QUALITY)]
+    assert metrics[0][0] == "uploaded_low_quality_samples_deleted"
+    assert metrics[0][1]["job_id"] == "job-a"
+    assert metrics[0][1]["deleted_sample_count"] == 2
+
+
+def test_accepted_uploaded_sample_ids_uses_cloud_confirmed_ids_only() -> None:
+    message = (
+        "Waiting for enough recent training samples: available=64, required=128, "
+        "accepted_low_quality_samples=2, uploaded_low_quality_samples=3; "
+        'accepted_low_quality_sample_ids_json=["low-2","other","low-2","low-1"]'
+    )
+
+    assert _accepted_uploaded_sample_ids(message, ["low-1", "low-2", "low-3"]) == [
+        "low-2",
+        "low-1",
+    ]
+
+
+def test_accepted_uploaded_sample_ids_keeps_samples_when_cloud_ids_missing() -> None:
+    assert (
+        _accepted_uploaded_sample_ids(
+            "Waiting for enough recent training samples: available=64, required=128.",
+            ["low-1"],
+        )
+        == []
+    )
 
 
 def test_background_thread_priority_is_best_effort(monkeypatch) -> None:
