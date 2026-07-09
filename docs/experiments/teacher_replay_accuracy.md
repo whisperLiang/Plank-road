@@ -42,6 +42,8 @@ python tools/experiments/evaluate_plank_road_baseline_teacher_accuracy.py \
   --teacher_model rtdetr_x \
   --yaml_path ./config/config.yaml \
   --device cuda:0 \
+  --score_threshold 0.6 \
+  --student_score_threshold 0.6 \
   --update_manifest
 
 python tools/experiments/normalize_plank_road_baseline_logs.py \
@@ -101,3 +103,7 @@ in the evaluator report. Legacy logs fall back to the student class names in
 The accuracy JSONL keeps the existing `ACCURACY_FIELDS` schema. The first
 implementation fills only `f1`; `map` and `window_accuracy` remain empty. mAP
 is not synthesized from F1.
+
+Teacher pseudo labels and student predictions are both score-filtered before
+F1 matching. Use the same threshold for both sides unless the experiment has a
+specific reason to decouple teacher confidence from student confidence.

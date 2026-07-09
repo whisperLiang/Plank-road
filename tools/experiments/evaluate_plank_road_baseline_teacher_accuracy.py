@@ -278,6 +278,7 @@ class _FrameReader:
         self.comparison_dir = comparison_dir
         self.report = report
         self._captures: dict[Path, cv2.VideoCapture] = {}
+        self._next_frame_ids: dict[Path, int] = {}
         self._zip_members: dict[Path, set[str]] = {}
 
     def close(self) -> None:
@@ -297,9 +298,21 @@ class _FrameReader:
         if capture is None:
             capture = cv2.VideoCapture(str(path))
             self._captures[path] = capture
-        capture.set(cv2.CAP_PROP_POS_FRAMES, max(0, record.frame_id - 1))
-        ok, frame = capture.read()
-        return (frame, "") if ok and frame is not None else (None, "video frame read failed")
+            self._next_frame_ids[path] = 1
+        target_frame_id = int(record.frame_id)
+        next_frame_id = self._next_frame_ids.get(path, 1)
+        if target_frame_id < next_frame_id:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, max(0, target_frame_id - 1))
+            next_frame_id = target_frame_id
+        frame: np.ndarray | None = None
+        while next_frame_id <= target_frame_id:
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                self._next_frame_ids[path] = next_frame_id
+                return None, "video frame read failed"
+            next_frame_id += 1
+        self._next_frame_ids[path] = next_frame_id
+        return frame, ""
 
     def _read_snapshot(self, record: StudentRecord) -> tuple[np.ndarray | None, str]:
         member = record.replay_frame_path
@@ -617,7 +630,11 @@ def evaluate_teacher_accuracy(
     score_threshold = (
         float(score_threshold)
         if score_threshold is not None
-        else _manifest_metric_float(manifest, "teacher_score_threshold", 0.0)
+        else _manifest_metric_float(
+            manifest,
+            "teacher_score_threshold",
+            fallback_student_score_threshold,
+        )
     )
     iou_threshold = (
         float(iou_threshold)
@@ -938,6 +955,10 @@ def evaluate_teacher_accuracy(
                     }
                 )
                 continue
+            filtered_teacher = _filter_prediction_by_score(
+                mapped_teacher,
+                score_threshold=float(score_threshold),
+            )
             output_rows.append(
                 {
                     "run_id": record.run_id,
@@ -952,7 +973,7 @@ def evaluate_teacher_accuracy(
                             record.prediction,
                             score_threshold=float(student_score_threshold),
                         ),
-                        mapped_teacher,
+                        filtered_teacher,
                         iou_threshold=float(iou_threshold),
                         score_threshold=float(student_score_threshold),
                     ),

@@ -146,9 +146,23 @@ def _scenario_name(value: object) -> str:
     return text
 
 
-def _ordered_scenarios(rows: Iterable[Mapping[str, Any]]) -> list[str]:
-    del rows
-    return list(SCENARIO_ORDER)
+def _formal_scenarios_present(rows: Iterable[Mapping[str, Any]]) -> list[str]:
+    available = {str(row.get("scenario_name", "")) for row in rows if row.get("scenario_name")}
+    return [scenario for scenario in SCENARIO_ORDER if scenario in available]
+
+
+def _single_figure_scenario(rows: Iterable[Mapping[str, Any]]) -> str | None:
+    counts: dict[str, int] = defaultdict(int)
+    for row in rows:
+        scenario = str(row.get("scenario_name", ""))
+        if scenario in SCENARIO_ORDER:
+            counts[scenario] += 1
+    if not counts:
+        return None
+    return max(
+        SCENARIO_ORDER,
+        key=lambda scenario: (counts.get(scenario, 0), -SCENARIO_ORDER.index(scenario)),
+    )
 
 
 def _unknown_scenarios(rows: Iterable[Mapping[str, Any]]) -> list[str]:
@@ -281,14 +295,13 @@ def _event_frame(
     return _nearest_frame(timestamped, optional_float(row.get("event_time_ms")))
 
 
-def _mean_event_frames(
+def _event_frames_by_name(
     event_rows: Sequence[Mapping[str, Any]],
-    frame_rows: Sequence[Mapping[str, Any]],
+    timestamped: Mapping[FrameKey, Sequence[tuple[int, float]]],
     *,
     scenario: str,
     method: str,
-) -> dict[str, float]:
-    timestamps = _timestamped_frames(frame_rows)
+) -> dict[str, list[float]]:
     positions: dict[str, list[float]] = defaultdict(list)
     for row in event_rows:
         if row.get("scenario_name") != scenario or _method_id(row.get("method")) != method:
@@ -297,10 +310,10 @@ def _mean_event_frames(
         if event_name not in {"trigger_decision", "model_update_applied"}:
             continue
         key = (scenario, method, str(row.get("run_id", "")))
-        frame_id = _event_frame(row, timestamps.get(key, []))
+        frame_id = _event_frame(row, timestamped.get(key, []))
         if frame_id is not None:
             positions[event_name].append(float(frame_id))
-    return {event_name: float(np.mean(values)) for event_name, values in positions.items()}
+    return {event_name: sorted(values) for event_name, values in positions.items()}
 
 
 def _run_series_for(
@@ -382,12 +395,16 @@ def _plot_fig1(
     ]
     if not _has_formal_scenario(frame_rows):
         return [], "formal Suwon scenario data missing", partial, {}
-    scenarios = _ordered_scenarios(frame_rows)
+    selected_scenario = _single_figure_scenario(frame_rows)
+    if selected_scenario is None:
+        return [], "formal Suwon scenario data missing", partial, {}
+    scenarios = [selected_scenario]
     series_by_run = _frame_series_by_run(frame_rows, metric)
+    timestamped = _timestamped_frames(frame_rows)
     fig, axes = plt.subplots(
         1,
         len(scenarios),
-        figsize=(7.1, 2.45),
+        figsize=(7.1, 3.65),
         squeeze=False,
         sharey=True,
         constrained_layout=True,
@@ -397,6 +414,7 @@ def _plot_fig1(
     plotted_values: list[float] = []
     used_bin = False
     marker_count = 0
+    event_counts: dict[str, dict[str, int]] = {}
     for axis, scenario in zip(axes_list, scenarios):
         scenario_methods = _method_order(
             row.get("method", "") for row in frame_rows if row.get("scenario_name") == scenario
@@ -441,51 +459,44 @@ def _plot_fig1(
                     alpha=0.16,
                     linewidth=0,
                 )
-        event_positions = {
-            event_name: value
-            for event_name, value in _mean_event_frames(
-                event_rows,
-                frame_rows,
-                scenario=scenario,
-                method="",
-            ).items()
-        }
-        del event_positions
         for method in scenario_methods:
-            positions = _mean_event_frames(
+            positions = _event_frames_by_name(
                 event_rows,
-                frame_rows,
+                timestamped,
                 scenario=scenario,
                 method=method,
             )
+            event_counts[f"{scenario}/{_method_label(method)}"] = {
+                "trigger_decision": len(positions.get("trigger_decision", [])),
+                "model_update_applied": len(positions.get("model_update_applied", [])),
+            }
             for event_name, marker in (
                 ("trigger_decision", "^"),
                 ("model_update_applied", "*"),
             ):
-                frame = positions.get(event_name)
-                if frame is None:
-                    continue
-                marker_count += 1
-                axis.axvline(
-                    frame,
-                    color=_method_color(method),
-                    linewidth=0.8,
-                    alpha=0.32,
-                    linestyle="--",
-                )
-                y = 0.05 if event_name == "trigger_decision" else 0.12
-                axis.scatter(
-                    [frame],
-                    [y],
-                    transform=axis.get_xaxis_transform(),
-                    marker=marker,
-                    s=30 if marker == "^" else 50,
-                    color=_method_color(method),
-                    edgecolor="white",
-                    linewidth=0.4,
-                    zorder=5,
-                    clip_on=False,
-                )
+                frames = positions.get(event_name, [])
+                for frame in frames:
+                    marker_count += 1
+                    axis.axvline(
+                        frame,
+                        color=_method_color(method),
+                        linewidth=0.7,
+                        alpha=0.2,
+                        linestyle="--" if event_name == "trigger_decision" else ":",
+                    )
+                    y = 0.05 if event_name == "trigger_decision" else 0.12
+                    axis.scatter(
+                        [frame],
+                        [y],
+                        transform=axis.get_xaxis_transform(),
+                        marker=marker,
+                        s=30 if marker == "^" else 48,
+                        color=_method_color(method),
+                        edgecolor="white",
+                        linewidth=0.4,
+                        zorder=5,
+                        clip_on=False,
+                    )
         axis.set_title(scenario)
         axis.set_xlabel("Frame ID")
         axis.xaxis.set_major_locator(MaxNLocator(nbins=5))
@@ -507,19 +518,50 @@ def _plot_fig1(
         plt.close(fig)
         return [], "accuracy data missing for formal Suwon scenarios", partial, {}
     metadata = {
+        "selected_scenario": selected_scenario,
         "frame_bin_size": FRAME_BIN_SIZE if used_bin else None,
         "variability": "standard deviation across repeated runs",
-        "event_markers": "mean trigger/update frame" if marker_count else "omitted",
+        "event_markers": "individual trigger/update frames" if marker_count else "omitted",
+        "event_counts": event_counts,
     }
     return _save(fig, figure_dir, "fig1_dynamic_accuracy_recovery"), None, partial, metadata
 
 
-def _event_identities(row: Mapping[str, Any]) -> set[str]:
+def _event_identity_fields(row: Mapping[str, Any]) -> dict[str, str]:
     return {
-        value
+        field: value
         for field in ("job_id", "window_id")
         if (value := str(row.get(field, "") or ""))
     }
+
+
+def _trigger_candidate_index(
+    triggers: Sequence[Mapping[str, Any]],
+    update: Mapping[str, Any],
+    update_time: float,
+) -> int | None:
+    before_update = [
+        (index, trigger)
+        for index, trigger in enumerate(triggers)
+        if (optional_float(trigger.get("event_time_ms")) or update_time + 1) <= update_time
+    ]
+    update_identities = _event_identity_fields(update)
+    if update_identities:
+        for index, trigger in before_update:
+            trigger_identities = _event_identity_fields(trigger)
+            if any(
+                trigger_identities.get(field) == value
+                for field, value in update_identities.items()
+                if field in trigger_identities
+            ):
+                return index
+        comparable_identity_exists = any(
+            any(field in _event_identity_fields(trigger) for field in update_identities)
+            for _index, trigger in before_update
+        )
+        if comparable_identity_exists:
+            return None
+    return before_update[0][0] if before_update else None
 
 
 def _trigger_to_update_seconds(
@@ -553,28 +595,7 @@ def _trigger_to_update_seconds(
             update_time = optional_float(update.get("event_time_ms"))
             if update_time is None:
                 continue
-            update_identities = _event_identities(update)
-            if update_identities:
-                candidate_index = next(
-                    (
-                        index
-                        for index, trigger in enumerate(unused)
-                        if update_identities.intersection(_event_identities(trigger))
-                        and (optional_float(trigger.get("event_time_ms")) or update_time + 1)
-                        <= update_time
-                    ),
-                    None,
-                )
-            else:
-                candidate_index = next(
-                    (
-                        index
-                        for index, trigger in enumerate(unused)
-                        if (optional_float(trigger.get("event_time_ms")) or update_time + 1)
-                        <= update_time
-                    ),
-                    None,
-                )
+            candidate_index = _trigger_candidate_index(unused, update, update_time)
             if candidate_index is None:
                 continue
             trigger = unused.pop(candidate_index)
@@ -639,7 +660,6 @@ def _plot_fig2(
     ]
     if not _has_formal_scenario(frame_rows):
         return [], "formal Suwon scenario data missing", partial, {}
-    scenarios = _ordered_scenarios(frame_rows)
     series_by_run = _frame_series_by_run(frame_rows, metric)
     timestamped = _timestamped_frames(frame_rows)
     points: dict[tuple[str, str], list[dict[str, float | str]]] = defaultdict(list)
@@ -674,11 +694,16 @@ def _plot_fig2(
         points[(scenario, method)].append({"x": total_s, "y": post_f1, "run_id": run_id})
     if not points:
         return [], "accuracy/time tradeoff data missing", partial, {}
+    scenarios = [
+        scenario
+        for scenario in SCENARIO_ORDER
+        if any(item_scenario == scenario for item_scenario, _method in points)
+    ]
 
     fig, axes = plt.subplots(
         1,
         len(scenarios),
-        figsize=(7.1, 2.55),
+        figsize=(max(4.6, 2.35 * len(scenarios)), 2.55),
         squeeze=False,
         sharey=True,
         constrained_layout=True,
@@ -764,6 +789,7 @@ def _plot_fig2(
             bbox_to_anchor=(0.5, -0.04),
         )
     metadata = {
+        "selected_scenarios": scenarios,
         "ellipses_drawn": ellipses,
         "points_without_ellipse": point_only,
         "ellipse_width": "std(total_retraining_time_s)",
@@ -777,16 +803,22 @@ def _plot_fig2(
     )
 
 
-def _sum_fields_ms(rows: Sequence[Mapping[str, Any]], fields: Sequence[str]) -> float | None:
-    values = []
-    for row in rows:
-        for field in fields:
-            value = optional_float(row.get(field))
-            if value is not None:
-                values.append(float(value))
-    if not values:
+def _mean_positive_fields_ms(
+    rows: Sequence[Mapping[str, Any]],
+    fields: Sequence[str],
+) -> float | None:
+    field_means = []
+    for field in fields:
+        values = [
+            float(value)
+            for row in rows
+            if (value := optional_float(row.get(field))) is not None and value > 0
+        ]
+        if values:
+            field_means.append(float(np.mean(values)))
+    if not field_means:
         return None
-    return float(sum(values))
+    return float(sum(field_means))
 
 
 def _component_specs(method: str) -> list[tuple[str, str, str, tuple[str, ...]]]:
@@ -865,7 +897,7 @@ def _plot_fig3(
     ]
     if not _has_formal_scenario(latency_rows):
         return [], "formal Suwon latency data missing", partial, {}
-    scenarios = _ordered_scenarios(latency_rows)
+    scenarios = _formal_scenarios_present(latency_rows)
     run_groups = _run_latency_groups(latency_rows)
     run_components: dict[FrameKey, dict[str, float | None]] = {}
     run_totals: dict[FrameKey, float | None] = {}
@@ -874,7 +906,7 @@ def _plot_fig3(
         components = {
             label: (
                 value / 1000.0
-                if (value := _sum_fields_ms(rows, fields)) is not None
+                if (value := _mean_positive_fields_ms(rows, fields)) is not None
                 else None
             )
             for _, label, _, fields in _component_specs(method)
@@ -885,6 +917,7 @@ def _plot_fig3(
     values: dict[tuple[str, str, str], float] = {}
     totals_by_method: dict[tuple[str, str], list[float]] = defaultdict(list)
     component_meta: dict[str, list[str]] = defaultdict(list)
+    component_values_meta: dict[str, dict[str, float]] = defaultdict(dict)
     for scenario in scenarios:
         for method in METHOD_ORDER:
             method_keys = [
@@ -900,8 +933,12 @@ def _plot_fig3(
                     if run_components[key].get(label) is not None
                 ]
                 if measured:
-                    values[(scenario, method, label)] = float(np.mean(measured))
+                    component_value = float(np.mean(measured))
+                    values[(scenario, method, label)] = component_value
                     component_meta[f"{scenario}/{_method_label(method)}"].append(label)
+                    component_values_meta[f"{scenario}/{_method_label(method)}"][
+                        label
+                    ] = component_value
                 else:
                     partial.append(
                         f"{scenario}/{_method_label(method)} omitted {label} because "
@@ -914,7 +951,10 @@ def _plot_fig3(
     if not values:
         return [], "retraining time components missing", partial, {}
 
-    fig, axis = plt.subplots(figsize=(7.1, 3.05), constrained_layout=True)
+    fig, axis = plt.subplots(
+        figsize=(max(5.6, 2.35 * len(scenarios)), 3.05),
+        constrained_layout=True,
+    )
     x = np.arange(len(scenarios))
     bar_width = 0.17
     offsets = np.linspace(-1.5 * bar_width, 1.5 * bar_width, len(METHOD_ORDER))
@@ -973,7 +1013,7 @@ def _plot_fig3(
                     color="#4D4D4D",
                 )
     axis.set_xticks(x, scenarios)
-    axis.set_ylabel("Average Time Cost for Retraining (s)")
+    axis.set_ylabel("Average Time Cost per Retraining (s)")
     axis.yaxis.set_major_locator(MaxNLocator(nbins=5))
     _style_axis(axis, grid_axis="y")
     axis.set_ylim(0, max(max_total * 1.22, 0.1))
@@ -985,7 +1025,15 @@ def _plot_fig3(
         fontsize=5.6,
     )
     metadata = {
+        "selected_scenarios": scenarios,
         "components": dict(component_meta),
+        "component_seconds": {
+            key: dict(values) for key, values in component_values_meta.items()
+        },
+        "component_aggregation": (
+            "mean positive measured component duration per run; repeated component "
+            "observations within a run are averaged, not summed"
+        ),
         "total_error_bar": "std(total_retraining_time_s across repeats)",
     }
     return _save(fig, figure_dir, "fig3_retraining_time_breakdown"), None, partial, metadata

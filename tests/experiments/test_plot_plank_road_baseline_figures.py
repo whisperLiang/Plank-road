@@ -202,6 +202,12 @@ def test_complete_normalized_data_generates_exactly_three_figure_sets(tmp_path: 
     assert report["figure_metadata"]["fig2_accuracy_retraining_time_tradeoff"][
         "ellipses_drawn"
     ]
+    fig1_metadata = report["figure_metadata"]["fig1_dynamic_accuracy_recovery"]
+    assert fig1_metadata["event_markers"] == "individual trigger/update frames"
+    assert fig1_metadata["event_counts"]["Sunny/Ours"] == {
+        "trigger_decision": 3,
+        "model_update_applied": 3,
+    }
     assert (
         "No interpolation, random data, synthetic data, or placeholder curves are generated."
         in report["notes"]
@@ -246,6 +252,63 @@ def test_fig3_omits_missing_components_without_inventing_values(tmp_path: Path) 
         "Accuracy-Trigger omitted AccuracyTrigger-Label because it is not measured" in warning
         for warning in report["partial_data"]["fig3_retraining_time_breakdown"]
     )
+
+
+def test_fig3_averages_repeated_component_observations_instead_of_summing(
+    tmp_path: Path,
+) -> None:
+    normalized = tmp_path / "normalized"
+    figures = tmp_path / "figures"
+    _write_complete_normalized(normalized, repeats=1)
+    latency_rows = read_csv(normalized / "latency_breakdown.csv")
+    latency_rows.append(
+        empty_row(
+            LATENCY_FIELDS,
+            comparison_id="c",
+            run_id="sunny-0-r1",
+            method="plank_road",
+            edge_id=1,
+            scenario_name="Sunny",
+            video_slug="sunny",
+            window_id="w-1",
+            training_ms=2000,
+        )
+    )
+    write_csv(normalized / "latency_breakdown.csv", LATENCY_FIELDS, latency_rows)
+
+    report = plot_figures(normalized, figures)
+
+    component_seconds = report["figure_metadata"]["fig3_retraining_time_breakdown"][
+        "component_seconds"
+    ]
+    assert component_seconds["Sunny/Ours"]["Ours-Retrain"] == 1.5
+
+
+def test_single_scenario_results_do_not_draw_empty_scenario_panels(tmp_path: Path) -> None:
+    normalized = tmp_path / "normalized"
+    figures = tmp_path / "figures"
+    _write_complete_normalized(normalized, repeats=1)
+    for filename, fields in (
+        ("frame_metrics.csv", FRAME_FIELDS),
+        ("adaptation_events.csv", ADAPTATION_FIELDS),
+        ("latency_breakdown.csv", LATENCY_FIELDS),
+        ("summary.csv", SUMMARY_FIELDS),
+    ):
+        rows = [
+            row
+            for row in read_csv(normalized / filename)
+            if row["scenario_name"] == "Snowy"
+        ]
+        write_csv(normalized / filename, fields, rows)
+
+    report = plot_figures(normalized, figures)
+
+    metadata = report["figure_metadata"]
+    assert metadata["fig1_dynamic_accuracy_recovery"]["selected_scenario"] == "Snowy"
+    assert metadata["fig2_accuracy_retraining_time_tradeoff"]["selected_scenarios"] == [
+        "Snowy"
+    ]
+    assert metadata["fig3_retraining_time_breakdown"]["selected_scenarios"] == ["Snowy"]
 
 
 def test_missing_accuracy_skips_fig1_and_fig2_and_removes_stale_outputs(

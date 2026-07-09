@@ -1200,7 +1200,7 @@ def _coalesce_adaptation_events(
         )
         job_id = str(row.get("job_id", "") or "")
         window_id = str(row.get("window_id", "") or "")
-        identity = job_id or window_id
+        identity = _adaptation_event_coalesce_identity(row, job_id=job_id, window_id=window_id)
         target = None
         if identity:
             exact_key = (*base, identity)
@@ -1260,6 +1260,24 @@ def _coalesce_adaptation_events(
             if target.get(field) in (None, "") and incoming not in (None, ""):
                 target[field] = incoming
     return merged
+
+
+def _adaptation_event_coalesce_identity(
+    row: Mapping[str, Any],
+    *,
+    job_id: str,
+    window_id: str,
+) -> str:
+    identity = job_id or window_id
+    if (
+        str(row.get("method", "")) == "plank_road"
+        and str(row.get("event_name", "")) == "trigger_decision"
+        and identity
+    ):
+        frame_id = str(row.get("frame_id", "") or "")
+        event_time = str(row.get("event_time_ms", "") or "")
+        return "|".join(part for part in (identity, frame_id, event_time) if part)
+    return identity
 
 
 def _anchor_accuracy_trigger_decisions(
