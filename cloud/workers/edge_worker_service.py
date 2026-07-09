@@ -216,9 +216,14 @@ class EdgeWorkerService:
         root = os.path.abspath(str(workspace_root))
         self.config.workspace_root = root
         self.config.continual_learning.max_concurrent_jobs = 1
-        self.config.sample_pool.root_dir = os.path.join(root, "cloud_sample_pool")
-        self.config.sample_pool.staging_root = os.path.join(root, "cloud_sample_staging")
-        self.config.sample_pool.split_contract_root = os.path.join(root, "split_contracts")
+        self.config.continual_learning.recent_training_window_root = os.path.join(
+            root,
+            "recent_training_windows",
+        )
+        self.config.continual_learning.split_contract_root = os.path.join(
+            root,
+            "split_contracts",
+        )
         feature_cache = self.config.continual_learning.feature_cache
         feature_cache.view_root_dir = os.path.join(root, "cloud_training_views")
         feature_cache.store_root_dir = os.path.join(root, "cloud_feature_shards")

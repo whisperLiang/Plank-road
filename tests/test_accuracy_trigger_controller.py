@@ -244,6 +244,7 @@ def test_controller_absolute_accuracy_floor_is_debug_trigger() -> None:
     controller = _controller(
         min_history_windows=5,
         absolute_accuracy_floor=0.5,
+        training_frame_count=1,
     )
 
     submission = _add_window(
@@ -258,7 +259,7 @@ def test_controller_absolute_accuracy_floor_is_debug_trigger() -> None:
 
 
 def test_controller_default_absolute_accuracy_floor_triggers_before_min_history() -> None:
-    controller = _controller(min_history_windows=5)
+    controller = _controller(min_history_windows=5, training_frame_count=1)
 
     submission = _add_window(
         controller,
@@ -356,7 +357,7 @@ def test_controller_rejected_submission_retains_buffer_and_can_retrigger() -> No
         teacher_prediction=_box(),
     )
     assert retrigger is not None
-    assert retrigger.training_frame_ids == (1, 2, 3, 4)
+    assert retrigger.training_frame_ids == (2, 3, 4)
 
 
 def test_controller_isolates_model_keys_and_resets_after_update() -> None:
@@ -459,11 +460,43 @@ def test_controller_terminal_failure_keeps_buffer_for_retraining() -> None:
         teacher_prediction=_box(),
     )
     assert retrigger is not None
-    assert retrigger.training_frame_ids == (1, 2, 3, 4)
+    assert retrigger.training_frame_ids == (2, 3, 4)
 
 
-def test_controller_buffer_accumulates_until_sample_pool_capacity() -> None:
-    controller = _controller(sample_pool_max_samples=5)
+def test_controller_waits_for_training_frame_count_after_trigger() -> None:
+    controller = _controller(training_frame_count=4)
+
+    _add_window(controller, _payload(1, edge_prediction=_box()), teacher_prediction=_box())
+    _add_window(controller, _payload(2, edge_prediction=_box()), teacher_prediction=_box())
+    early = _add_window(
+        controller,
+        _payload(3, edge_prediction=_empty()),
+        teacher_prediction=_box(),
+    )
+
+    assert early is None
+    snapshot = controller.snapshot(
+        run_id="run-a",
+        edge_id=1,
+        model_name="tiny",
+        model_version="0",
+    )
+    assert snapshot["last_decision"]["triggered"] is True
+    assert snapshot["buffer_frame_ids"] == [1, 2, 3]
+
+    ready = _add_window(
+        controller,
+        _payload(4, edge_prediction=_box()),
+        teacher_prediction=_box(),
+    )
+
+    assert ready is not None
+    assert ready.trigger_reason == "adaptive_drop"
+    assert ready.training_frame_ids == (1, 2, 3, 4)
+
+
+def test_controller_buffer_accumulates_until_training_frame_count() -> None:
+    controller = _controller(training_frame_count=5)
 
     for frame_id in range(1, 7):
         _add_window(
@@ -482,8 +515,8 @@ def test_controller_buffer_accumulates_until_sample_pool_capacity() -> None:
     assert snapshot["buffer_window_count"] == 5
 
 
-def test_controller_buffer_capacity_selection_prefers_drift_rare_and_recency() -> None:
-    controller = _controller(sample_pool_max_samples=4)
+def test_controller_buffer_keeps_recent_frames_only() -> None:
+    controller = _controller(training_frame_count=4)
 
     frames = [
         (1, _box(label=1), {}),
@@ -510,7 +543,7 @@ def test_controller_buffer_capacity_selection_prefers_drift_rare_and_recency() -
         model_name="tiny",
         model_version="0",
     )
-    assert snapshot["buffer_frame_ids"] == [2, 3, 5, 6]
+    assert snapshot["buffer_frame_ids"] == [3, 4, 5, 6]
 
 
 def test_cloud_controller_submits_bundle_with_reused_teacher_targets(tmp_path) -> None:
@@ -522,9 +555,13 @@ def test_cloud_controller_submits_bundle_with_reused_teacher_targets(tmp_path) -
         run_id="run-a",
         results_root=str(tmp_path),
         training_backend=backend,
-        baseline_training_config=SimpleNamespace(batch_size=2, num_epoch=1, learning_rate=1e-3),
+        baseline_training_config=SimpleNamespace(
+            batch_size=2,
+            num_epoch=1,
+            learning_rate=1e-3,
+            training_frame_count=6,
+        ),
         baseline_method_config=_accuracy_config(),
-        sample_pool_max_samples=64,
         model_weights_path="weights.pt",
         tinynext_input_size=None,
         teacher_annotator=annotator,
@@ -593,9 +630,8 @@ def test_cloud_controller_rejects_legacy_accuracy_frame_upload(tmp_path) -> None
         run_id="run-a",
         results_root=str(tmp_path),
         training_backend=backend,
-        baseline_training_config=SimpleNamespace(batch_size=2, num_epoch=1, learning_rate=1e-3),
+        baseline_training_config=SimpleNamespace(batch_size=2, num_epoch=1, learning_rate=1e-3, training_frame_count=2),
         baseline_method_config=_accuracy_config(),
-        sample_pool_max_samples=64,
         model_weights_path="weights.pt",
         tinynext_input_size=None,
         teacher_annotator=annotator,
@@ -617,9 +653,8 @@ def test_cloud_controller_window_annotation_is_single_batch_without_pending_queu
         run_id="run-a",
         results_root=str(tmp_path),
         training_backend=backend,
-        baseline_training_config=SimpleNamespace(batch_size=2, num_epoch=1, learning_rate=1e-3),
+        baseline_training_config=SimpleNamespace(batch_size=2, num_epoch=1, learning_rate=1e-3, training_frame_count=2),
         baseline_method_config=_accuracy_config(),
-        sample_pool_max_samples=64,
         model_weights_path="weights.pt",
         tinynext_input_size=None,
         teacher_annotator=annotator,
@@ -651,9 +686,8 @@ def test_cloud_controller_accepts_empty_source_window_without_teacher_work(tmp_p
         run_id="run-a",
         results_root=str(tmp_path),
         training_backend=backend,
-        baseline_training_config=SimpleNamespace(batch_size=2, num_epoch=1, learning_rate=1e-3),
+        baseline_training_config=SimpleNamespace(batch_size=2, num_epoch=1, learning_rate=1e-3, training_frame_count=2),
         baseline_method_config=_accuracy_config(),
-        sample_pool_max_samples=64,
         model_weights_path="weights.pt",
         tinynext_input_size=None,
         teacher_annotator=annotator,
@@ -694,9 +728,8 @@ def test_cloud_controller_defers_retryable_window_annotation_without_dropping_wi
         run_id="run-a",
         results_root=str(tmp_path),
         training_backend=backend,
-        baseline_training_config=SimpleNamespace(batch_size=2, num_epoch=1, learning_rate=1e-3),
+        baseline_training_config=SimpleNamespace(batch_size=2, num_epoch=1, learning_rate=1e-3, training_frame_count=2),
         baseline_method_config=_accuracy_config(),
-        sample_pool_max_samples=64,
         model_weights_path="weights.pt",
         tinynext_input_size=None,
         teacher_annotator=annotator,
@@ -738,9 +771,8 @@ def test_cloud_controller_window_annotation_log_reports_batch_request(tmp_path) 
         run_id="run-a",
         results_root=str(tmp_path),
         training_backend=backend,
-        baseline_training_config=SimpleNamespace(batch_size=2, num_epoch=1, learning_rate=1e-3),
+        baseline_training_config=SimpleNamespace(batch_size=2, num_epoch=1, learning_rate=1e-3, training_frame_count=2),
         baseline_method_config=_accuracy_config(),
-        sample_pool_max_samples=64,
         model_weights_path="weights.pt",
         tinynext_input_size=None,
         teacher_annotator=annotator,
@@ -778,9 +810,8 @@ def test_cloud_controller_logs_prediction_schema_warning_once_per_window(tmp_pat
         run_id="run-a",
         results_root=str(tmp_path),
         training_backend=backend,
-        baseline_training_config=SimpleNamespace(batch_size=2, num_epoch=1, learning_rate=1e-3),
+        baseline_training_config=SimpleNamespace(batch_size=2, num_epoch=1, learning_rate=1e-3, training_frame_count=2),
         baseline_method_config=_accuracy_config(),
-        sample_pool_max_samples=64,
         model_weights_path="weights.pt",
         tinynext_input_size=None,
         teacher_annotator=annotator,
@@ -817,9 +848,8 @@ def test_cloud_controller_validates_accuracy_window_frame_contract(tmp_path) -> 
         run_id="run-a",
         results_root=str(tmp_path),
         training_backend=RecordingTrainingBackend(),
-        baseline_training_config=SimpleNamespace(batch_size=2, num_epoch=1, learning_rate=1e-3),
+        baseline_training_config=SimpleNamespace(batch_size=2, num_epoch=1, learning_rate=1e-3, training_frame_count=2),
         baseline_method_config=_accuracy_config(),
-        sample_pool_max_samples=64,
         model_weights_path="weights.pt",
         tinynext_input_size=None,
         teacher_annotator=RecordingSharedAnnotator([_box()]),
@@ -846,9 +876,8 @@ def test_cloud_controller_requires_shared_teacher_annotator(tmp_path) -> None:
         run_id="run-a",
         results_root=str(tmp_path),
         training_backend=RecordingTrainingBackend(),
-        baseline_training_config=SimpleNamespace(batch_size=2, num_epoch=1, learning_rate=1e-3),
+        baseline_training_config=SimpleNamespace(batch_size=2, num_epoch=1, learning_rate=1e-3, training_frame_count=2),
         baseline_method_config=_accuracy_config(),
-        sample_pool_max_samples=64,
         model_weights_path="weights.pt",
         tinynext_input_size=None,
     )
@@ -951,11 +980,11 @@ def _window_payload(payloads: list[BaselineFramePayload]) -> BaselineWindowPaylo
 
 
 def _controller(**overrides) -> AccuracyTriggerController:
-    sample_pool_max_samples = int(overrides.pop("sample_pool_max_samples", 64))
+    training_frame_count = int(overrides.pop("training_frame_count", 3))
     config = _accuracy_config(**overrides)
     return AccuracyTriggerController(
         config,
-        sample_pool_max_samples=sample_pool_max_samples,
+        training_frame_count=training_frame_count,
     )
 
 

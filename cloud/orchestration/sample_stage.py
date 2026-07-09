@@ -4,7 +4,6 @@ import json
 import os
 import time
 from collections.abc import Mapping, Sequence
-from typing import Any
 
 import torch
 from loguru import logger
@@ -18,8 +17,6 @@ from cloud.orchestration.fixed_split_dependencies import (
     POOL_LABEL_METADATA_FIELDS,
     _read_json_file,
 )
-from cloud.orchestration.results import SampleRebuildResult
-from cloud.sample_pool import CloudSamplePool
 from cloud.training.proxy_metadata import (
     original_image_size_from_metadata as _original_image_size_from_metadata,
 )
@@ -34,33 +31,6 @@ from grpc_server.workspace import prepare_request_workspace
 from model_management.payload import BoundaryPayload
 from model_management.split_contract import SplitRuntimeContract
 from model_management.universal_model_split import UniversalModelSplitter
-
-
-class CanonicalSampleStage:
-    def __init__(self, sample_pool: CloudSamplePool) -> None:
-        self.sample_pool = sample_pool
-
-    def rebuild(
-        self,
-        *,
-        split_contract: SplitRuntimeContract,
-        existing_active: list[Mapping[str, Any]],
-        pending_high_quality: list[Mapping[str, Any]],
-        new_low_quality: list[Mapping[str, Any]],
-    ) -> SampleRebuildResult:
-        rebuild_stats, kept_records = self.sample_pool.rebuild_canonical_training_pool(
-            split_contract=split_contract,
-            existing_active_samples=existing_active,
-            pending_high_quality_samples=pending_high_quality,
-            new_low_quality_samples=new_low_quality,
-        )
-        return SampleRebuildResult(
-            rebuild_stats=dict(rebuild_stats),
-            kept_records=list(kept_records),
-            existing_active=[dict(sample) for sample in existing_active],
-            pending_high_quality=[dict(sample) for sample in pending_high_quality],
-            staging_low_quality=[dict(sample) for sample in new_low_quality],
-        )
 
 
 class SampleStageMixin:
@@ -107,7 +77,7 @@ class SampleStageMixin:
         model_input_size: tuple[int, int] | None = None,
         resize_mode: str | None = None,
     ) -> list[dict[str, object]]:
-        """Build canonical-pool staging candidates from rebuilt low-quality shard refs."""
+        """Build recent-window candidates from rebuilt low-quality shard refs."""
         processed_samples: list[dict[str, object]] = []
         for entry in list(feature_entries or []):
             if not isinstance(entry, Mapping):
@@ -279,89 +249,20 @@ class SampleStageMixin:
             rebuild_provider=provider,
         )
 
-    def _build_training_cache_view_from_canonical_active(
+    def _build_training_cache_view_from_recent_samples(
         self,
-        sample_pool: CloudSamplePool,
+        samples: list[Mapping[str, object]],
         *,
         contract: SplitRuntimeContract,
         model_name: str,
         edge_id: int | str,
     ):
-        return self._feature_readiness_service().build_training_cache_view_from_canonical_active(
-            sample_pool,
+        return self._feature_readiness_service().build_training_cache_view_from_recent_samples(
+            samples=samples,
             contract=contract,
             model_name=model_name,
             edge_id=edge_id,
             pool_annotations_from_labels=self._pool_annotations_from_labels,
-        )
-
-    def _log_sample_rebuild_summary(
-        self,
-        *,
-        split_contract: SplitRuntimeContract,
-        existing_active: Sequence[object],
-        pending_high_quality: Sequence[object],
-        staging_low_quality: Sequence[object],
-        rebuild_stats: Mapping[str, object],
-        staging_stats: Mapping[str, object],
-        low_quality_candidate_count: int,
-    ) -> None:
-        validation_stats = dict(rebuild_stats.get("validation", {}) or {})
-        selection_stats = dict(rebuild_stats.get("selection", {}) or {})
-        commit_stats = dict(rebuild_stats.get("generation_commit", {}) or {})
-        skipped_total = (
-            int(validation_stats.get("skipped_stale_contract", 0) or 0)
-            + int(validation_stats.get("skipped_feature_layout", 0) or 0)
-            + int(validation_stats.get("skipped_label_metadata", 0) or 0)
-            + int(validation_stats.get("skipped_unreadable", 0) or 0)
-        )
-        logger.info(
-            "[SamplePool] canonical rebuild: existing={} pending_hq={} new_lq={} "
-            "active={} kept={} accepted_hq={} accepted_lq={} rebound={} "
-            "deferred={} skipped={} staging_lq={} candidates_lq={}.",
-            len(existing_active),
-            len(pending_high_quality),
-            len(staging_low_quality),
-            commit_stats.get("active", 0),
-            selection_stats.get("kept", 0),
-            validation_stats.get("accepted_high_quality", 0),
-            validation_stats.get("accepted_low_quality", 0),
-            validation_stats.get("rebound_existing_active", 0),
-            validation_stats.get("deferred_feature_layout", 0),
-            skipped_total,
-            staging_stats.get("accepted_to_staging", 0),
-            int(low_quality_candidate_count),
-        )
-        log_diagnostic_debug(
-            self,
-            "[SamplePool] canonical rebuild diagnostics",
-            lambda: {
-                "contract_id": split_contract.contract_id,
-                "feature_layout_id": split_contract.feature_layout_id,
-                "feature_abi_id": split_contract.feature_abi_id,
-                "validation": validation_stats,
-            },
-        )
-        deferred_preview = validation_stats.get("deferred_feature_layout_preview")
-        if deferred_preview:
-            log_diagnostic_debug(
-                self,
-                "[SamplePool] deferred feature-layout preview",
-                lambda: {"sample_ids": self._preview_ids(list(deferred_preview), limit=5)},
-            )
-        log_diagnostic_debug(
-            self,
-            "[SamplePool] canonical rebuild detail",
-            lambda: {
-                "selection": selection_stats,
-                "shard_validation": dict(rebuild_stats.get("shard_validation", {}) or {}),
-                "shard_carry_forward": dict(
-                    rebuild_stats.get("shard_carry_forward", {}) or {}
-                ),
-                "shard_high_quality": dict(rebuild_stats.get("shard_high_quality", {}) or {}),
-                "shard_cleanup": dict(rebuild_stats.get("shard_cleanup", {}) or {}),
-                "staging": dict(staging_stats or {}),
-            },
         )
 
     def sync_samples(
@@ -374,14 +275,7 @@ class SampleStageMixin:
         model_version: str = "",
         split_config_id: str = "",
     ) -> tuple[bool, str, int]:
-        """Stage high-quality feature-label samples into the cloud pending area.
-
-        The canonical rebuild is always performed inside a training job after the
-        cloud batch runtime is bound and the :class:`SplitRuntimeContract` is
-        created/validated. Sync therefore only writes into
-        ``pending_high_quality`` staging; it never touches the active
-        generation.
-        """
+        """Append high-quality feature-label samples into the recent training window."""
         try:
             if str(sync_type or "") != "HIGH_QUALITY_FEATURE_LABEL_SHARD":
                 raise RuntimeError(f"Unsupported sample sync type: {sync_type!r}")
@@ -411,17 +305,16 @@ class SampleStageMixin:
             ) as handle:
                 json.dump(manifest, handle, indent=2, sort_keys=True)
                 handle.write("\n")
-            sample_pool = self._cloud_sample_pool_for_manifest(
-                edge_id=edge_id,
-                manifest=manifest,
-            )
-            sample_pool = self._reset_initial_cloud_state_if_needed(
+            self._reset_initial_cloud_state_if_needed(
                 edge_id=edge_id,
                 manifest=manifest,
                 model_name=str(manifest.get("model_id") or model_id or self.edge_model_name),
-                sample_pool=sample_pool,
                 fallback_model_version=model_version,
                 allow_without_session=False,
+            )
+            recent_window = self._recent_training_window_for_manifest(
+                edge_id=edge_id,
+                manifest=manifest,
             )
             pending_candidates, unreadable_ids = load_high_quality_shard_candidates(
                 manifest=manifest,
@@ -431,11 +324,14 @@ class SampleStageMixin:
                     manifest.get("label_coordinate_space") or POOL_LABEL_COORDINATE_SPACE
                 ),
             )
-            stage_stats = sample_pool.store_pending_high_quality_samples(pending_candidates)
-            accepted = int(stage_stats.get("accepted_to_pending", 0))
+            append_stats = recent_window.append_samples(
+                pending_candidates,
+                sample_source="high_quality",
+            )
+            stage_stats = append_stats.as_dict()
+            accepted = int(append_stats.accepted)
             message = (
-                f"Staged {accepted} high-quality sample(s) to pending_high_quality; "
-                f"they will enter training on the next canonical rebuild."
+                f"Appended {accepted} high-quality sample(s) to the recent training window."
             )
             if unreadable_ids:
                 stage_stats = dict(stage_stats)
@@ -443,17 +339,19 @@ class SampleStageMixin:
                     stage_stats.get("skipped_unreadable", 0)
                 ) + len(unreadable_ids)
             logger.info(
-                "[ShardCL][SamplePoolCommit] high_quality staged: edge={} accepted={} "
-                "skipped_unreadable={}.",
+                "[ShardCL][RecentTrainingWindow] high_quality appended: edge={} "
+                "accepted={} retained={} required={} skipped_unreadable={}.",
                 edge_id,
                 accepted,
+                append_stats.retained,
+                self.training_frame_count,
                 int(stage_stats.get("skipped_unreadable", 0) or 0),
             )
             log_diagnostic_debug(
                 self,
-                "[ShardCL][SamplePoolCommit] diagnostics",
+                "[ShardCL][RecentTrainingWindow] diagnostics",
                 lambda: {
-                    "pending_dir": sample_pool.pending_high_quality_dir,
+                    "window_dir": recent_window.root_dir,
                     "stats": stage_stats,
                     "skipped_unreadable_preview": self._preview_ids(unreadable_ids),
                 },

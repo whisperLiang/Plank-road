@@ -150,7 +150,7 @@ class CloudFrameBuffer:
             completed: list[CompletedFrameWindow] = []
             for (edge_id, camera_id, task_id, window_index), records in sorted(groups.items()):
                 records = sorted(records, key=lambda item: item.frame_idx)
-                if len(records) < self.window_size and not self._is_final_partial_window(records):
+                if len(records) < self.window_size:
                     continue
                 start = records[0].frame_idx
                 selected = tuple(records[: self.window_size])
@@ -179,11 +179,6 @@ class CloudFrameBuffer:
         if completed:
             self.write_sampled_frames()
         return completed
-
-    def _is_final_partial_window(self, records: list[UploadedFrameRecord]) -> bool:
-        if self.num_frames is None or not records:
-            return False
-        return max(record.frame_idx for record in records) >= int(self.num_frames)
 
     def write_sampled_frames(self) -> Path:
         payload = {

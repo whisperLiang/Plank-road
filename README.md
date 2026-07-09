@@ -75,7 +75,7 @@ Core areas: [edge/resource_aware_trigger.py](./edge/resource_aware_trigger.py), 
 
 The cloud receives training bundles, expands the working cache, annotates selected raw samples, rebuilds missing features, creates direct-reference training views, and retrains the server-side tail behind the selected split boundary.
 
-Core areas: [cloud/orchestration/](./cloud/orchestration/), [cloud/annotation/](./cloud/annotation/), [cloud/feature_cache/](./cloud/feature_cache/), [cloud/sample_pool/](./cloud/sample_pool/).
+Core areas: [cloud/orchestration/](./cloud/orchestration/), [cloud/annotation/](./cloud/annotation/), [cloud/feature_cache/](./cloud/feature_cache/).
 
 ### Model Update And Multi-Edge Safety
 
@@ -97,7 +97,6 @@ Plank-road/
 |   |-- baselines/              # Cloud-side baseline controllers, including Ekya-style scheduling
 |   |-- feature_cache/          # Cloud feature shard store, planner, materializer, GC
 |   |-- orchestration/          # Fixed-split training pipeline stages
-|   |-- sample_pool/            # Canonical sample pool, labels, staging, views
 |   `-- workers/                # Edge-affine workers, assignment, MPS, GPU leases
 |-- grpc_server/                # Protobuf contract, RPC server, jobs, workspace helpers
 |   `-- protos/                 # message_transmission.proto and generated stubs
@@ -334,8 +333,6 @@ baseline:
   pure_edge_local_updating:
     training_strategy: surgeon_tta
     quality_mode: output_only_when_no_boundary
-    trigger_low_quality_samples: 8
-    max_local_buffer_samples: 64
     trainable_scope: norm_affine
     consistency_weight: 0.01
     entropy_margin_ratio: 0.4
@@ -348,6 +345,7 @@ baseline:
     learning_rate: 1.0e-3
     optimizer_name: adam
     weight_decay: 0.0
+    training_frame_count: 120
 ```
 
 `accuracy_trigger_cloud_retraining` uses edge predictions only for trigger and

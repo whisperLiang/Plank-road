@@ -25,7 +25,7 @@ from cloud.orchestration.runtime_stage import (
     splitter_dynamic_batch_min as _splitter_dynamic_batch_min,
 )
 from cloud.orchestration.runtime_template_stage import FixedSplitRuntimeTemplateMixin
-from cloud.orchestration.sample_stage import CanonicalSampleStage, SampleStageMixin
+from cloud.orchestration.sample_stage import SampleStageMixin
 from cloud.orchestration.settings import PipelineLifecycleMixin
 from cloud.orchestration.teacher_stage import TeacherAnnotationMixin
 from cloud.orchestration.training_stage import TrainingStageMixin
@@ -113,17 +113,20 @@ class FixedSplitPipeline(
                     manifest.get("model", {}).get("model_version", "0"),
                     field_name="bundle model version",
                 )
-                sample_pool = self._cloud_sample_pool_for_manifest(
+                recent_window = self._recent_training_window_for_manifest(
                     edge_id=edge_id,
                     manifest=manifest,
                 )
-                sample_pool = self._reset_initial_cloud_state_if_needed(
+                self._reset_initial_cloud_state_if_needed(
                     edge_id=edge_id,
                     manifest=manifest,
                     model_name=current_model_name,
-                    sample_pool=sample_pool,
                     fallback_model_version=bundle_model_version,
                     allow_without_session=True,
+                )
+                recent_window = self._recent_training_window_for_manifest(
+                    edge_id=edge_id,
+                    manifest=manifest,
                 )
                 next_checkpoint_model_version = _increment_model_version(
                     bundle_model_version,
@@ -134,7 +137,7 @@ class FixedSplitPipeline(
                     manifest=manifest,
                 )
                 front_version = str(
-                    self._sample_pool_manifest_context(manifest).get("front_version") or "0"
+                    self._training_window_manifest_context(manifest).get("front_version") or "0"
                 )
                 if (
                     existing_contract is None
@@ -235,14 +238,13 @@ class FixedSplitPipeline(
                     teacher_requests,
                 )
                 self._log_stage_duration("teacher annotation ensure", stage_started)
-                pending_high_quality = sample_pool.load_pending_high_quality_samples()
                 contract_layout_tensors = self._contract_layout_tensors_from_runtime(
                     splitter=prepared_splitter,
                     candidate=prepared_candidate,
                     input_tensor_shape=[
                         int(dim)
                         for dim in list(
-                            self._sample_pool_manifest_context(manifest).get(
+                            self._training_window_manifest_context(manifest).get(
                                 "input_tensor_shape",
                                 [],
                             )
@@ -261,12 +263,6 @@ class FixedSplitPipeline(
                     bundle_root=bundle_cache_path,
                     create_if_missing=True,
                 )
-                self._log_pending_high_quality_layout_alignment(
-                    pending_high_quality=pending_high_quality,
-                    split_contract=split_contract,
-                    expected_source="runtime",
-                    low_quality_tensors=None,
-                )
                 stage_started = time.perf_counter()
                 low_quality_feature_entries = self._prepare_low_quality_feature_entries(
                     tmp_model,
@@ -284,32 +280,36 @@ class FixedSplitPipeline(
                     model_input_size=pool_model_input_size,
                     resize_mode=pool_input_resize_mode,
                 )
-                staging_stats = sample_pool.stage_low_quality_samples(
-                    low_quality_staging_candidates
+                append_stats = recent_window.append_samples(
+                    low_quality_staging_candidates,
+                    sample_source="low_quality",
                 )
-                staging_low_quality = sample_pool.load_staging_low_quality_samples()
-                existing_active = sample_pool.load_active_samples_for_rebuild(
-                    split_contract=split_contract,
-                )
-                rebuild_result = CanonicalSampleStage(sample_pool).rebuild(
-                    split_contract=split_contract,
-                    existing_active=existing_active,
-                    pending_high_quality=pending_high_quality,
-                    new_low_quality=staging_low_quality,
-                )
-                rebuild_stats = rebuild_result.rebuild_stats
+                recent_samples = recent_window.latest_samples(self.training_frame_count)
                 self._log_stage_duration(
-                    "feature readiness + canonical sample-pool rebuild", stage_started
+                    "feature readiness + recent training-window append",
+                    stage_started,
                 )
-                self._log_sample_rebuild_summary(
-                    split_contract=split_contract,
-                    existing_active=existing_active,
-                    pending_high_quality=pending_high_quality,
-                    staging_low_quality=staging_low_quality,
-                    rebuild_stats=rebuild_stats,
-                    staging_stats=staging_stats,
-                    low_quality_candidate_count=len(low_quality_staging_candidates),
+                logger.info(
+                    "[FixedSplitCL] recent training window edge={} accepted={} "
+                    "replaced={} retained={} required={} dropped_old={} "
+                    "low_quality_candidates={}.",
+                    edge_id,
+                    append_stats.accepted,
+                    append_stats.replaced,
+                    append_stats.retained,
+                    self.training_frame_count,
+                    append_stats.dropped_old,
+                    len(low_quality_staging_candidates),
                 )
+                if len(recent_samples) < int(self.training_frame_count):
+                    message = (
+                        "Waiting for enough recent training samples: "
+                        f"available={len(recent_samples)}, "
+                        f"required={int(self.training_frame_count)}."
+                    )
+                    logger.info("[FixedSplitCL] {}", message)
+                    self._log_stage_duration("total round time", total_round_started)
+                    return False, "", message
 
                 stage_started = time.perf_counter()
                 (
@@ -320,14 +320,20 @@ class FixedSplitPipeline(
                     sample_metadata_by_id,
                     _training_view,
                     _training_view_stats,
-                ) = self._build_training_cache_view_from_canonical_active(
-                    sample_pool,
+                ) = self._build_training_cache_view_from_recent_samples(
+                    recent_samples,
                     contract=split_contract,
                     model_name=current_model_name,
                     edge_id=edge_id,
                 )
                 self._log_stage_duration("training cache view materialization", stage_started)
                 active_sample_count = len(bundle_info["all_sample_ids"])
+                if active_sample_count != int(self.training_frame_count):
+                    raise RuntimeError(
+                        "Recent training-window view must contain exactly "
+                        f"{int(self.training_frame_count)} samples; "
+                        f"got {active_sample_count}."
+                    )
                 required_dynamic_batch_min = max(
                     _FIXED_SPLIT_DYNAMIC_BATCH_MIN,
                     _splitter_dynamic_batch_min(prepared_splitter),
@@ -345,11 +351,10 @@ class FixedSplitPipeline(
                     random_seed=proxy_sample_random_seed,
                     min_train_samples=required_dynamic_batch_min,
                 )
-                train_sample_count = len(validation_split.train_sample_ids)
+                train_sample_count = active_sample_count
                 validation_sample_count = len(validation_split.validation_sample_ids)
                 if (
                     active_sample_count < required_dynamic_batch_min
-                    or train_sample_count < required_dynamic_batch_min
                     or validation_sample_count <= 0
                 ):
                     message = (
@@ -363,8 +368,8 @@ class FixedSplitPipeline(
                     self._log_stage_duration("total round time", total_round_started)
                     return False, "", message
                 training_bundle_info = dict(bundle_info)
-                training_bundle_info["all_sample_ids"] = list(validation_split.train_sample_ids)
-                gt_annotations = dict(validation_split.train_gt_annotations)
+                training_bundle_info["all_sample_ids"] = list(bundle_info["all_sample_ids"])
+                gt_annotations = dict(gt_annotations)
                 validation_gt_annotations = dict(validation_split.validation_gt_annotations)
                 effective_batch_size = self._resolve_fixed_split_runtime_batch_size(
                     current_model_name,
@@ -383,8 +388,8 @@ class FixedSplitPipeline(
                     manifest=manifest,
                 )
                 logger.info(
-                    "[FixedSplitCL] Training from {} canonical-active sample(s) with "
-                    "{} validation sample(s) via TrainingCacheView(source=canonical_active) "
+                    "[FixedSplitCL] Training from {} recent-window sample(s) with "
+                    "{} validation sample(s) via TrainingCacheView(source=recent_training_window) "
                     "({} train label entry/entries; {} validation label entry/entries).",
                     len(training_bundle_info["all_sample_ids"]),
                     len(validation_split.validation_sample_ids),

@@ -27,7 +27,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from cloud.feature_cache import FeatureShardRef, FeatureShardStore
-from cloud.sample_pool import CloudSamplePool
 from model_management.payload import boundary_payload_from_tensors
 
 SUMMARY_FIELDS = [
@@ -108,63 +107,7 @@ def _make_fake_entries(count: int, dtype: str, seed: int) -> list[dict[str, Any]
     return entries
 
 
-def _labels_from_sample(sample: dict[str, Any]) -> dict[str, Any]:
-    label_ref = sample.get("label_ref")
-    if isinstance(label_ref, dict) and isinstance(label_ref.get("labels"), dict):
-        return dict(label_ref["labels"])
-    return {
-        "boxes": list(sample.get("boxes") or sample.get("pseudo_boxes") or []),
-        "labels": list(sample.get("labels") or sample.get("pseudo_labels") or []),
-    }
-
-
-def _make_sample_pool_entries(args: argparse.Namespace) -> list[dict[str, Any]]:
-    pool = CloudSamplePool(
-        str(args.sample_pool_root),
-        model_id=str(args.model),
-        split_config_id=str(args.split_config_id or ""),
-    )
-    active = pool.list_active_samples()
-    if args.sample_count > 0:
-        active = active[: int(args.sample_count)]
-    if not active:
-        raise RuntimeError(
-            "No active canonical sample pool entries found. "
-            f"sample_pool_root={args.sample_pool_root!r}"
-        )
-    source_store = FeatureShardStore(
-        str(Path(args.output_dir) / "work" / "source_reader"),
-        storage_format="npy_memmap_shard",
-        payload_cache_enabled=bool(args.payload_cache),
-        pin_memory=False,
-    )
-    entries: list[dict[str, Any]] = []
-    for sample in active:
-        ref_payload = sample.get("feature_ref")
-        if not isinstance(ref_payload, dict):
-            raise RuntimeError(f"Active sample {sample.get('sample_id')!r} is missing feature_ref.")
-        ref = FeatureShardRef.from_dict(ref_payload)
-        payload = source_store.read_batch([ref])
-        entries.append(
-            {
-                "sample": {
-                    "sample_id": str(sample.get("sample_id") or ref.sample_id),
-                    "labels": _labels_from_sample(dict(sample)),
-                    "input_tensor_shape": list(sample.get("input_tensor_shape") or []),
-                    "input_resize_mode": str(sample.get("input_resize_mode") or ""),
-                    "input_image_size": list(sample.get("input_image_size") or []),
-                },
-                "record": {"intermediate": payload},
-            }
-        )
-    return entries
-
-
 def _make_entries(args: argparse.Namespace) -> tuple[str, list[dict[str, Any]]]:
-    if args.use_current_canonical_active:
-        args.input_source = "sample_pool"
-    if args.input_source == "sample_pool":
-        return "sample_pool", _make_sample_pool_entries(args)
     return "fake", _make_fake_entries(args.sample_count, args.dtype, args.seed)
 
 
@@ -363,9 +306,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="benchmark_results/feature_shards")
     parser.add_argument("--shard-max-samples", type=int, default=64)
     parser.add_argument("--payload-cache", action="store_true")
-    parser.add_argument("--input-source", choices=("fake", "sample_pool"), default="fake")
-    parser.add_argument("--sample-pool-root", default="./cache/cloud_sample_pool")
-    parser.add_argument("--use-current-canonical-active", action="store_true")
+    parser.add_argument("--input-source", choices=("fake",), default="fake")
     return parser.parse_args()
 
 
@@ -378,7 +319,6 @@ def main() -> None:
     raw: dict[str, Any] = {
         "formats": {},
         "input_source": scenario,
-        "sample_pool_root": str(args.sample_pool_root) if scenario == "sample_pool" else "",
         "sample_order": [entry["sample"]["sample_id"] for entry in entries],
     }
     rows = []

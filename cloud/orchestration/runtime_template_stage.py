@@ -811,7 +811,7 @@ class FixedSplitRuntimeTemplateMixin:
             preferred_mode=self._preferred_fixed_split_runtime_mode(model_family),
         )
         model_meta = dict(manifest.get("model", {}) or {})
-        context = self._sample_pool_manifest_context(manifest)
+        context = self._training_window_manifest_context(manifest)
         runtime_splitter = UniversalModelSplitter(device=self.device).bind_runtime(
             runtime,
             model=trace_model,

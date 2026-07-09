@@ -53,7 +53,6 @@ class DistributedBaselineController:
         baseline_method_config: object | dict[str, Any] | None = None,
         model_weights_path: str = "",
         tinynext_input_size: int | None = None,
-        sample_pool_max_samples: int | None = None,
         strict_run_id: bool = True,
         teacher_annotator: Any | None = None,
     ) -> None:
@@ -65,9 +64,9 @@ class DistributedBaselineController:
         self.baseline_method_config = baseline_method_config
         self.model_weights_path = str(model_weights_path or "")
         self.tinynext_input_size = tinynext_input_size
-        self.sample_pool_max_samples = _baseline_sample_pool_max_samples(
-            sample_pool_max_samples,
-            baseline_method=self.baseline_method,
+        self.training_frame_count = max(
+            1,
+            int(_config_value(baseline_training_config, "training_frame_count", 120)),
         )
         self.strict_run_id = bool(strict_run_id)
         self.teacher_annotator = teacher_annotator
@@ -80,7 +79,7 @@ class DistributedBaselineController:
         self._accuracy_trigger_controller = (
             AccuracyTriggerController(
                 baseline_method_config,
-                sample_pool_max_samples=int(self.sample_pool_max_samples),
+                training_frame_count=int(self.training_frame_count),
             )
             if self._accuracy_trigger_enabled
             else None
@@ -608,20 +607,6 @@ def _accuracy_window_key(payload: BaselineWindowPayload) -> tuple[str, str, int,
     )
 
 
-def _baseline_sample_pool_max_samples(
-    value: object,
-    *,
-    baseline_method: str,
-) -> int:
-    if str(baseline_method) == _ACCURACY_TRIGGER_METHOD:
-        if value in (None, "", 0):
-            raise ValueError(
-                "sample_pool_max_samples is required for cloud baseline buffers"
-            )
-        return max(1, int(value))
-    return 0
-
-
 def _config_value(config: object | dict[str, Any] | None, name: str, default: Any) -> Any:
     if isinstance(config, dict):
         return config.get(name, default)
@@ -639,6 +624,7 @@ def _training_config_dict(config: object | dict[str, Any] | None) -> dict[str, A
         "weight_decay",
         "min_training_samples",
         "training_window_size",
+        "training_frame_count",
         "microprofile_epochs",
         "device",
         "training_failure_backoff_sec",
@@ -653,4 +639,5 @@ def _training_config_dict(config: object | dict[str, Any] | None) -> dict[str, A
     result.setdefault("learning_rate", 1e-3)
     result.setdefault("min_training_samples", 1)
     result.setdefault("training_window_size", 8)
+    result.setdefault("training_frame_count", 120)
     return result

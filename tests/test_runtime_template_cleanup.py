@@ -49,7 +49,7 @@ class RuntimeTemplateHarness(FixedSplitRuntimeTemplateMixin):
         return str(model_meta.get("model_id") or manifest.get("model_id") or self.edge_model_name)
 
     @staticmethod
-    def _sample_pool_manifest_context(manifest: Mapping[str, object]) -> dict[str, object]:
+    def _training_window_manifest_context(manifest: Mapping[str, object]) -> dict[str, object]:
         split_plan = dict(manifest.get("split_plan", {}) or {})
         runtime_contract = dict(split_plan.get("runtime_contract") or {})
         return {

@@ -6,13 +6,18 @@ import pytest
 import torch
 from torch import nn
 
-from cloud.sample_pool import _single_sample_feature_tensors
-from model_management.payload import boundary_payload_from_tensors
+from model_management.payload import BoundaryPayload, boundary_payload_from_tensors
 from model_management.split_runtime import (
     BoundaryPayloadCacheCodec,
     make_split_spec,
     prepare_split_runtime,
 )
+
+
+def _single_sample_feature_tensors(payload: object) -> dict[str, torch.Tensor]:
+    if not isinstance(payload, BoundaryPayload) or int(payload.batch_size) != 1:
+        raise ValueError("Expected BoundaryPayload with single-sample tensors")
+    return dict(payload.tensors)
 
 
 class TinyBoundaryModel(nn.Module):

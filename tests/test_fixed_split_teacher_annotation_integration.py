@@ -8,7 +8,6 @@ import numpy as np
 import torch
 
 from cloud.feature_cache import FeatureShardStore
-from cloud.sample_pool import CloudSamplePool
 from cloud_server import CloudContinualLearner
 from model_management.payload import boundary_payload_from_tensors
 from model_management.split_contract import SplitRuntimeContract
@@ -64,16 +63,8 @@ def _config(tmp_path, *, async_enabled: bool):
         tinynext_fixed_split_target_steps_per_round=4,
         yolo_fixed_split_target_steps_per_round=4,
         rfdetr_fixed_split_target_steps_per_round=4,
-    )
-    sample_pool = SimpleNamespace(
-        enabled=True,
-        root_dir=str(tmp_path / "pool"),
-        staging_root=str(tmp_path / "staging"),
+        recent_training_window_root=str(tmp_path / "recent_training_windows"),
         split_contract_root=str(tmp_path / "contracts"),
-        max_samples=32,
-        shard_size=1,
-        enable_timing_logs=False,
-        enable_coordinate_debug=False,
     )
     return SimpleNamespace(
         edge_model_name="yolo26n",
@@ -81,7 +72,7 @@ def _config(tmp_path, *, async_enabled: bool):
         weights_path="",
         workspace_root=str(tmp_path / "workspace"),
         continual_learning=continual_learning,
-        sample_pool=sample_pool,
+        training_frame_count=2,
         das=None,
         tinynext_input_size=320,
     )
@@ -171,79 +162,6 @@ def _candidate_with_shard_ref(
         "input_tensor_shape": [1, 3, 16, 16],
         "input_resize_mode": "direct_resize",
     }
-
-
-def test_cache_label_format_is_accepted_by_cloud_sample_pool(tmp_path) -> None:
-    boundary, contract = _boundary_and_contract()
-    pool = CloudSamplePool(
-        str(tmp_path / "pool"),
-        model_id="yolo26n",
-        front_version="0",
-        split_config_id="split-a",
-        edge_id=1,
-        staging_root=str(tmp_path / "staging"),
-    )
-
-    stage_stats = pool.stage_low_quality_samples(
-        [
-            _candidate_with_shard_ref(
-                tmp_path,
-                sample_id="sample-1",
-                boundary=boundary,
-                contract=contract,
-                labels={
-                    "boxes": [[1, 2, 3, 4]],
-                    "labels": [1],
-                    "scores": [0.9],
-                    "label_coordinate_space": "original_xyxy",
-                },
-            )
-        ]
-    )
-    rebuild_stats, kept = pool.rebuild_canonical_training_pool(
-        split_contract=contract,
-        existing_active_samples=[],
-        pending_high_quality_samples=[],
-        new_low_quality_samples=pool.load_staging_low_quality_samples(),
-    )
-
-    assert stage_stats["accepted_to_staging"] == 1
-    assert rebuild_stats["validation"]["accepted_low_quality"] == 1
-    assert kept[0].label_source == "teacher"
-
-
-def test_unresolved_low_quality_sample_is_not_staged(tmp_path) -> None:
-    boundary, contract = _boundary_and_contract()
-    pool = CloudSamplePool(
-        str(tmp_path / "pool"),
-        model_id="yolo26n",
-        front_version="0",
-        split_config_id="split-a",
-        edge_id=1,
-        staging_root=str(tmp_path / "staging"),
-    )
-    resolved_labels = {"sample-1": {"boxes": [], "labels": []}}
-    candidates = [
-        _candidate_with_shard_ref(
-            tmp_path,
-            sample_id=sample_id,
-            boundary=boundary,
-            contract=contract,
-            labels=labels,
-        )
-        for sample_id, labels in resolved_labels.items()
-    ]
-
-    pool.stage_low_quality_samples(candidates)
-    rebuild_stats, kept = pool.rebuild_canonical_training_pool(
-        split_contract=contract,
-        existing_active_samples=[],
-        pending_high_quality_samples=[],
-        new_low_quality_samples=pool.load_staging_low_quality_samples(),
-    )
-
-    assert rebuild_stats["validation"]["accepted_low_quality"] == 1
-    assert [record.sample_id for record in kept] == ["sample-1"]
 
 
 def test_cache_hit_training_path_does_not_call_teacher_model(tmp_path) -> None:

@@ -660,7 +660,6 @@ class EdgeWorker:
                 self.sample_store,
                 server_ip=self.config.server_ip,
                 edge_id=self.edge_id,
-                sample_pool_config=getattr(self.config, "sample_pool", None),
                 feature_upload_config=getattr(self.config, "feature_upload", None),
                 context_provider=self._sample_sync_context,
                 log_internal_ids=self.log_internal_ids,
@@ -1236,12 +1235,12 @@ class EdgeWorker:
             )
             return False
 
-    def _sample_pool_shard_size(self) -> int | None:
-        sample_pool_cfg = getattr(self.config, "sample_pool", None)
-        if sample_pool_cfg is None:
+    def _feature_upload_shard_size(self) -> int | None:
+        feature_upload_cfg = getattr(self.config, "feature_upload", None)
+        if feature_upload_cfg is None:
             return None
         try:
-            return max(1, int(getattr(sample_pool_cfg, "shard_size")))
+            return max(1, int(getattr(feature_upload_cfg, "shard_max_samples")))
         except Exception:
             return None
 
@@ -2154,7 +2153,7 @@ class EdgeWorker:
                     edge_session_id=str(getattr(self, "edge_session_id", "") or ""),
                     send_low_conf_features=decision.send_low_conf_features,
                     bundle_cap_bytes=decision.bundle_cap_bytes,
-                    trigger_shard_size=self._sample_pool_shard_size(),
+                    trigger_shard_size=self._feature_upload_shard_size(),
                     bandwidth_mbps=decision.bandwidth_mbps,
                     channel=training_channel,
                     log_internal_ids=self.log_internal_ids,

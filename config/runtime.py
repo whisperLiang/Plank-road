@@ -168,7 +168,7 @@ class TeacherAnnotationConfig(ConfigSection):
 
 @dataclass
 class FeatureCacheConfig(ConfigSection):
-    view_source: str = "canonical_active"
+    view_source: str = "recent_training_window"
     materialization_mode: str = "direct_ref"
     view_root_dir: str = "./cache/cloud_training_views"
     store_root_dir: str = "./cache/cloud_feature_store"
@@ -235,18 +235,6 @@ class ContinualLearningConfig(ConfigSection):
 
 
 @dataclass
-class SamplePoolConfig(ConfigSection):
-    enabled: bool = True
-    shard_size: int = 64
-    sync_interval_sec: float = 30.0
-    max_samples: int = 5000
-    root_dir: str = "./cache/cloud_sample_pool"
-    compact_threshold: float = 0.3
-    enable_timing_logs: bool = False
-    enable_coordinate_debug: bool = False
-
-
-@dataclass
 class PureEdgeBaselineConfig(ConfigSection):
     label_source: str = "pseudo_label"
     local_metrics: bool = True
@@ -256,8 +244,6 @@ class PureEdgeBaselineConfig(ConfigSection):
     local_gt_dir: str = ""
     training_strategy: str = "surgeon_tta"
     quality_mode: str = "output_only_when_no_boundary"
-    trigger_low_quality_samples: int = 8
-    max_local_buffer_samples: int = 64
     trainable_scope: str = "norm_affine"
     consistency_weight: float = 0.01
     entropy_margin_ratio: float = 0.4
@@ -300,6 +286,7 @@ class BaselineTrainingConfig(ConfigSection):
     weight_decay: float = 0.0
     min_training_samples: int = 1
     training_window_size: int = 8
+    training_frame_count: int = 120
     microprofile_epochs: int = 1
     device: str = "auto"
     worker_infra_failure_backoff_sec: float = 10.0
@@ -514,7 +501,6 @@ class ClientConfig(ConfigSection):
     )
     feature_upload: FeatureUploadConfig = field(default_factory=FeatureUploadConfig)
     split_learning: SplitLearningConfig = field(default_factory=SplitLearningConfig)
-    sample_pool: SamplePoolConfig = field(default_factory=SamplePoolConfig)
     continual_learning: ClientContinualLearningConfig = field(
         default_factory=ClientContinualLearningConfig
     )
@@ -536,7 +522,6 @@ class ServerConfig(ConfigSection):
     continual_learning: ContinualLearningConfig = field(default_factory=ContinualLearningConfig)
     das: DASConfig = field(default_factory=DASConfig)
     workspace_root: str = "./cache/server_workspace"
-    sample_pool: SamplePoolConfig = field(default_factory=SamplePoolConfig)
     edge_affine_workers: EdgeAffineWorkersConfig = field(default_factory=EdgeAffineWorkersConfig)
     baselines: ServerBaselinesConfig = field(default_factory=ServerBaselinesConfig)
     experiment_results: ExperimentResultsConfig = field(
@@ -549,18 +534,16 @@ class RuntimeConfig(ConfigSection):
     experiment_run: ExperimentRunConfig = field(default_factory=ExperimentRunConfig)
     client: ClientConfig = field(default_factory=ClientConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
-    sample_pool: SamplePoolConfig = field(default_factory=SamplePoolConfig)
     baseline: BaselineConfig = field(default_factory=BaselineConfig)
     experiment_results: ExperimentResultsConfig = field(
         default_factory=ExperimentResultsConfig
     )
 
     def __post_init__(self) -> None:
-        self.client.sample_pool = self.sample_pool
-        self.server.sample_pool = self.sample_pool
         self.client.experiment_results = self.experiment_results
         self.server.experiment_results = self.experiment_results
         self.client.das = self.server.das
+        self.server.training_frame_count = int(self.baseline.training.training_frame_count)
 
 
 def _section(section_cls, value: Mapping[str, Any] | None):
@@ -603,7 +586,6 @@ def _section(section_cls, value: Mapping[str, Any] | None):
             known.get("feature_cache"),
         )
     elif section_cls is ClientConfig:
-        known["sample_pool"] = _section(SamplePoolConfig, known.get("sample_pool"))
         known["continual_learning"] = _section(
             ClientContinualLearningConfig,
             known.get("continual_learning"),
@@ -635,7 +617,6 @@ def _section(section_cls, value: Mapping[str, Any] | None):
             known.get("experiment_results"),
         )
     elif section_cls is ServerConfig:
-        known["sample_pool"] = _section(SamplePoolConfig, known.get("sample_pool"))
         known["continual_learning"] = _section(
             ContinualLearningConfig,
             known.get("continual_learning"),
@@ -706,18 +687,14 @@ def _section(section_cls, value: Mapping[str, Any] | None):
             ExperimentRunConfig,
             known.get("experiment_run"),
         )
-        sample_pool = _section(SamplePoolConfig, known.get("sample_pool"))
         experiment_results = _section(
             ExperimentResultsConfig,
             known.get("experiment_results"),
         )
         client_data = dict(known.get("client") or {})
-        client_data["sample_pool"] = sample_pool
         client_data["experiment_results"] = experiment_results
         server_data = dict(known.get("server") or {})
-        server_data["sample_pool"] = sample_pool
         server_data["experiment_results"] = experiment_results
-        known["sample_pool"] = sample_pool
         known["experiment_results"] = experiment_results
         known["client"] = _section(ClientConfig, client_data)
         known["server"] = _section(ServerConfig, server_data)
@@ -857,6 +834,13 @@ def _reject_removed_config_fields(config: RuntimeConfig) -> None:
             },
         ),
         "baseline": (config.baseline, {"run_id", "results_root"}),
+        "baseline.pure_edge_local_updating": (
+            config.baseline.pure_edge_local_updating,
+            {"trigger_low_quality_samples", "max_local_buffer_samples"},
+        ),
+        "runtime": (config, {"sample_pool"}),
+        "client": (config.client, {"sample_pool"}),
+        "server": (config.server, {"sample_pool"}),
         "server.edge_affine_workers": (
             config.server.edge_affine_workers,
             {"run_id"},
@@ -875,30 +859,6 @@ def _reject_removed_config_fields(config: RuntimeConfig) -> None:
             "These config fields were removed by the current experiment layout: "
             + ", ".join(removed)
             + ". Use experiment_run or CLI experiment identity fields instead."
-        )
-
-
-def _validate_sample_pool_config(name: str, value: SamplePoolConfig) -> None:
-    if not isinstance(value.enabled, bool):
-        raise ValueError(f"{name}.enabled must be a boolean, got {value.enabled!r}")
-    _validate_positive(f"{name}.shard_size", int(value.shard_size))
-    _validate_positive(f"{name}.sync_interval_sec", float(value.sync_interval_sec))
-    _validate_positive(f"{name}.max_samples", int(value.max_samples))
-    compact_threshold = float(value.compact_threshold)
-    if not 0.0 < compact_threshold <= 1.0:
-        raise ValueError(
-            f"{name}.compact_threshold must be within (0, 1], got {value.compact_threshold!r}"
-        )
-    if not isinstance(value.root_dir, str) or not value.root_dir.strip():
-        raise ValueError(f"{name}.root_dir must be non-empty")
-    if not isinstance(value.enable_timing_logs, bool):
-        raise ValueError(
-            f"{name}.enable_timing_logs must be a boolean, got {value.enable_timing_logs!r}"
-        )
-    if not isinstance(value.enable_coordinate_debug, bool):
-        raise ValueError(
-            f"{name}.enable_coordinate_debug must be a boolean, "
-            f"got {value.enable_coordinate_debug!r}"
         )
 
 
@@ -926,6 +886,18 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             "server.continual_learning.rebuild_batch_size has been removed; "
             "use server.continual_learning.batch_size for the shared "
             "cloud continual-learning batch size."
+        ),
+        "sample_pool": (
+            "sample_pool has been removed; all training paths now use "
+            "baseline.training.training_frame_count."
+        ),
+        "client.sample_pool": (
+            "client.sample_pool has been removed; all training paths now use "
+            "baseline.training.training_frame_count."
+        ),
+        "server.sample_pool": (
+            "server.sample_pool has been removed; all training paths now use "
+            "baseline.training.training_frame_count."
         ),
         "min_wrapper_fixed_split_num_epoch": (
             "server.continual_learning.min_wrapper_fixed_split_num_epoch has been removed; "
@@ -995,7 +967,6 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         if getattr(config.server.continual_learning, field_name, None) is not None:
             raise ValueError(message)
 
-    _validate_sample_pool_config("sample_pool", config.sample_pool)
     experiment_run = config.experiment_run
     if not str(experiment_run.experiment_id or "").strip():
         raise ValueError("experiment_run.experiment_id must be non-empty")
@@ -1094,9 +1065,10 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         float(teacher_threshold),
         allow_zero=True,
     )
+    training_frame_count = int(baseline_training.training_frame_count)
     resolved_window_size = _configured_value(
         ekya_cfg.window_size,
-        accuracy_cfg.trigger_window_size,
+        training_frame_count,
     )
     resolved_num_frames = _configured_value(
         ekya_cfg.num_frames,
@@ -1106,6 +1078,11 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         "server.baselines.ekya_style_cloud_scheduling.window_size",
         int(resolved_window_size),
     )
+    if int(resolved_window_size) != training_frame_count:
+        raise ValueError(
+            "server.baselines.ekya_style_cloud_scheduling.window_size must equal "
+            "baseline.training.training_frame_count"
+        )
     if int(resolved_num_frames) < int(resolved_window_size):
         raise ValueError(
             "server.baselines.ekya_style_cloud_scheduling.num_frames must be >= window_size"
@@ -1220,8 +1197,8 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     if float(baseline_training.weight_decay) < 0.0:
         raise ValueError("baseline.training.weight_decay must be >= 0")
     _validate_positive(
-        "baseline.training.training_window_size",
-        int(baseline_training.training_window_size),
+        "baseline.training.training_frame_count",
+        int(baseline_training.training_frame_count),
     )
     _validate_positive(
         "baseline.training.microprofile_epochs",
@@ -1267,14 +1244,6 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             int(legacy_tta_steps),
         )
     _validate_positive(
-        "baseline.pure_edge_local_updating.trigger_low_quality_samples",
-        int(pure_edge.trigger_low_quality_samples),
-    )
-    _validate_positive(
-        "baseline.pure_edge_local_updating.max_local_buffer_samples",
-        int(pure_edge.max_local_buffer_samples),
-    )
-    _validate_positive(
         "baseline.pure_edge_local_updating.consistency_weight",
         float(pure_edge.consistency_weight),
         allow_zero=True,
@@ -1307,17 +1276,6 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         "baseline.accuracy_trigger_cloud_retraining.trigger_window_size",
         int(accuracy_cfg.trigger_window_size),
     )
-    max_baseline_buffer_samples = max(
-        int(baseline_training.training_window_size),
-        int(accuracy_cfg.trigger_window_size),
-    )
-    if int(config.sample_pool.max_samples) < max_baseline_buffer_samples:
-        raise ValueError(
-            "sample_pool.max_samples must be >= max("
-            "baseline.training.training_window_size, "
-            "baseline.accuracy_trigger_cloud_retraining.trigger_window_size"
-            ") for cloud baseline buffers"
-        )
     _validate_positive(
         "baseline.accuracy_trigger_cloud_retraining.min_history_windows",
         int(accuracy_cfg.min_history_windows),
@@ -1750,10 +1708,10 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             "server.continual_learning.teacher_annotation.cache_root_dir must be non-empty"
         )
     feature_cache = config.server.continual_learning.feature_cache
-    if str(feature_cache.view_source).strip().lower() != "canonical_active":
+    if str(feature_cache.view_source).strip().lower() != "recent_training_window":
         raise ValueError(
             "server.continual_learning.feature_cache.view_source must be "
-            "'canonical_active', "
+            "'recent_training_window', "
             f"got {feature_cache.view_source!r}"
         )
     if not str(feature_cache.store_root_dir).strip():

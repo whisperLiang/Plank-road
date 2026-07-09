@@ -195,14 +195,7 @@ def _write_e2e_config(
     cache_root = tmp_path / "cache"
     video_path = PROJECT_ROOT / "video_data" / "road.mp4"
 
-    config["sample_pool"].update(
-        {
-            "root_dir": str(cache_root / "cloud_sample_pool"),
-            "shard_size": 1,
-            "sync_interval_sec": 1,
-            "max_samples": 32,
-        }
-    )
+    config["baseline"]["training"]["training_frame_count"] = 2
     config["client"].update(
         {
             "server_ip": f"127.0.0.1:{port}",
@@ -270,6 +263,7 @@ def _write_e2e_config(
             "proxy_eval_interval_rounds": 1,
             "proxy_eval_patience": 0,
             "max_concurrent_jobs": 1,
+            "recent_training_window_root": str(cache_root / "recent_training_windows"),
             "connectivity_smoke_only": not full_retrain,
         }
     )
@@ -343,7 +337,7 @@ def test_fixed_split_continual_learning_process_e2e(tmp_path: Path) -> None:
             r"\[EdgeCL\] training accepted",
             r"Received training request: edge=1",
             r"\[ShardCL\]\[CloudUnpack\] materialized low-quality trigger shards",
-            r"\[SamplePool\] canonical rebuild",
+            r"TrainingCacheView\(source=recent_training_window\)",
         ]
         if full_retrain:
             patterns.extend(

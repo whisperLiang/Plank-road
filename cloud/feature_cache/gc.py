@@ -9,10 +9,9 @@ from typing import Any
 from loguru import logger
 
 from cloud.feature_cache.shard_reachability import (
-    collect_refs_from_active_generations,
     collect_refs_from_pending_annotation,
     collect_refs_from_pending_feature_rebuild,
-    collect_refs_from_pending_high_quality,
+    collect_refs_from_recent_training_windows,
 )
 from cloud.feature_cache.types import FeatureCacheGCResult
 
@@ -29,7 +28,7 @@ class FeatureCacheGC:
         *,
         store_root_dir: str,
         view_root_dir: str | None = None,
-        sample_pool_root_dir: str | None = None,
+        recent_training_window_root_dir: str | None = None,
         staging_root_dir: str | None = None,
         max_live_generations: int = 3,
         dry_run: bool = False,
@@ -39,10 +38,10 @@ class FeatureCacheGC:
         self.view_root_dir = (
             None if view_root_dir in (None, "") else os.path.abspath(str(view_root_dir))
         )
-        self.sample_pool_root_dir = (
+        self.recent_training_window_root_dir = (
             None
-            if sample_pool_root_dir in (None, "")
-            else os.path.abspath(str(sample_pool_root_dir))
+            if recent_training_window_root_dir in (None, "")
+            else os.path.abspath(str(recent_training_window_root_dir))
         )
         self.staging_root_dir = (
             None if staging_root_dir in (None, "") else os.path.abspath(str(staging_root_dir))
@@ -92,10 +91,13 @@ class FeatureCacheGC:
         effective_dry_run = self.dry_run if dry_run is None else bool(dry_run)
         live = self._normalise_live_paths(live_shard_paths)
         live.update(self._view_live_paths())
-        if self.sample_pool_root_dir:
-            live.update(collect_refs_from_active_generations(self.sample_pool_root_dir))
+        if self.recent_training_window_root_dir:
+            live.update(
+                collect_refs_from_recent_training_windows(
+                    self.recent_training_window_root_dir
+                )
+            )
         if self.staging_root_dir:
-            live.update(collect_refs_from_pending_high_quality(self.staging_root_dir))
             live.update(collect_refs_from_pending_annotation(self.staging_root_dir))
             live.update(collect_refs_from_pending_feature_rebuild(self.staging_root_dir))
         result = FeatureCacheGCResult(dry_run=effective_dry_run)

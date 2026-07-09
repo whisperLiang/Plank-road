@@ -6,7 +6,6 @@ from types import SimpleNamespace
 
 import torch
 
-from cloud.orchestration.sample_stage import CanonicalSampleStage
 from cloud.training import FixedSplitProxyEvaluator
 
 
@@ -42,7 +41,7 @@ def _config(tmp_path: Path) -> SimpleNamespace:
         storage_format="safetensors_shard",
         accepted_storage_formats=["safetensors_shard", "npy_memmap_shard"],
         materialization_mode="direct_ref",
-        view_source="canonical_active",
+        view_source="recent_training_window",
     )
     continual_learning = SimpleNamespace(
         num_epoch=1,
@@ -68,16 +67,8 @@ def _config(tmp_path: Path) -> SimpleNamespace:
         tinynext_fixed_split_target_steps_per_round=4,
         yolo_fixed_split_target_steps_per_round=4,
         rfdetr_fixed_split_target_steps_per_round=4,
-    )
-    sample_pool = SimpleNamespace(
-        enabled=True,
-        root_dir=str(tmp_path / "pool"),
-        staging_root=str(tmp_path / "staging"),
+        recent_training_window_root=str(tmp_path / "recent_training_windows"),
         split_contract_root=str(tmp_path / "contracts"),
-        max_samples=32,
-        shard_size=1,
-        enable_timing_logs=False,
-        enable_coordinate_debug=False,
     )
     return SimpleNamespace(
         edge_model_name="yolo26n",
@@ -85,7 +76,7 @@ def _config(tmp_path: Path) -> SimpleNamespace:
         weights_path="",
         workspace_root=str(tmp_path / "workspace"),
         continual_learning=continual_learning,
-        sample_pool=sample_pool,
+        training_frame_count=2,
         das=None,
         tinynext_input_size=320,
     )
@@ -134,30 +125,6 @@ def test_fixed_split_dependencies_does_not_bridge_private_proxy_helpers() -> Non
     assert "import cloud.training." + "proxy_eval as " + "_proxy" + "_eval" not in source
     assert "_proxy" + "_eval." not in source
     assert "from cloud.training." + "proxy_eval import " + "_" not in source
-
-
-def test_sample_stage_preserves_canonical_rebuild_argument_order() -> None:
-    calls = {}
-
-    class FakePool:
-        def rebuild_canonical_training_pool(self, **kwargs):
-            calls.update(kwargs)
-            return {"generation_commit": {"active": 0}}, []
-
-    existing_active = [{"sample_id": "active"}]
-    pending_high_quality = [{"sample_id": "pending"}]
-    new_low_quality = [{"sample_id": "low"}]
-
-    CanonicalSampleStage(FakePool()).rebuild(
-        split_contract=object(),
-        existing_active=existing_active,
-        pending_high_quality=pending_high_quality,
-        new_low_quality=new_low_quality,
-    )
-
-    assert calls["existing_active_samples"] is existing_active
-    assert calls["pending_high_quality_samples"] is pending_high_quality
-    assert calls["new_low_quality_samples"] is new_low_quality
 
 
 def test_full_image_retrain_remains_rejected_public_stub(tmp_path) -> None:
@@ -263,35 +230,3 @@ def test_tinynext_evaluation_uses_detection_metric_without_threshold_calibration
     assert metrics["primary_metric"] == 0.42
     assert calls["max_samples"] == 30
     assert "full_proxy_evaluation_skipped" not in metrics
-
-
-def test_sample_stage_rebuild_uses_three_way_canonical_merge_order() -> None:
-    class FakePool:
-        def __init__(self) -> None:
-            self.kwargs = None
-
-        def rebuild_canonical_training_pool(self, **kwargs):
-            self.kwargs = kwargs
-            return {"validation": {"accepted_low_quality": 1}}, ["kept"]
-
-    pool = FakePool()
-    existing_active = [{"sample_id": "active"}]
-    pending_high_quality = [{"sample_id": "pending"}]
-    new_low_quality = [{"sample_id": "low"}]
-    contract = object()
-
-    result = CanonicalSampleStage(pool).rebuild(
-        split_contract=contract,
-        existing_active=existing_active,
-        pending_high_quality=pending_high_quality,
-        new_low_quality=new_low_quality,
-    )
-
-    assert pool.kwargs == {
-        "split_contract": contract,
-        "existing_active_samples": existing_active,
-        "pending_high_quality_samples": pending_high_quality,
-        "new_low_quality_samples": new_low_quality,
-    }
-    assert result.rebuild_stats["validation"]["accepted_low_quality"] == 1
-    assert result.kept_records == ["kept"]

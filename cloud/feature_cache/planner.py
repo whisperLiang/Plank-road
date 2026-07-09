@@ -238,7 +238,6 @@ class FeatureCachePlanner:
         self,
         *,
         existing_active_samples: Sequence[Mapping[str, object]] | None = None,
-        pending_high_quality_samples: Sequence[Mapping[str, object]] | None = None,
         resolved_low_quality_samples: Sequence[Mapping[str, object]] | None = None,
         unresolved_low_quality_samples: Sequence[Mapping[str, object]] | None = None,
         runtime_context: Mapping[str, object],
@@ -246,14 +245,10 @@ class FeatureCachePlanner:
         generation: str,
     ) -> FeatureCachePreparePlan:
         existing = list(existing_active_samples or [])
-        pending_hq = list(pending_high_quality_samples or [])
         resolved_lq = list(resolved_low_quality_samples or [])
         unresolved_lq = list(unresolved_low_quality_samples or [])
         stats = FeatureCacheStats(
-            requested_samples=len(existing)
-            + len(pending_hq)
-            + len(resolved_lq)
-            + len(unresolved_lq)
+            requested_samples=len(existing) + len(resolved_lq) + len(unresolved_lq)
         )
         plan = FeatureCachePreparePlan(
             view_id=str(view_id),
@@ -272,7 +267,7 @@ class FeatureCachePlanner:
                 sample,
                 runtime_context,
                 stats,
-                source=str(sample.get("feature_source") or "canonical_active"),
+                source=str(sample.get("feature_source") or "recent_training_window"),
             )
             if entry is None:
                 if _candidate_raw_path(sample):
@@ -297,29 +292,6 @@ class FeatureCachePlanner:
                 stats.existing_reused += 1
                 plan.reuse_existing_refs.append(entry)
             stats.existing_feature_ref_reused += 1
-            plan.create_training_view.append(entry)
-
-        for sample in pending_hq:
-            if not _label_valid(sample, low_quality=False):
-                stats.invalid_dropped += 1
-                plan.drop_invalid_samples.append(
-                    {"sample": dict(sample), "reason": "invalid_label"}
-                )
-                continue
-            entry = self._ref_entry(
-                sample,
-                runtime_context,
-                stats,
-                source=str(sample.get("feature_source") or "edge_uploaded"),
-            )
-            if entry is None:
-                stats.invalid_dropped += 1
-                plan.drop_invalid_samples.append(
-                    {"sample": dict(sample), "reason": "missing_or_invalid_uploaded_shard_ref"}
-                )
-                continue
-            stats.high_quality_registered += 1
-            plan.register_uploaded_feature_refs.append(entry)
             plan.create_training_view.append(entry)
 
         for sample in resolved_lq:

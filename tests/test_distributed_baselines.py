@@ -66,6 +66,7 @@ def _config(tmp_path: Path) -> SimpleNamespace:
                 learning_rate=1e-3,
                 min_training_samples=1,
                 training_window_size=8,
+                training_frame_count=2,
             ),
         ),
     )
@@ -266,40 +267,20 @@ def test_baseline_defaults_to_freeze_and_disabled_edge_split_runtime() -> None:
         pytest.approx(0.6)
     )
     assert config.baseline.edge.split_runtime_policy == "disabled"
+    assert config.baseline.training.training_frame_count == 120
 
 
-
-
-
-
-@pytest.mark.parametrize(
-    "yaml_body",
-    [
-        """
-sample_pool:
-  max_samples: 8
-baseline:
-  training:
-    training_window_size: 9
-  accuracy_trigger_cloud_retraining:
-    trigger_window_size: 8
-""",
-        """
-sample_pool:
-  max_samples: 8
-baseline:
-  training:
-    training_window_size: 8
-  accuracy_trigger_cloud_retraining:
-    trigger_window_size: 9
-""",
-    ],
-)
-def test_sample_pool_capacity_must_cover_baseline_windows(tmp_path, yaml_body: str) -> None:
+def test_removed_sample_pool_config_is_rejected(tmp_path) -> None:
     path = tmp_path / "config.yaml"
-    path.write_text(yaml_body, encoding="utf-8")
+    path.write_text(
+        """
+sample_pool:
+  max_samples: 8
+""",
+        encoding="utf-8",
+    )
 
-    with pytest.raises(ValueError, match="sample_pool.max_samples"):
+    with pytest.raises(ValueError, match="runtime.sample_pool"):
         load_runtime_config(path)
 
 
@@ -322,7 +303,6 @@ def test_default_baseline_edge_disables_main_cl_side_effects(tmp_path) -> None:
     config = _config(tmp_path)
     config.retrain = SimpleNamespace(flag=True, cache_path=str(tmp_path / "cache"))
     config.resource_aware_trigger = SimpleNamespace(enabled=True)
-    config.sample_pool = SimpleNamespace(enabled=True)
     config.split_learning = SimpleNamespace(enabled=True)
 
     policy = _configure_baseline_client_runtime(config, config.baseline)
@@ -330,7 +310,6 @@ def test_default_baseline_edge_disables_main_cl_side_effects(tmp_path) -> None:
     assert policy == "disabled"
     assert config.retrain.flag is False
     assert config.resource_aware_trigger.enabled is False
-    assert config.sample_pool.enabled is False
     assert config.split_learning.enabled is False
 
 
@@ -1047,7 +1026,6 @@ def test_cloud_controller_no_longer_exposes_training_state_machine() -> None:
         baseline_method="accuracy_trigger_cloud_retraining",
         run_id="run-a",
         results_root="unused",
-        sample_pool_max_samples=64,
         strict_run_id=False,
     )
     assert not hasattr(controller, "request_training")

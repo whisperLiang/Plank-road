@@ -81,14 +81,8 @@ def _collect_refs_from_json_files(root_dir: str) -> set[str]:
     return refs
 
 
-def collect_refs_from_active_generations(pool_root_dir: str) -> set[str]:
-    root = os.path.join(os.path.abspath(str(pool_root_dir)), "generations")
-    return _collect_refs_from_json_files(root)
-
-
-def collect_refs_from_pending_high_quality(staging_root: str) -> set[str]:
-    root = os.path.join(os.path.abspath(str(staging_root)), "pending_high_quality")
-    return _collect_refs_from_json_files(root)
+def collect_refs_from_recent_training_windows(window_root_dir: str) -> set[str]:
+    return _collect_refs_from_json_files(os.path.abspath(str(window_root_dir)))
 
 
 def collect_refs_from_pending_annotation(staging_root: str) -> set[str]:
@@ -126,10 +120,9 @@ def is_shard_reachable(
 
 
 __all__ = [
-    "collect_refs_from_active_generations",
     "collect_refs_from_pending_annotation",
     "collect_refs_from_pending_feature_rebuild",
-    "collect_refs_from_pending_high_quality",
+    "collect_refs_from_recent_training_windows",
     "collect_refs_from_training_views",
     "is_shard_reachable",
 ]

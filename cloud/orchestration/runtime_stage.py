@@ -273,7 +273,6 @@ from cloud.orchestration.fixed_split_dependencies import (
     _sanitize_cache_segment,
     _stable_json_dumps,
 )
-from cloud.sample_pool import align_sample_feature_contract
 from model_management.payload import BoundaryPayload
 from model_management.split_contract import (
     SplitRuntimeContract,
@@ -377,102 +376,6 @@ class FixedSplitRuntimeContractMixin:
 
         return normalised_specs(actual) == normalised_specs(expected)
 
-    def _log_pending_high_quality_layout_alignment(
-        self,
-        *,
-        pending_high_quality: list[Mapping[str, object]],
-        split_contract: SplitRuntimeContract,
-        expected_source: str,
-        low_quality_tensors: Mapping[str, torch.Tensor] | None,
-    ) -> None:
-        if not pending_high_quality:
-            return
-        expected_layout = dict(split_contract.feature_layout or {})
-        expected_layout_id = str(split_contract.feature_layout_id or "")
-        low_quality_layout = (
-            feature_layout_from_tensors(low_quality_tensors)
-            if low_quality_tensors is not None
-            else None
-        )
-        compatible = 0
-        renamed_compatible = 0
-        mismatches: list[dict[str, object]] = []
-        shard_validator = ShardFeatureRefValidator()
-        for candidate in pending_high_quality:
-            alignment = align_sample_feature_contract(
-                candidate,
-                split_contract=split_contract,
-                input_source="pending_high_quality",
-                shard_validator=shard_validator,
-            )
-            if alignment.status == "accepted":
-                compatible += 1
-                continue
-            if len(mismatches) < 5:
-                actual_layout = (
-                    dict(alignment.validation.feature_layout or {})
-                    if alignment.validation is not None
-                    else {}
-                )
-                mismatches.append(
-                    {
-                        "sample_id": str(candidate.get("sample_id") or ""),
-                        "reason": alignment.reason or alignment.status,
-                        "feature_layout": actual_layout,
-                        "expected_feature_layout_id": expected_layout_id,
-                        "expected_feature_layout": expected_layout,
-                        "expected_source": expected_source,
-                        "source_metadata": dict(
-                            candidate.get("source_metadata")
-                            if isinstance(candidate.get("source_metadata"), Mapping)
-                            else {}
-                        )
-                        or {
-                            key: candidate[key]
-                            for key in (
-                                "feature_abi_id",
-                                "source_feature_abi_id",
-                                "source_feature_layout_id",
-                                "source_feature_schema_hash",
-                                "source_feature_value_schema_hash",
-                                "source_feature_split_id",
-                                "source_feature_graph_signature",
-                                "rebinding_reason",
-                            )
-                            if candidate.get(key) is not None
-                        },
-                    }
-                )
-        logger.info(
-            "[SamplePool] pending high-quality layout alignment: pending={} "
-            "compatible={} renamed={} mismatched={}.",
-            len(pending_high_quality),
-            compatible,
-            renamed_compatible,
-            len(pending_high_quality) - compatible,
-        )
-        log_diagnostic_debug(
-            self,
-            "[SamplePool] pending high-quality layout diagnostics",
-            lambda: {
-                "expected_source": expected_source,
-                "expected_feature_layout_id": expected_layout_id,
-                "low_quality_feature_layout_id": (
-                    make_feature_layout_id(low_quality_layout) if low_quality_layout else ""
-                ),
-            },
-        )
-        if mismatches:
-            logger.info(
-                "[SamplePool] deferred feature-only samples: count={} reason=layout_mismatch.",
-                len(mismatches),
-            )
-            log_diagnostic_debug(
-                self,
-                "[SamplePool] deferred feature-only sample diagnostics",
-                lambda: {"mismatches": mismatches},
-            )
-
     def _contract_layout_tensors_from_runtime(
         self,
         *,
@@ -523,7 +426,7 @@ class FixedSplitRuntimeContractMixin:
         edge_id: int | str,
         manifest: Mapping[str, object],
     ) -> SplitRuntimeContract | None:
-        context = self._sample_pool_manifest_context(manifest)
+        context = self._training_window_manifest_context(manifest)
         model_id = str(context.get("model_id") or self.edge_model_name)
         split_config_id = str(context.get("split_config_id") or "").strip()
         if not split_config_id:
@@ -637,7 +540,7 @@ class FixedSplitRuntimeContractMixin:
         cloud_batch_split_id: str,
         feature_layout_id: str,
     ) -> dict[str, object]:
-        context = self._sample_pool_manifest_context(manifest)
+        context = self._training_window_manifest_context(manifest)
         split_plan = dict(manifest.get("split_plan", {}) or {})
         cloud_runtime_contract = dict(manifest.get("_cloud_runtime_contract") or {})
         runtime = getattr(splitter, "runtime", splitter)
@@ -696,7 +599,7 @@ class FixedSplitRuntimeContractMixin:
         bundle_root: str | None = None,
         create_if_missing: bool = False,
     ) -> SplitRuntimeContract:
-        context = self._sample_pool_manifest_context(manifest)
+        context = self._training_window_manifest_context(manifest)
         model_id = str(context.get("model_id") or self.edge_model_name)
         split_config_id = str(context.get("split_config_id") or "").strip()
         if not split_config_id:

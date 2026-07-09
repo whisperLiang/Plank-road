@@ -418,7 +418,7 @@ class FeatureCacheMaterializer:
         feature_layout_id: str,
         contract_id: str,
         entries: Sequence[Mapping[str, object]],
-        source: str = "canonical_active",
+        source: str = "recent_training_window",
         feature_abi_id: str = "",
         runtime_identity_id: str = "",
         records: Mapping[str, Mapping[str, object]] | None = None,
@@ -576,7 +576,7 @@ class FeatureCacheMaterializer:
             bundle_info={
                 "manifest": {},
                 "all_sample_ids": [sample.sample_id for sample in sample_refs],
-                "from_sample_pool": True,
+                "from_recent_training_window": str(source) == "recent_training_window",
                 "generation_id": generation,
                 "training_view_id": view_id,
                 "training_view_path": view_dir,

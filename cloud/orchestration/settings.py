@@ -52,16 +52,6 @@ class TeacherAnnotationSettings:
 
 
 @dataclass(frozen=True)
-class SamplePoolSettings:
-    enabled: bool
-    root_dir: str
-    staging_root: str
-    split_contract_root: str
-    max_active_samples: int | None
-    shard_size: int
-
-
-@dataclass(frozen=True)
 class OrchestrationSettings:
     edge_model_name: str
     workspace_root: str
@@ -72,35 +62,20 @@ class OrchestrationSettings:
     fixed_split_runtime_smoke_validate: bool
     fixed_split_runtime_diagnostics: bool
     log_internal_ids: bool
+    training_frame_count: int
+    recent_training_window_root: str
+    split_contract_root: str
     feature_cache: FeatureCacheSettings
     teacher_annotation: TeacherAnnotationSettings
-    sample_pool: SamplePoolSettings
 
     @classmethod
     def from_config(cls, config: Any) -> "OrchestrationSettings":
         cl_cfg = getattr(config, "continual_learning", None)
         feature_cache_cfg = getattr(cl_cfg, "feature_cache", None) if cl_cfg is not None else None
-        sample_pool_cfg = getattr(config, "sample_pool", None)
         workspace_root = os.path.abspath(
             str(getattr(config, "workspace_root", "./cache/server_workspace"))
         )
-        sample_pool_root = os.path.abspath(
-            str(
-                getattr(
-                    sample_pool_cfg,
-                    "root_dir",
-                    os.path.join(workspace_root, "cloud_sample_pool"),
-                )
-            )
-        )
         teacher_cfg = getattr(cl_cfg, "teacher_annotation", None) if cl_cfg is not None else None
-        raw_sample_pool_max = (
-            getattr(sample_pool_cfg, "max_samples", None)
-            if sample_pool_cfg is not None
-            else getattr(cl_cfg, "sample_pool_max_active_samples", None)
-            if cl_cfg
-            else None
-        )
         return cls(
             edge_model_name=str(getattr(config, "edge_model_name", "rfdetr_nano")),
             workspace_root=workspace_root,
@@ -119,6 +94,19 @@ class OrchestrationSettings:
             if cl_cfg
             else False,
             log_internal_ids=bool(getattr(cl_cfg, "log_internal_ids", False)) if cl_cfg else False,
+            training_frame_count=max(1, int(getattr(config, "training_frame_count", 120))),
+            recent_training_window_root=os.path.abspath(
+                str(
+                    getattr(
+                        cl_cfg,
+                        "recent_training_window_root",
+                        os.path.join(workspace_root, "recent_training_windows"),
+                    )
+                )
+            ),
+            split_contract_root=os.path.abspath(
+                str(getattr(cl_cfg, "split_contract_root", "./cache/split_contracts"))
+            ),
             feature_cache=FeatureCacheSettings(
                 store_root_dir=os.path.abspath(
                     str(
@@ -155,7 +143,9 @@ class OrchestrationSettings:
                 )
                 .strip()
                 .lower(),
-                view_source=str(getattr(feature_cache_cfg, "view_source", "canonical_active"))
+                view_source=str(
+                    getattr(feature_cache_cfg, "view_source", "recent_training_window")
+                )
                 .strip()
                 .lower(),
             ),
@@ -171,36 +161,6 @@ class OrchestrationSettings:
                 cache_root_dir=os.path.abspath(
                     str(getattr(teacher_cfg, "cache_root_dir", "./cache/teacher_label_cache"))
                 ),
-            ),
-            sample_pool=SamplePoolSettings(
-                enabled=bool(getattr(sample_pool_cfg, "enabled", True))
-                if sample_pool_cfg is not None
-                else True,
-                root_dir=sample_pool_root,
-                staging_root=os.path.abspath(
-                    str(
-                        getattr(
-                            sample_pool_cfg,
-                            "staging_root",
-                            os.path.join(os.path.dirname(sample_pool_root), "cloud_sample_staging"),
-                        )
-                    )
-                ),
-                split_contract_root=os.path.abspath(
-                    str(
-                        getattr(
-                            sample_pool_cfg,
-                            "split_contract_root",
-                            os.path.join(os.path.dirname(workspace_root), "split_contracts"),
-                        )
-                    )
-                ),
-                max_active_samples=None
-                if raw_sample_pool_max in (None, "", 0)
-                else int(raw_sample_pool_max),
-                shard_size=max(1, int(getattr(sample_pool_cfg, "shard_size", 64)))
-                if sample_pool_cfg is not None
-                else 64,
             ),
         )
 
@@ -306,6 +266,7 @@ class PipelineLifecycleMixin:
         self.trace_batch_size = settings.trace_batch_size
         self.fixed_split_runtime_smoke_validate = settings.fixed_split_runtime_smoke_validate
         self.fixed_split_runtime_diagnostics = settings.fixed_split_runtime_diagnostics
+        self.training_frame_count = settings.training_frame_count
         self.feature_cache_mode = (
             (str(getattr(cl_cfg, "feature_cache_mode", "auto")) if cl_cfg else "auto")
             .strip()
@@ -317,9 +278,10 @@ class PipelineLifecycleMixin:
             )
         feature_cache_cfg = getattr(cl_cfg, "feature_cache", None) if cl_cfg is not None else None
         self.feature_cache_view_source = settings.feature_cache.view_source
-        if self.feature_cache_view_source != "canonical_active":
+        if self.feature_cache_view_source != "recent_training_window":
             raise ValueError(
-                "server.continual_learning.feature_cache.view_source must be 'canonical_active'."
+                "server.continual_learning.feature_cache.view_source must be "
+                "'recent_training_window'."
             )
         self.feature_cache_materialization_mode = settings.feature_cache.materialization_mode
         if self.feature_cache_materialization_mode != "direct_ref":
@@ -460,26 +422,10 @@ class PipelineLifecycleMixin:
         self.workspace_root = settings.workspace_root
         os.makedirs(self.feature_cache_store_root_dir, exist_ok=True)
         os.makedirs(self.feature_cache_view_root_dir, exist_ok=True)
-        sample_pool_cfg = getattr(config, "sample_pool", None)
-        self.sample_pool_enabled = settings.sample_pool.enabled
-        self.sample_pool_root = settings.sample_pool.root_dir
-        os.makedirs(self.sample_pool_root, exist_ok=True)
-        self.sample_pool_staging_root = settings.sample_pool.staging_root
-        os.makedirs(self.sample_pool_staging_root, exist_ok=True)
-        self.split_contract_root = settings.sample_pool.split_contract_root
+        self.recent_training_window_root = settings.recent_training_window_root
+        os.makedirs(self.recent_training_window_root, exist_ok=True)
+        self.split_contract_root = settings.split_contract_root
         os.makedirs(self.split_contract_root, exist_ok=True)
-        self.sample_pool_max_active_samples = settings.sample_pool.max_active_samples
-        self.sample_pool_shard_size = settings.sample_pool.shard_size
-        self.sample_pool_enable_timing_logs = (
-            bool(getattr(sample_pool_cfg, "enable_timing_logs", False))
-            if sample_pool_cfg is not None
-            else False
-        )
-        self.sample_pool_enable_coordinate_debug = (
-            bool(getattr(sample_pool_cfg, "enable_coordinate_debug", False))
-            if sample_pool_cfg is not None
-            else False
-        )
         self._fixed_split_runtime_template_cache = get_fixed_split_runtime_template_cache()
 
         # Dynamic Activation Sparsity (SURGEON) config

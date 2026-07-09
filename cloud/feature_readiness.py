@@ -14,7 +14,6 @@ from cloud.feature_cache import (
     FeatureCachePlanner,
     FeatureShardStore,
 )
-from cloud.sample_pool import CloudSamplePool
 from cloud.training.proxy_metadata import (
     is_low_quality_trigger_sample as _is_low_quality_trigger_sample,
 )
@@ -226,7 +225,7 @@ class FeatureReadinessService:
             unresolved_low_quality_samples=unresolved_lq,
             runtime_context=runtime_context,
             view_id="low_quality_feature_readiness",
-            generation="pending_canonical_rebuild",
+            generation="pending_recent_training_window",
         )
         rebuilt_entries = self.materializer(
             store,
@@ -236,19 +235,17 @@ class FeatureReadinessService:
         entries.extend(rebuilt_entries)
         return entries
 
-    def build_training_cache_view_from_canonical_active(
+    def build_training_cache_view_from_recent_samples(
         self,
-        sample_pool: CloudSamplePool,
         *,
+        samples: list[Mapping[str, object]],
         contract: SplitRuntimeContract,
         model_name: str,
         edge_id: int | str,
         pool_annotations_from_labels: Callable[[Mapping[str, object]], dict[str, object]],
     ):
-        active_samples = sample_pool.load_active_samples_for_rebuild(
-            split_contract=contract,
-        )
-        generation_id = sample_pool.current_generation_id() or "none"
+        recent_samples = [dict(sample) for sample in list(samples or [])]
+        generation_id = "recent_training_window"
         view_id = (
             f"edge_{_sanitize_segment(edge_id)}_"
             f"{_sanitize_segment(model_name)}_"
@@ -266,7 +263,7 @@ class FeatureReadinessService:
             log_internal_ids=cfg.log_internal_ids,
         )
         plan = planner.build_plan(
-            existing_active_samples=active_samples,
+            existing_active_samples=recent_samples,
             runtime_context=self.runtime_context(
                 contract=contract,
                 model_name=model_name,
@@ -282,45 +279,49 @@ class FeatureReadinessService:
             ]
             log_diagnostic_debug(
                 self.config,
-                "[FeatureCache][CanonicalActive] dropped sample diagnostics",
+                "[FeatureCache][RecentTrainingWindow] dropped sample diagnostics",
                 lambda: {"sample_ids_preview": dropped_ids},
             )
             raise RuntimeError(
-                "Canonical active samples could not all be direct-referenced into "
+                "Recent training-window samples could not all be direct-referenced into "
                 f"the training view: dropped={len(plan.drop_invalid_samples)}."
             )
         result = self.materializer(store).prepare(plan)
         if result.view is None:
             raise RuntimeError("Feature cache materializer did not create a TrainingCacheView.")
-        active_ids = {str(sample.get("sample_id") or "") for sample in active_samples}
+        active_ids = {str(sample.get("sample_id") or "") for sample in recent_samples}
         view_ids = {sample.sample_id for sample in result.view.samples}
         if active_ids != view_ids:
             log_diagnostic_debug(
                 self.config,
-                "[FeatureCache][CanonicalActive] mismatch diagnostics",
+                "[FeatureCache][RecentTrainingWindow] mismatch diagnostics",
                 lambda: {
                     "missing_from_view": sorted(active_ids - view_ids),
                     "unexpected_in_view": sorted(view_ids - active_ids),
                 },
             )
             raise RuntimeError(
-                "TrainingCacheView(source=canonical_active) sample mismatch: "
+                "TrainingCacheView(source=recent_training_window) sample mismatch: "
                 f"active={len(active_ids)} view={len(view_ids)}."
             )
         if int(result.stats.files_copied) != 0 or int(result.stats.bytes_copied) != 0:
             raise RuntimeError(
-                "TrainingCacheView(source=canonical_active) must use direct refs "
+                "TrainingCacheView(source=recent_training_window) must use direct refs "
                 f"only; files_copied={result.stats.files_copied} "
                 f"bytes_copied={result.stats.bytes_copied}."
             )
+        result.view.source = "recent_training_window"
+        result.bundle_info["feature_cache_view_source"] = "recent_training_window"
+        result.bundle_info["from_recent_training_window"] = True
         logger.info(
-            "[FeatureCache][CanonicalActive] generation={} active={} source=canonical_active.",
+            "[FeatureCache][RecentTrainingWindow] generation={} samples={} "
+            "source=recent_training_window.",
             generation_id,
             len(active_ids),
         )
         log_diagnostic_debug(
             self.config,
-            "[FeatureCache][CanonicalActive] diagnostics",
+            "[FeatureCache][RecentTrainingWindow] diagnostics",
             lambda: {"view_id": view_id},
         )
         gt_annotations = {

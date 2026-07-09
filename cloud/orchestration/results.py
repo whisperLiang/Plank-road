@@ -24,12 +24,3 @@ class SampleSyncResult:
 
     def as_tuple(self) -> tuple[bool, str, int]:
         return self.success, self.message, self.committed_samples
-
-
-@dataclass(frozen=True)
-class SampleRebuildResult:
-    rebuild_stats: dict[str, Any]
-    kept_records: list[Any]
-    existing_active: list[dict[str, Any]]
-    pending_high_quality: list[dict[str, Any]]
-    staging_low_quality: list[dict[str, Any]]

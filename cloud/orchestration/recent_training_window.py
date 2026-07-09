@@ -1,0 +1,150 @@
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import tempfile
+import time
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any
+
+
+_STATE_FILE = "recent_training_window.json"
+_SEQUENCE_KEY = "__recent_window_sequence"
+_ADDED_AT_KEY = "__recent_window_added_at"
+
+
+@dataclass(frozen=True)
+class RecentWindowAppendStats:
+    accepted: int
+    replaced: int
+    retained: int
+    dropped_old: int
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "accepted": int(self.accepted),
+            "replaced": int(self.replaced),
+            "retained": int(self.retained),
+            "dropped_old": int(self.dropped_old),
+        }
+
+
+class RecentTrainingWindowStore:
+    """Persistent sliding window of method-eligible training samples."""
+
+    def __init__(self, root_dir: str, *, max_samples: int) -> None:
+        self.root_dir = os.path.abspath(str(root_dir))
+        self.max_samples = max(1, int(max_samples))
+        self.state_path = os.path.join(self.root_dir, _STATE_FILE)
+
+    def append_samples(
+        self,
+        samples: Sequence[Mapping[str, object]],
+        *,
+        sample_source: str = "",
+    ) -> RecentWindowAppendStats:
+        state = self._load_state()
+        existing = {
+            str(sample.get("sample_id") or ""): dict(sample)
+            for sample in list(state.get("samples", []) or [])
+            if isinstance(sample, Mapping) and str(sample.get("sample_id") or "")
+        }
+        next_sequence = int(state.get("next_sequence") or 0)
+        accepted = 0
+        replaced = 0
+        now = time.time()
+        for raw_sample in list(samples or []):
+            if not isinstance(raw_sample, Mapping):
+                continue
+            sample = dict(raw_sample)
+            sample_id = str(sample.get("sample_id") or "").strip()
+            if not sample_id:
+                continue
+            if sample_id in existing:
+                replaced += 1
+            sample[_SEQUENCE_KEY] = next_sequence
+            sample[_ADDED_AT_KEY] = now
+            if sample_source and not sample.get("sample_source"):
+                sample["sample_source"] = str(sample_source)
+            existing[sample_id] = sample
+            next_sequence += 1
+            accepted += 1
+
+        ordered = sorted(
+            existing.values(),
+            key=lambda sample: (
+                int(sample.get(_SEQUENCE_KEY) or 0),
+                str(sample.get("sample_id") or ""),
+            ),
+        )
+        dropped_old = max(0, len(ordered) - self.max_samples)
+        retained = ordered[-self.max_samples :]
+        self._write_state({"next_sequence": next_sequence, "samples": retained})
+        return RecentWindowAppendStats(
+            accepted=accepted,
+            replaced=replaced,
+            retained=len(retained),
+            dropped_old=dropped_old,
+        )
+
+    def latest_samples(self, count: int | None = None) -> list[dict[str, object]]:
+        limit = self.max_samples if count in (None, 0) else max(1, int(count))
+        state = self._load_state()
+        samples = [
+            dict(sample)
+            for sample in list(state.get("samples", []) or [])
+            if isinstance(sample, Mapping) and str(sample.get("sample_id") or "")
+        ]
+        samples.sort(
+            key=lambda sample: (
+                int(sample.get(_SEQUENCE_KEY) or 0),
+                str(sample.get("sample_id") or ""),
+            )
+        )
+        selected = samples[-limit:]
+        return [_strip_internal_fields(sample) for sample in selected]
+
+    def sample_count(self) -> int:
+        return len(self.latest_samples(self.max_samples))
+
+    def reset(self) -> None:
+        shutil.rmtree(self.root_dir, ignore_errors=True)
+
+    def _load_state(self) -> dict[str, Any]:
+        try:
+            with open(self.state_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            return payload if isinstance(payload, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except Exception:
+            return {}
+
+    def _write_state(self, payload: Mapping[str, object]) -> None:
+        os.makedirs(self.root_dir, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".recent_training_window.",
+            suffix=".json",
+            dir=self.root_dir,
+            text=True,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(dict(payload), handle, indent=2, sort_keys=True)
+                handle.write("\n")
+            os.replace(tmp_path, self.state_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+
+def _strip_internal_fields(sample: Mapping[str, object]) -> dict[str, object]:
+    clean = dict(sample)
+    clean.pop(_SEQUENCE_KEY, None)
+    clean.pop(_ADDED_AT_KEY, None)
+    return clean
+
+
+__all__ = ["RecentTrainingWindowStore", "RecentWindowAppendStats"]

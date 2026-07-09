@@ -100,6 +100,7 @@ def _runtime(tmp_path: Path):
                 learning_rate=1.0e-5,
                 optimizer_name="adamw",
                 weight_decay=0.0,
+                training_frame_count=2,
             ),
         ),
     )
@@ -490,6 +491,7 @@ def test_ekya_config_inherits_shared_plank_road_settings() -> None:
     runtime.baseline.accuracy_trigger_cloud_retraining.agreement_iou_threshold = 0.6
     runtime.baseline.accuracy_trigger_cloud_retraining.training_strategy = "freeze"
     runtime.baseline.accuracy_trigger_cloud_retraining.trainable_param_ratio = 0.25
+    runtime.baseline.training.training_frame_count = 12
     runtime.baseline.training.microprofile_epochs = 3
     runtime.baseline.training.min_training_samples = 2
     runtime.baseline.training.optimizer_name = "sgd"
@@ -895,7 +897,7 @@ def test_cloud_frame_buffer_keeps_streams_separate(tmp_path: Path) -> None:
     assert len({window.window_id for window in windows}) == 2
 
 
-def test_cloud_frame_buffer_completes_final_partial_window(tmp_path: Path) -> None:
+def test_cloud_frame_buffer_skips_final_partial_window(tmp_path: Path) -> None:
     buffer = CloudFrameBuffer(window_size=2, output_dir=tmp_path, num_frames=3)
 
     buffer.append_packet(_packet(1), timestamp_cloud_receive=1.0, decode=False)
@@ -906,8 +908,7 @@ def test_cloud_frame_buffer_completes_final_partial_window(tmp_path: Path) -> No
     final = buffer.completed_windows()
 
     assert [window.frame_indices for window in first] == [(1, 2)]
-    assert [window.frame_indices for window in final] == [(3,)]
-    assert final[0].window_id == "1:0:1:3:3"
+    assert final == []
 
 
 @pytest.mark.parametrize(

@@ -389,8 +389,6 @@ def _configure_baseline_client_runtime(config, baseline_config) -> str:
         config.retrain.flag = False
     if getattr(config, "resource_aware_trigger", None) is not None:
         config.resource_aware_trigger.enabled = False
-    if getattr(config, "sample_pool", None) is not None:
-        config.sample_pool.enabled = False
     split_learning = getattr(config, "split_learning", None)
     if split_learning is not None:
         split_learning.enabled = False
@@ -1261,8 +1259,6 @@ if __name__ == "__main__":
                 config.retrain.flag = False
             if getattr(config, "resource_aware_trigger", None) is not None:
                 config.resource_aware_trigger.enabled = False
-            if getattr(config, "sample_pool", None) is not None:
-                config.sample_pool.enabled = False
             split_learning = getattr(config, "split_learning", None)
             if split_learning is not None:
                 split_learning.enabled = False

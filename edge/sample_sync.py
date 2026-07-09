@@ -458,7 +458,6 @@ class HighQualitySampleSyncer:
         *,
         server_ip: str,
         edge_id: int,
-        sample_pool_config: object | None = None,
         feature_upload_config: object | None = None,
         shard_size: int | None = None,
         sync_interval_sec: float | None = None,
@@ -471,25 +470,13 @@ class HighQualitySampleSyncer:
         self.edge_id = int(edge_id)
         self.shard_size = max(
             1,
-            int(
-                getattr(
-                    sample_pool_config,
-                    "shard_size",
-                    64 if shard_size is None else shard_size,
-                )
-            ),
+            int(64 if shard_size is None else shard_size),
         )
         self.sync_interval_sec = max(
             0.1,
-            float(
-                getattr(
-                    sample_pool_config,
-                    "sync_interval_sec",
-                    30.0 if sync_interval_sec is None else sync_interval_sec,
-                )
-            ),
+            float(30.0 if sync_interval_sec is None else sync_interval_sec),
         )
-        self.enabled = bool(getattr(sample_pool_config, "enabled", enabled))
+        self.enabled = bool(enabled)
         self.storage_format = str(
             getattr(feature_upload_config, "storage_format", "safetensors_shard")
             or "safetensors_shard"

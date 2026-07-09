@@ -971,6 +971,7 @@ def _training_config_dict(config: object | None) -> dict[str, Any]:
         "weight_decay",
         "min_training_samples",
         "training_window_size",
+        "training_frame_count",
         "microprofile_epochs",
         "device",
         "training_failure_backoff_sec",
@@ -985,6 +986,7 @@ def _training_config_dict(config: object | None) -> dict[str, Any]:
     result.setdefault("learning_rate", 1e-3)
     result.setdefault("min_training_samples", 1)
     result.setdefault("training_window_size", 8)
+    result.setdefault("training_frame_count", 120)
     return result
 
 

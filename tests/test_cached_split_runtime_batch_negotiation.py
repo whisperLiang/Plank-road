@@ -91,8 +91,8 @@ def test_runtime_identity_uses_public_splitter_dynamic_batch_range() -> None:
     class Harness(runtime_stage.FixedSplitRuntimeContractMixin):
         edge_model_name = "rfdetr_nano"
 
-        def _sample_pool_manifest_context(self, manifest):
-            return dict(manifest["sample_pool_context"])
+        def _training_window_manifest_context(self, manifest):
+            return dict(manifest["training_window_context"])
 
     split_spec = types.SimpleNamespace(dynamic_batch=(1, 64), mode="generated_eager")
     runtime = types.SimpleNamespace(
@@ -107,7 +107,7 @@ def test_runtime_identity_uses_public_splitter_dynamic_batch_range() -> None:
         manifest={
             "model": {"model_version": "0"},
             "split_plan": {"logical_split_id": "linear_4_32"},
-            "sample_pool_context": {
+            "training_window_context": {
                 "model_id": "rfdetr_nano",
                 "front_version": "0",
                 "split_config_id": "split-config",

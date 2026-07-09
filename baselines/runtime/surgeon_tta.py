@@ -344,13 +344,9 @@ class SurgeonLocalTTAUpdater:
             persistence_windows=int(getattr(drift_cfg, "persistence_windows", 3)),
         )
 
-        self.trigger_low_quality_samples = max(
+        self.training_frame_count = max(
             1,
-            int(getattr(self.method_cfg, "trigger_low_quality_samples", 8)),
-        )
-        self.max_local_buffer_samples = max(
-            1,
-            int(getattr(self.method_cfg, "max_local_buffer_samples", 64)),
+            int(getattr(self.training_cfg, "training_frame_count", 120)),
         )
         configured_num_epoch = getattr(self.training_cfg, "num_epoch", 1)
         self.num_epoch = max(1, int(configured_num_epoch))
@@ -373,7 +369,7 @@ class SurgeonLocalTTAUpdater:
         self.optimizer_name = str(getattr(self.training_cfg, "optimizer_name", "adam"))
 
         self._edge = None
-        self._buffer: deque[_BufferedSample] = deque(maxlen=self.max_local_buffer_samples)
+        self._buffer: deque[_BufferedSample] = deque(maxlen=self.training_frame_count)
         self._lock = threading.Lock()
         self._running_thread: threading.Thread | None = None
         self._pending_local_update: PendingLocalTTAUpdate | None = None
@@ -384,11 +380,10 @@ class SurgeonLocalTTAUpdater:
     def attach_edge(self, edge) -> None:
         self._edge = edge
         logger.info(
-            "[PureEdgeSURGEON] attached trigger_low_quality_samples={} "
-            "max_local_buffer_samples={} num_epoch={} batch_size={} quality_mode={} "
+            "[PureEdgeSURGEON] attached training_frame_count={} "
+            "num_epoch={} batch_size={} quality_mode={} "
             "das_enabled={}",
-            self.trigger_low_quality_samples,
-            self.max_local_buffer_samples,
+            self.training_frame_count,
             self.num_epoch,
             self.batch_size,
             self.quality_mode,
@@ -430,25 +425,27 @@ class SurgeonLocalTTAUpdater:
         )
         with self._lock:
             self._buffer.append(sample)
-            if len(self._buffer) < self.trigger_low_quality_samples:
+            if len(self._buffer) < self.training_frame_count:
                 return
             if self._running_thread is not None and self._running_thread.is_alive():
                 return
             if self._pending_local_update is not None:
                 return
-            selected = list(self._buffer)[: min(len(self._buffer), self.batch_size)]
+            selected = list(self._buffer)[-int(self.training_frame_count) :]
             logger.info(
-                "[PureEdgeSURGEON] local TTA triggered: low_quality={} batch_size={} "
-                "trigger_frame={}",
+                "[PureEdgeSURGEON] local TTA triggered: low_quality={} "
+                "training_frame_count={} mini_batch_size={} trigger_frame={}",
                 len(self._buffer),
                 len(selected),
+                self.batch_size,
                 int(frame_index),
             )
             self.metrics.record(
                 "surgeon_tta_triggered",
                 frame_id=int(frame_index),
                 low_quality_sample_count=len(self._buffer),
-                batch_size=len(selected),
+                batch_size=int(self.batch_size),
+                training_frame_count=len(selected),
             )
             self._running_thread = threading.Thread(
                 target=self._run_tta_task,
@@ -562,7 +559,6 @@ class SurgeonLocalTTAUpdater:
 
     def _run_tta_task(self, samples: list[_BufferedSample], trigger_frame_id: int) -> None:
         started = time.perf_counter()
-        frame_ids = {int(sample.frame_id) for sample in samples}
         self.metrics.record(
             "surgeon_tta_started",
             frame_id=int(trigger_frame_id),
@@ -621,10 +617,6 @@ class SurgeonLocalTTAUpdater:
                 )
         finally:
             with self._lock:
-                self._buffer = deque(
-                    (sample for sample in self._buffer if int(sample.frame_id) not in frame_ids),
-                    maxlen=self.max_local_buffer_samples,
-                )
                 self._running_thread = None
 
     def _execute_tta(
@@ -877,7 +869,14 @@ class SurgeonLocalTTAUpdater:
         model_version_before: str,
     ) -> dict[str, Any]:
         trainable_model = adapter.trainable_model
-        batch = _move_batch_to_device(batch, _model_device(trainable_model))
+        training_device = _model_device(trainable_model)
+        batch = list(batch)
+        total_sample_count = len(batch)
+        mini_batch_size = max(1, int(self.batch_size))
+        mini_batches = [
+            batch[index : index + mini_batch_size]
+            for index in range(0, total_sample_count, mini_batch_size)
+        ]
         previous_mode = bool(getattr(trainable_model, "training", False))
         module_training_state = _module_training_state(trainable_model)
         grad_state = _parameter_grad_state(trainable_model)
@@ -885,13 +884,16 @@ class SurgeonLocalTTAUpdater:
         self.metrics.record(
             "surgeon_tta_shadow_train_started",
             frame_id=int(trigger_frame_id),
-            batch_size=int(len(batch)),
+            batch_size=int(total_sample_count),
+            mini_batch_size=int(mini_batch_size),
             num_epoch=int(self.num_epoch),
             model_version_before=str(model_version_before),
         )
         logger.info(
-            "[PureEdgeSURGEON] shadow training started: batch_size={} epochs={}",
-            int(len(batch)),
+            "[PureEdgeSURGEON] shadow training started: samples={} "
+            "mini_batch_size={} epochs={}",
+            int(total_sample_count),
+            int(mini_batch_size),
             int(self.num_epoch),
         )
         try:
@@ -907,46 +909,82 @@ class SurgeonLocalTTAUpdater:
             if hasattr(trainable_model, "train"):
                 trainable_model.train(True)
             if das_trainer is not None:
-                self._probe_das(adapter, batch, trainable_model, das_trainer)
+                self._probe_das(
+                    adapter,
+                    _move_batch_to_device(mini_batches[0], training_device),
+                    trainable_model,
+                    das_trainer,
+                )
             losses: list[float] = []
             for epoch_index in range(self.num_epoch):
                 epoch_started = time.perf_counter()
                 epoch = epoch_index + 1
-                optimizer.zero_grad(set_to_none=True)
-                outputs = adapter.forward_tta_outputs(batch)
-                entropy_loss, loss_stats = adapter.entropy_loss(outputs)
-                loss = entropy_loss
-                consistency_loss_value = 0.0
-                weighted_consistency_loss_value = 0.0
-                if self.consistency_weight > 0.0:
-                    augmented = adapter.forward_tta_outputs(batch, augment=True)
-                    consistency = adapter.consistency_loss(outputs, augmented)
-                    if consistency is not None:
-                        consistency_loss_value = float(consistency.detach().item())
-                        weighted_consistency = self.consistency_weight * consistency
-                        weighted_consistency_loss_value = float(
-                            weighted_consistency.detach().item()
-                        )
-                        loss = loss + weighted_consistency
-                loss.backward()
-                optimizer.step()
-                loss_value = float(loss.detach().item())
-                entropy_loss_value = float(entropy_loss.detach().item())
+                epoch_loss_values: list[float] = []
+                epoch_entropy_values: list[float] = []
+                epoch_consistency_values: list[float] = []
+                epoch_weighted_consistency_values: list[float] = []
+                epoch_logit_count = 0
+                epoch_selected_logit_count = 0
+                for mini_batch in mini_batches:
+                    device_batch = _move_batch_to_device(mini_batch, training_device)
+                    optimizer.zero_grad(set_to_none=True)
+                    outputs = adapter.forward_tta_outputs(device_batch)
+                    entropy_loss, loss_stats = adapter.entropy_loss(outputs)
+                    loss = entropy_loss
+                    consistency_loss_value = 0.0
+                    weighted_consistency_loss_value = 0.0
+                    if self.consistency_weight > 0.0:
+                        augmented = adapter.forward_tta_outputs(device_batch, augment=True)
+                        consistency = adapter.consistency_loss(outputs, augmented)
+                        if consistency is not None:
+                            consistency_loss_value = float(consistency.detach().item())
+                            weighted_consistency = self.consistency_weight * consistency
+                            weighted_consistency_loss_value = float(
+                                weighted_consistency.detach().item()
+                            )
+                            loss = loss + weighted_consistency
+                    loss.backward()
+                    optimizer.step()
+                    epoch_loss_values.append(float(loss.detach().item()))
+                    epoch_entropy_values.append(float(entropy_loss.detach().item()))
+                    epoch_consistency_values.append(consistency_loss_value)
+                    epoch_weighted_consistency_values.append(
+                        weighted_consistency_loss_value
+                    )
+                    epoch_logit_count += int(loss_stats.get("logit_count", 0))
+                    epoch_selected_logit_count += int(
+                        loss_stats.get("selected_logit_count", 0)
+                    )
+                loss_value = float(np.mean(epoch_loss_values)) if epoch_loss_values else 0.0
+                entropy_loss_value = (
+                    float(np.mean(epoch_entropy_values)) if epoch_entropy_values else 0.0
+                )
+                consistency_loss_value = (
+                    float(np.mean(epoch_consistency_values))
+                    if epoch_consistency_values
+                    else 0.0
+                )
+                weighted_consistency_loss_value = (
+                    float(np.mean(epoch_weighted_consistency_values))
+                    if epoch_weighted_consistency_values
+                    else 0.0
+                )
                 epoch_ms = (time.perf_counter() - epoch_started) * 1000.0
                 losses.append(loss_value)
                 logger.info(
                     "[PureEdgeSURGEON][Train] epoch={}/{} loss={:.6f} "
-                    "entropy_loss={:.6f} consistency_loss={:.6f} batch_size={} "
-                    "selected_logits={}/{} model_version={} das_enabled={} "
+                    "entropy_loss={:.6f} consistency_loss={:.6f} samples={} "
+                    "mini_batch_size={} selected_logits={}/{} model_version={} das_enabled={} "
                     "epoch_ms={:.3f}",
                     epoch,
                     self.num_epoch,
                     loss_value,
                     entropy_loss_value,
                     consistency_loss_value,
-                    len(batch),
-                    int(loss_stats.get("selected_logit_count", 0)),
-                    int(loss_stats.get("logit_count", 0)),
+                    total_sample_count,
+                    mini_batch_size,
+                    epoch_selected_logit_count,
+                    epoch_logit_count,
                     model_version_before,
                     bool(das_trainer is not None),
                     epoch_ms,
@@ -960,9 +998,10 @@ class SurgeonLocalTTAUpdater:
                     entropy_loss=entropy_loss_value,
                     consistency_loss=consistency_loss_value,
                     weighted_consistency_loss=weighted_consistency_loss_value,
-                    batch_size=int(len(batch)),
-                    logit_count=int(loss_stats.get("logit_count", 0)),
-                    selected_logit_count=int(loss_stats.get("selected_logit_count", 0)),
+                    batch_size=int(total_sample_count),
+                    mini_batch_size=int(mini_batch_size),
+                    logit_count=int(epoch_logit_count),
+                    selected_logit_count=int(epoch_selected_logit_count),
                     das_enabled=bool(das_trainer is not None),
                     model_version=str(model_version_before),
                     epoch_ms=float(epoch_ms),
@@ -972,7 +1011,8 @@ class SurgeonLocalTTAUpdater:
             self.metrics.record(
                 "surgeon_tta_shadow_train_done",
                 frame_id=int(trigger_frame_id),
-                batch_size=int(len(batch)),
+                batch_size=int(total_sample_count),
+                mini_batch_size=int(mini_batch_size),
                 num_epoch=int(self.num_epoch),
                 loss=float(final_loss),
                 shadow_train_ms=float(shadow_train_ms),
@@ -981,7 +1021,7 @@ class SurgeonLocalTTAUpdater:
                 trainable_param_count=int(trainable_param_count),
             )
             return {
-                "batch_size": len(batch),
+                "batch_size": total_sample_count,
                 "loss": final_loss,
                 "das_enabled": das_trainer is not None,
                 "trainable_param_count": trainable_param_count,

@@ -235,11 +235,6 @@ class CloudServer:
                 baseline_method_config=getattr(baseline_config, method, None),
                 model_weights_path=str(getattr(config, "weights_path", "") or ""),
                 tinynext_input_size=getattr(config, "tinynext_input_size", None),
-                sample_pool_max_samples=getattr(
-                    getattr(config, "sample_pool", None),
-                    "max_samples",
-                    None,
-                ),
                 strict_run_id=True,
                 teacher_annotator=teacher_annotator,
             )

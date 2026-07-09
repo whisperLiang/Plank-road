@@ -17,7 +17,7 @@ from cloud.orchestration.fixed_split_dependencies import (
     _sanitize_cache_segment,
     _stable_json_dumps,
 )
-from cloud.sample_pool import CloudSamplePool
+from cloud.orchestration.recent_training_window import RecentTrainingWindowStore
 from common.logging_sanitizer import log_diagnostic_debug
 from model_management.split_contract import contract_path
 
@@ -61,7 +61,7 @@ def manifest_model_metadata(manifest: Mapping[str, object]) -> dict[str, object]
     return metadata
 
 
-def sample_pool_manifest_context(manifest: Mapping[str, object]) -> dict[str, object]:
+def training_window_manifest_context(manifest: Mapping[str, object]) -> dict[str, object]:
     model_meta = dict(manifest.get("model", {}) or {})
     split_plan = dict(manifest.get("split_plan", {}) or {})
     runtime_contract = dict(
@@ -160,7 +160,7 @@ class RequestContext:
 
 class RequestContextMixin:
     @staticmethod
-    def _sample_pool_manifest_context(
+    def _training_window_manifest_context(
         manifest: Mapping[str, object],
     ) -> dict[str, object]:
         model_meta = dict(manifest.get("model", {}) or {})
@@ -211,13 +211,13 @@ class RequestContextMixin:
             "runtime_contract": runtime_contract,
         }
 
-    def _cloud_sample_pool_path(
+    def _recent_training_window_path(
         self,
         *,
         edge_id: int | str,
         manifest: Mapping[str, object],
     ) -> str:
-        context = self._sample_pool_manifest_context(manifest)
+        context = self._training_window_manifest_context(manifest)
         layout_key = str(context.get("feature_layout_id", "") or "").strip()
         split_key = (
             f"feature_layout_{layout_key}"
@@ -232,57 +232,36 @@ class RequestContextMixin:
                 }
             )[:16]
         return os.path.join(
-            self.sample_pool_root,
+            self.recent_training_window_root,
             f"edge_{_sanitize_cache_segment(edge_id)}",
             _sanitize_cache_segment(context.get("model_id") or "unknown_model"),
             f"front_version_{_sanitize_cache_segment(context.get('front_version') or '0')}",
             _sanitize_cache_segment(split_key),
         )
 
-    def _cloud_sample_staging_path(
+    def _recent_training_window_model_root(
         self,
         *,
         edge_id: int | str,
         manifest: Mapping[str, object],
     ) -> str:
-        context = self._sample_pool_manifest_context(manifest)
-        layout_key = str(context.get("feature_layout_id", "") or "").strip()
-        split_key = (
-            f"feature_layout_{layout_key}"
-            if layout_key
-            else str(context.get("split_config_id", "") or "").strip()
-        )
-        if not split_key:
-            split_key = _json_fingerprint(
-                {
-                    "canonical_split_key": context.get("canonical_split_key"),
-                    "boundary_tensor_labels": list(context.get("boundary_tensor_labels", []) or []),
-                }
-            )[:16]
+        context = self._training_window_manifest_context(manifest)
         return os.path.join(
-            self.sample_pool_staging_root,
+            self.recent_training_window_root,
             f"edge_{_sanitize_cache_segment(edge_id)}",
             _sanitize_cache_segment(context.get("model_id") or "unknown_model"),
-            _sanitize_cache_segment(split_key),
+            f"front_version_{_sanitize_cache_segment(context.get('front_version') or '0')}",
         )
 
-    def _cloud_sample_pool_for_manifest(
+    def _recent_training_window_for_manifest(
         self,
         *,
         edge_id: int | str,
         manifest: Mapping[str, object],
-    ) -> CloudSamplePool:
-        context = self._sample_pool_manifest_context(manifest)
-        return CloudSamplePool(
-            self._cloud_sample_pool_path(edge_id=edge_id, manifest=manifest),
-            model_id=str(context.get("model_id", "") or ""),
-            front_version=str(context.get("front_version", "") or "0"),
-            split_config_id=str(context.get("split_config_id", "") or ""),
-            edge_id=edge_id,
-            staging_root=self._cloud_sample_staging_path(edge_id=edge_id, manifest=manifest),
-            boundary_tensor_labels=list(context.get("boundary_tensor_labels", []) or []),
-            max_active_samples=self.sample_pool_max_active_samples,
-            shard_size=self.sample_pool_shard_size,
+    ) -> RecentTrainingWindowStore:
+        return RecentTrainingWindowStore(
+            self._recent_training_window_path(edge_id=edge_id, manifest=manifest),
+            max_samples=int(self.training_frame_count),
         )
 
     @staticmethod
@@ -342,16 +321,15 @@ class RequestContextMixin:
         edge_id: int | str,
         manifest: Mapping[str, object],
         model_name: str,
-        sample_pool: CloudSamplePool,
         fallback_model_version: object = "",
         allow_without_session: bool = False,
-    ) -> CloudSamplePool:
+    ) -> None:
         model_version = self._manifest_model_version(
             manifest,
             fallback=fallback_model_version,
         )
         if not model_version:
-            return sample_pool
+            return
         try:
             is_initial_model = (
                 _normalize_model_version(
@@ -363,15 +341,15 @@ class RequestContextMixin:
         except Exception:
             is_initial_model = False
         if not is_initial_model:
-            return sample_pool
+            return
 
-        context = self._sample_pool_manifest_context(manifest)
+        context = self._training_window_manifest_context(manifest)
         model_id = str(context.get("model_id") or model_name or self.edge_model_name)
         split_config_id = str(context.get("split_config_id") or "").strip()
         front_version = str(context.get("front_version") or "0")
         edge_session_id = self._manifest_edge_session_id(manifest)
         if not edge_session_id and not allow_without_session:
-            return sample_pool
+            return
 
         reset_key = (
             _stable_json_dumps(
@@ -389,16 +367,11 @@ class RequestContextMixin:
         edge_segment = f"edge_{_sanitize_cache_segment(edge_id)}"
         model_segment = _sanitize_cache_segment(model_id)
         front_segment = f"front_version_{_sanitize_cache_segment(front_version)}"
-        pool_front_dir = os.path.join(
-            self.sample_pool_root,
+        window_front_dir = os.path.join(
+            self.recent_training_window_root,
             edge_segment,
             model_segment,
             front_segment,
-        )
-        staging_model_dir = os.path.join(
-            self.sample_pool_staging_root,
-            edge_segment,
-            model_segment,
         )
         stale_contract_dir = os.path.join(
             self.split_contract_root,
@@ -410,10 +383,13 @@ class RequestContextMixin:
 
         with self._initial_state_reset_lock:
             if reset_key and reset_key in self._initial_state_reset_sessions:
-                return sample_pool
+                return
             reset_paths = [
-                (pool_front_dir, self.sample_pool_root, "sample_pool"),
-                (staging_model_dir, self.sample_pool_staging_root, "sample_staging"),
+                (
+                    window_front_dir,
+                    self.recent_training_window_root,
+                    "recent_training_window",
+                ),
                 (stale_contract_dir, self.split_contract_root, "stale_contracts"),
             ]
             if split_config_id:
@@ -448,9 +424,7 @@ class RequestContextMixin:
             lambda: {
                 "split_config_id": split_config_id,
                 "session_id": edge_session_id,
-                "pool_front_dir": pool_front_dir,
-                "staging_model_dir": staging_model_dir,
+                "window_front_dir": window_front_dir,
                 "stale_contract_dir": stale_contract_dir,
             },
         )
-        return self._cloud_sample_pool_for_manifest(edge_id=edge_id, manifest=manifest)

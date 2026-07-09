@@ -6,15 +6,6 @@ experiment_run:
  edge_count: 1
  repeat: 1
 
-sample_pool:
- enabled: true
- shard_size: 64
- sync_interval_sec: 30
- max_samples: 500
- root_dir: "./cache/cloud_sample_pool"
- compact_threshold: 0.3
- enable_timing_logs: false
-
 experiment_results:
  enabled: true
  root_dir: results/experiments
@@ -30,11 +21,10 @@ baseline:
   learning_rate: 1e-3
   optimizer_name: adam
   weight_decay: 0.0
+  training_frame_count: 120
  pure_edge_local_updating:
   training_strategy: surgeon_tta
   quality_mode: output_only_when_no_boundary
-  trigger_low_quality_samples: 8
-  max_local_buffer_samples: 64
   trainable_scope: norm_affine
   consistency_weight: 0.01
   entropy_margin_ratio: 0.4
@@ -305,7 +295,7 @@ server:
   batch_size: 32
   feature_cache_mode: auto
   feature_cache:
-   view_source: canonical_active
+   view_source: recent_training_window
    materialization_mode: direct_ref
    view_root_dir: "./cache/cloud_training_views"
    store_root_dir: "./cache/cloud_feature_shards"
