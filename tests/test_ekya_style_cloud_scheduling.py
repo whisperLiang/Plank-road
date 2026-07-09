@@ -1390,7 +1390,6 @@ def test_ekya_cloud_server_uses_dedicated_controller_without_edge_affine(tmp_pat
         mode="baseline",
         baseline_config=baseline_config,
         baseline_method="ekya_style_cloud_scheduling",
-        run_id="run",
         experiment_id="comparison",
         scenario="road",
         edge_count=1,

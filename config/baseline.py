@@ -27,17 +27,6 @@ def validate_baseline_method(method: str) -> str:
     return value
 
 
-def default_run_id(prefix: str = "baseline") -> str:
-    from datetime import datetime, timezone
-
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    safe_prefix = "".join(
-        character if character.isalnum() or character in {"-", "_"} else "_"
-        for character in str(prefix or "baseline")
-    ).strip("_")
-    return f"{safe_prefix or 'baseline'}_{stamp}"
-
-
 @dataclass(frozen=True)
 class BaselineIdentity:
     run_id: str

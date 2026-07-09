@@ -34,7 +34,7 @@ Run a single edge against one cloud server:
 Cloud terminal:
 
 ```shell
-python cloud_server.py --yaml_path ./config/config.yaml --edge_affine_workers_enabled true --edge_affine_worker_mode edge_affine_single_gpu_mps --run_id plank_road_single_edge_001
+python cloud_server.py --yaml_path ./config/config.yaml --edge_affine_workers_enabled true --edge_affine_worker_mode edge_affine_single_gpu_mps
 ```
 
 Edge terminal:
@@ -216,7 +216,7 @@ Start the cloud server and one edge client:
 Cloud terminal:
 
 ```shell
-python cloud_server.py --yaml_path ./config/config.yaml --edge_affine_workers_enabled true --edge_affine_worker_mode edge_affine_single_gpu_mps --run_id plank_road_single_edge_001
+python cloud_server.py --yaml_path ./config/config.yaml --edge_affine_workers_enabled true --edge_affine_worker_mode edge_affine_single_gpu_mps
 ```
 
 Edge terminal:
@@ -255,7 +255,7 @@ export CUDA_VISIBLE_DEVICES=0 CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps CUDA_MPS_L
 Start the cloud:
 
 ```shell
-python cloud_server.py --yaml_path ./config/config.yaml --listen_address "[::]:50051" --edge_affine_workers_enabled true --edge_affine_worker_mode edge_affine_single_gpu_mps --run_id plank_road_real_devices_001
+python cloud_server.py --yaml_path ./config/config.yaml --listen_address "[::]:50051" --edge_affine_workers_enabled true --edge_affine_worker_mode edge_affine_single_gpu_mps
 ```
 
 Start each physical edge with a unique `edge_id`:
@@ -312,9 +312,8 @@ experiment_run:
 ```
 
 CLI values such as `--scenario`, `--video_path`, `--max_count`, and `--repeat`
-override `experiment_run`. `--run_id` is optional; if omitted it is generated
-from those dimensions and the method. Different repeated runs must use different
-`repeat` values.
+override `experiment_run`. The runtime run id is generated from those dimensions
+and the method. Different repeated runs must use different `repeat` values.
 
 The supported baseline methods are:
 

@@ -308,7 +308,6 @@ def _create_experiment_identity(
     edge_count: int | str | None,
     repeat: int | str | None,
     method: str,
-    run_id: str | None,
     video_identity: VideoIdentity,
 ) -> ExperimentIdentity:
     scenario_slug = (
@@ -322,7 +321,6 @@ def _create_experiment_identity(
         edge_count=1 if edge_count is None else edge_count,
         repeat=1 if repeat is None else repeat,
         method=method,
-        run_id=run_id,
     )
 
 
@@ -447,7 +445,7 @@ def _run_video_loop(
     result_path: Path,
     experiment_metrics: ExperimentJsonlWriter | None = None,
     method: str = "",
-    run_id: str = "",
+    run_id: str,
     video_identity: VideoIdentity | None = None,
     replay_archiver: ReplayFrameArchiver | None = None,
 ) -> int:
@@ -1171,7 +1169,6 @@ if __name__ == "__main__":
     )
     parser.add_argument("--mode", choices=("main", "baseline"), default="main")
     parser.add_argument("--baseline_method", default=None, help="baseline method for baseline mode")
-    parser.add_argument("--run_id", default=None, help="optional experiment run id override")
     parser.add_argument("--experiment_id", default=None, help="experiment id")
     parser.add_argument("--scenario", default=None, help="experiment scenario slug/name")
     parser.add_argument("--edge_count", type=int, default=None, help="number of edge devices")
@@ -1211,7 +1208,6 @@ if __name__ == "__main__":
         config.server_ip = args.server_ip
 
     baseline_method = None
-    baseline_run_id = None
     if args.mode == "baseline":
         baseline_method = args.baseline_method or runtime_config.baseline.method
         try:
@@ -1245,13 +1241,10 @@ if __name__ == "__main__":
         ),
         repeat=args.repeat if args.repeat is not None else experiment_run.repeat,
         method=method,
-        run_id=args.run_id,
         video_identity=video_identity,
     )
     run_id = experiment_identity.run_id
     config.experiment_identity = experiment_identity
-    if args.mode == "baseline":
-        baseline_run_id = run_id
 
     baseline_adapter = None
     if args.mode == "baseline":

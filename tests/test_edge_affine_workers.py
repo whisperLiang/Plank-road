@@ -1329,7 +1329,7 @@ def test_cloud_server_worker_pool_does_not_create_local_training_objects(
     config.workspace_root = str(tmp_path)
     config.edge_affine_workers.enabled = True
 
-    server = CloudServer(config, run_id="run-a", yaml_path="./config/config.yaml")
+    server = CloudServer(config, yaml_path="./config/config.yaml")
 
     assert server.large_object_detection is None
     assert not hasattr(server, "continual_learner")
@@ -1404,7 +1404,6 @@ def test_cloud_server_baseline_loads_teacher_detector_only(
         mode="baseline",
         baseline_config=runtime.baseline,
         baseline_method="accuracy_trigger_cloud_retraining",
-        run_id="run-accuracy",
         yaml_path="./config/config.yaml",
     )
     try:

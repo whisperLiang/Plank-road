@@ -97,7 +97,6 @@ def _create_experiment_identity(
     edge_count: int | str | None,
     repeat: int | str | None,
     method: str,
-    run_id: str | None,
     runtime_config,
 ) -> ExperimentIdentity:
     return ExperimentIdentity.create(
@@ -109,7 +108,6 @@ def _create_experiment_identity(
         edge_count=1 if edge_count is None else edge_count,
         repeat=1 if repeat is None else repeat,
         method=method,
-        run_id=run_id,
     )
 
 
@@ -133,7 +131,6 @@ class CloudServer:
         mode: str = "main",
         baseline_config=None,
         baseline_method: str = "",
-        run_id: str = "",
         experiment_id: str = "",
         scenario: str = "",
         edge_count: int | str = 1,
@@ -170,7 +167,6 @@ class CloudServer:
                 edge_count=edge_count,
                 repeat=repeat,
                 method=experiment_method,
-                run_id=run_id,
                 runtime_config=runtime_config,
             )
             resolved_run_id = self.experiment_identity.run_id
@@ -264,7 +260,6 @@ class CloudServer:
                 edge_count=edge_count,
                 repeat=repeat,
                 method=PLANK_ROAD_METHOD,
-                run_id=run_id,
                 runtime_config=runtime_config,
             )
             self.run_id = self.experiment_identity.run_id
@@ -705,7 +700,6 @@ if __name__ == "__main__":
     )
     parser.add_argument("--mode", choices=("main", "baseline"), default="main")
     parser.add_argument("--baseline_method", default=None, help="baseline method for baseline mode")
-    parser.add_argument("--run_id", default=None, help="optional experiment run id override")
     parser.add_argument("--experiment_id", default=None, help="experiment id")
     parser.add_argument("--scenario", default=None, help="experiment scenario slug/name")
     parser.add_argument("--edge_count", type=int, default=None, help="number of edge devices")
@@ -752,7 +746,6 @@ if __name__ == "__main__":
         mode=args.mode,
         baseline_config=config.baseline,
         baseline_method=baseline_method,
-        run_id=args.run_id or "",
         experiment_id=(
             args.experiment_id
             if args.experiment_id is not None

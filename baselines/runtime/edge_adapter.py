@@ -25,7 +25,7 @@ from baselines.runtime.upload_client import (
     validate_baseline_training_strategy,
 )
 from common.experiment_results import edge_run_dir
-from config.baseline import default_run_id, validate_baseline_method
+from config.baseline import validate_baseline_method
 
 
 class BaselineEdgeAdapter:
@@ -43,7 +43,9 @@ class BaselineEdgeAdapter:
     ) -> None:
         self.config = config
         self.baseline_method = validate_baseline_method(baseline_method)
-        self.run_id = str(run_id or default_run_id(self.baseline_method))
+        self.run_id = str(run_id or "").strip()
+        if not self.run_id:
+            raise ValueError("run_id must be generated before creating BaselineEdgeAdapter")
         self.edge_id = int(edge_id)
         self.server_ip = str(server_ip or "")
         self.cache_path = str(cache_path or "./cache")

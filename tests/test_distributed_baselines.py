@@ -368,6 +368,17 @@ def test_pure_edge_adapter_uses_shared_artifacts_without_cloud(tmp_path) -> None
         adapter.close()
 
 
+def test_baseline_edge_adapter_requires_generated_run_id(tmp_path) -> None:
+    with pytest.raises(ValueError, match="run_id must be generated"):
+        BaselineEdgeAdapter(
+            config=_config(tmp_path),
+            baseline_method="pure_edge_local_updating",
+            run_id=None,
+            edge_id=1,
+            transport=None,
+        )
+
+
 def test_pure_edge_startup_validation_can_skip_cloud_address(tmp_path) -> None:
     config = _config(tmp_path)
     config.edge_id = 1
@@ -423,7 +434,6 @@ def test_create_experiment_identity_preserves_explicit_zero_values(
             edge_count=edge_count,
             repeat=repeat,
             method="plank_road",
-            run_id=None,
             video_identity=video_identity,
         )
 
@@ -503,7 +513,6 @@ def test_cloud_create_experiment_identity_preserves_explicit_zero_values(
             edge_count=edge_count,
             repeat=repeat,
             method="plank_road",
-            run_id=None,
             runtime_config=runtime_config,
         )
 

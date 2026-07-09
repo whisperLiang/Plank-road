@@ -217,7 +217,7 @@ def parse_ekya_style_config(
             "ekya_style_cloud_scheduling"
         )
 
-    resolved_run_id = str(run_id or _get(baseline, "run_id", "") or "")
+    resolved_run_id = str(run_id or "")
     if not resolved_run_id:
         raise ValueError("run_id must be non-empty for ekya_style_cloud_scheduling")
 
