@@ -2,7 +2,7 @@ experiment_run:
  experiment_id: suwon5a_weather
  scenario: snowy
  video_path: ./video_data/snowy.mp4
- max_count: 50000
+ max_count: 5000
  edge_count: 1
  repeat: 1
 
@@ -290,7 +290,7 @@ server:
  wait_thresh: 10
  # continual learning settings
  continual_learning:
-  num_epoch: 50
+  num_epoch: 30
   # Cloud traces the fixed split runtime with a small batch to build a
   # dynamic-batch TorchLens native template; reconstruction/training use batch_size.
   trace_batch_size: 1
