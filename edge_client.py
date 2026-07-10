@@ -330,10 +330,11 @@ def _experiment_result_upload_enabled(
     baseline_method: str | None,
     experiment_results: object,
 ) -> bool:
-    pure_edge_local = (
-        str(mode) == "baseline" and str(baseline_method or "") == PURE_EDGE_METHOD
+    enabled = bool(getattr(experiment_results, "enabled", False))
+    upload_enabled = bool(
+        getattr(experiment_results, "upload_enabled", enabled)
     )
-    return bool(getattr(experiment_results, "enabled", False) and not pure_edge_local)
+    return enabled and upload_enabled
 
 
 def _upload_experiment_run_artifacts_if_enabled(
@@ -1213,7 +1214,15 @@ if __name__ == "__main__":
         except ValueError as exc:
             parser.error(str(exc))
 
-    require_server_ip = args.mode == "main" or _baseline_requires_cloud(baseline_method)
+    require_server_ip = (
+        args.mode == "main"
+        or _baseline_requires_cloud(baseline_method)
+        or _experiment_result_upload_enabled(
+            mode=args.mode,
+            baseline_method=baseline_method,
+            experiment_results=experiment_results,
+        )
+    )
     try:
         _validate_startup_config(config, require_server_ip=require_server_ip)
     except (FileNotFoundError, ValueError) as exc:

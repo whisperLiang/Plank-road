@@ -64,6 +64,7 @@ experiment_results:
     assert config.client.experiment_results is config.experiment_results
     assert config.server.experiment_results is config.experiment_results
     assert config.experiment_results.local_root_dir == "edge-results"
+    assert config.experiment_results.upload_enabled is True
 
 
 def test_experiment_run_config_is_loaded_and_normalized(tmp_path) -> None:

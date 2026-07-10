@@ -374,6 +374,14 @@ python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baselin
 
 #### Pure Edge Local Updating
 
+Cloud result receiver (no Pure Edge cloud training):
+
+```shell
+python cloud_server.py --yaml_path ./config/config.yaml --mode baseline --baseline_method pure_edge_local_updating --listen_address "[::]:50051"
+```
+
+Pure Edge edge device 1:
+
 ```shell
 python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method pure_edge_local_updating --edge_id 1 --cache_path ./cache/edge_1 --headless
 ```
@@ -381,9 +389,14 @@ python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baselin
 Pure Edge Local Updating writes metrics locally under
 `results/baselines_distributed/{run_id}/pure_edge_local_updating/edge_{edge_id}/metrics.jsonl`
 and mirrors experiment artifacts under `cache/experiment_results/...` when
-experiment archival is enabled. It does not upload frames, metrics, teacher
-requests, or shutdown artifacts to the cloud by default, so it can run without a
-cloud server.
+experiment archival is enabled. When `experiment_results.enabled: true`, the
+completed experiment artifacts are uploaded to the cloud result repository at
+shutdown when `experiment_results.upload_enabled: true`; the Pure Edge
+inference/training path still does not upload frames, metrics, or teacher
+requests during execution. The cloud gRPC server must be running for shutdown
+upload, and `client.server_ip` must point to it. If no cloud process is
+desired, keep `experiment_results.enabled: true` and set
+`experiment_results.upload_enabled: false` to retain local archival only.
 
 #### Ekya-Style Cloud Scheduling
 

@@ -8,6 +8,7 @@ experiment_run:
 
 experiment_results:
  enabled: true
+ upload_enabled: true
  root_dir: results/experiments
  local_root_dir: cache/experiment_results
  max_artifact_bytes: 268435456

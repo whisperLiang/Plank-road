@@ -313,6 +313,7 @@ class BaselineConfig(ConfigSection):
 @dataclass
 class ExperimentResultsConfig(ConfigSection):
     enabled: bool = True
+    upload_enabled: bool = True
     root_dir: str = "results/experiments"
     local_root_dir: str = "cache/experiment_results"
     max_artifact_bytes: int = 268435456
@@ -989,7 +990,7 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     if experiment_run.scenario:
         config.client.source.scenario_name = experiment_run.scenario
     experiment_results = config.experiment_results
-    for name in ("enabled",):
+    for name in ("enabled", "upload_enabled"):
         if not isinstance(getattr(experiment_results, name), bool):
             raise ValueError(f"experiment_results.{name} must be a boolean")
     for name in ("root_dir", "local_root_dir"):

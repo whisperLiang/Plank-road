@@ -496,7 +496,7 @@ def test_cloud_create_experiment_identity_preserves_explicit_zero_values(
         )
 
 
-def test_pure_edge_shutdown_upload_disabled_but_local_artifacts_collected(tmp_path) -> None:
+def test_pure_edge_shutdown_upload_enabled_and_local_artifacts_collected(tmp_path) -> None:
     run_dir = tmp_path / "pure-edge-run"
     run_dir.mkdir()
     inference_path = run_dir / "latest_inference_results.jsonl"
@@ -509,6 +509,7 @@ def test_pure_edge_shutdown_upload_disabled_but_local_artifacts_collected(tmp_pa
     )
     experiment_results = SimpleNamespace(
         enabled=True,
+        upload_enabled=True,
         max_artifact_bytes=1024 * 1024,
     )
 
@@ -529,7 +530,7 @@ def test_pure_edge_shutdown_upload_disabled_but_local_artifacts_collected(tmp_pa
     assert "latest_inference_results.jsonl" in artifacts
     assert "metrics.jsonl" in artifacts
     assert "edge_summary.json" in artifacts
-    assert not _experiment_result_upload_enabled(
+    assert _experiment_result_upload_enabled(
         mode="baseline",
         baseline_method="pure_edge_local_updating",
         experiment_results=experiment_results,
@@ -542,16 +543,16 @@ def test_pure_edge_shutdown_upload_disabled_but_local_artifacts_collected(tmp_pa
         ("main", None, True, True),
         ("baseline", "accuracy_trigger_cloud_retraining", True, True),
         ("main", None, False, False),
-        ("baseline", "pure_edge_local_updating", True, False),
+        ("baseline", "pure_edge_local_updating", True, True),
     ],
 )
-def test_shutdown_experiment_upload_enablement_preserves_non_pure_edge_modes(
+def test_shutdown_experiment_upload_enablement_respects_config(
     mode: str,
     baseline_method: str | None,
     enabled: bool,
     expected: bool,
 ) -> None:
-    experiment_results = SimpleNamespace(enabled=enabled)
+    experiment_results = SimpleNamespace(enabled=enabled, upload_enabled=enabled)
 
     assert (
         _experiment_result_upload_enabled(
@@ -563,7 +564,7 @@ def test_shutdown_experiment_upload_enablement_preserves_non_pure_edge_modes(
     )
 
 
-def test_shutdown_upload_helper_does_not_call_uploader_for_pure_edge() -> None:
+def test_shutdown_upload_helper_calls_uploader_for_pure_edge() -> None:
     calls: list[dict[str, object]] = []
 
     class FakeUploader:
@@ -578,7 +579,7 @@ def test_shutdown_upload_helper_does_not_call_uploader_for_pure_edge() -> None:
         server_ip="127.0.0.1:1",
         mode="baseline",
         baseline_method="pure_edge_local_updating",
-        experiment_results=SimpleNamespace(enabled=True),
+        experiment_results=SimpleNamespace(enabled=True, upload_enabled=True),
         identity=ExperimentIdentity.create(
             experiment_id="comparison",
             scenario_slug="road",
@@ -594,8 +595,10 @@ def test_shutdown_upload_helper_does_not_call_uploader_for_pure_edge() -> None:
         uploader_cls=FakeUploader,
     )
 
-    assert uploaded is False
-    assert calls == []
+    assert uploaded is True
+    assert calls[0] == {"event": "init", "server_ip": "127.0.0.1:1", "enabled": True}
+    assert calls[1]["event"] == "upload"
+    assert calls[1]["method"] == "pure_edge_local_updating"
 
 
 def test_shutdown_upload_helper_still_calls_uploader_for_accuracy_trigger() -> None:
@@ -613,7 +616,7 @@ def test_shutdown_upload_helper_still_calls_uploader_for_accuracy_trigger() -> N
         server_ip="127.0.0.1:1",
         mode="baseline",
         baseline_method="accuracy_trigger_cloud_retraining",
-        experiment_results=SimpleNamespace(enabled=True),
+        experiment_results=SimpleNamespace(enabled=True, upload_enabled=True),
         identity=ExperimentIdentity.create(
             experiment_id="comparison",
             scenario_slug="road",
@@ -633,6 +636,14 @@ def test_shutdown_upload_helper_still_calls_uploader_for_accuracy_trigger() -> N
     assert calls[0] == {"event": "init", "server_ip": "127.0.0.1:1", "enabled": True}
     assert calls[1]["event"] == "upload"
     assert calls[1]["method"] == "accuracy_trigger_cloud_retraining"
+
+
+def test_shutdown_upload_can_be_disabled_while_local_archival_remains_enabled() -> None:
+    assert not _experiment_result_upload_enabled(
+        mode="baseline",
+        baseline_method="pure_edge_local_updating",
+        experiment_results=SimpleNamespace(enabled=True, upload_enabled=False),
+    )
 
 
 def test_accuracy_adapter_uploads_keyframes_without_local_training_submit(tmp_path) -> None:
