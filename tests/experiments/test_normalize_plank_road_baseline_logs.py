@@ -8,12 +8,19 @@ import pytest
 import yaml
 
 from tools.experiments.experiment_common import (
+    ADAPTATION_FIELDS,
     CSV_SCHEMAS,
     EKYA_CANONICAL_METHOD,
+    LATENCY_FIELDS,
     ManifestError,
+    empty_row,
     read_csv,
 )
-from tools.experiments.normalize_plank_road_baseline_logs import _summary_rows, normalize
+from tools.experiments.normalize_plank_road_baseline_logs import (
+    _derive_adaptation_latency,
+    _summary_rows,
+    normalize,
+)
 
 
 def _write_jsonl(path: Path, rows: list[dict], *, bad_line: bool = False) -> None:
@@ -174,6 +181,106 @@ def test_summary_rows_training_job_count_prefers_windowed_successes() -> None:
     summary = _summary_rows(manifest, frames=[], events=events, uploads=[], latency=[])
 
     assert summary[0]["num_training_jobs"] == 1
+
+
+def test_derived_total_adaptation_pairs_latest_preceding_plank_road_trigger() -> None:
+    events = [
+        empty_row(
+            ADAPTATION_FIELDS,
+            comparison_id="comparison-test",
+            run_id="road_n1_r01_plank_road",
+            method="plank_road",
+            edge_id=1,
+            scenario_name="road",
+            event_name="trigger_decision",
+            event_time_ms=1_000,
+            frame_id=10,
+            window_id="window-old",
+        ),
+        empty_row(
+            ADAPTATION_FIELDS,
+            comparison_id="comparison-test",
+            run_id="road_n1_r01_plank_road",
+            method="plank_road",
+            edge_id=1,
+            scenario_name="road",
+            event_name="trigger_decision",
+            event_time_ms=5_000,
+            frame_id=50,
+            window_id="window-latest",
+        ),
+        empty_row(
+            ADAPTATION_FIELDS,
+            comparison_id="comparison-test",
+            run_id="road_n1_r01_plank_road",
+            method="plank_road",
+            edge_id=1,
+            scenario_name="road",
+            event_name="model_update_applied",
+            event_time_ms=8_000,
+            job_id="job-from-window-latest",
+        ),
+    ]
+    latency = [
+        empty_row(
+            LATENCY_FIELDS,
+            comparison_id="comparison-test",
+            run_id="road_n1_r01_plank_road",
+            method="plank_road",
+            edge_id=1,
+            scenario_name="road",
+            total_adaptation_ms=999_000,
+        )
+    ]
+
+    _derive_adaptation_latency(events, latency)
+
+    derived = [
+        row
+        for row in latency
+        if row.get("total_adaptation_ms") not in (None, "")
+    ]
+    assert len(derived) == 1
+    assert derived[0]["total_adaptation_ms"] == 3_000
+    assert derived[0]["window_id"] == "window-latest"
+
+
+def test_derived_total_adaptation_rejects_conflicting_shared_identities() -> None:
+    events = [
+        empty_row(
+            ADAPTATION_FIELDS,
+            comparison_id="comparison-test",
+            run_id="road_n1_r01_accuracy_trigger_cloud_retraining",
+            method="accuracy_trigger_cloud_retraining",
+            edge_id=1,
+            scenario_name="road",
+            event_name="trigger_decision",
+            event_time_ms=1_000,
+            job_id="job-old",
+            window_id="window-shared",
+        ),
+        empty_row(
+            ADAPTATION_FIELDS,
+            comparison_id="comparison-test",
+            run_id="road_n1_r01_accuracy_trigger_cloud_retraining",
+            method="accuracy_trigger_cloud_retraining",
+            edge_id=1,
+            scenario_name="road",
+            event_name="model_update_applied",
+            event_time_ms=8_000,
+            job_id="job-new",
+            window_id="window-shared",
+        ),
+    ]
+    latency: list[dict[str, object]] = []
+
+    _derive_adaptation_latency(events, latency)
+
+    assert [
+        row
+        for row in latency
+        if row.get("total_adaptation_ms") not in (None, "")
+    ] == []
 
 
 def test_accuracy_trigger_upload_summary_uses_encoded_raw_bytes(tmp_path: Path) -> None:

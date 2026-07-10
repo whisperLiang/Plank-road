@@ -1342,12 +1342,63 @@ def _event_identity(row: Mapping[str, Any]) -> str:
     return str(row.get("job_id", "") or row.get("window_id", "") or "")
 
 
+def _event_identity_fields(row: Mapping[str, Any]) -> dict[str, str]:
+    return {
+        field: value
+        for field in ("job_id", "window_id")
+        if (value := str(row.get(field, "") or ""))
+    }
+
+
+def _shared_identity_fields_match(
+    left: Mapping[str, str],
+    right: Mapping[str, str],
+) -> bool | None:
+    shared_fields = set(left) & set(right)
+    if not shared_fields:
+        return None
+    return all(left[field] == right[field] for field in shared_fields)
+
+
 def _can_pair_by_time(start: Mapping[str, Any], end: Mapping[str, Any]) -> bool:
     start_identity = _event_identity(start)
     end_identity = _event_identity(end)
     if not start_identity or not end_identity:
         return True
     return start_identity == end_identity
+
+
+def _trigger_candidate_index(
+    triggers: list[dict[str, Any]],
+    update: Mapping[str, Any],
+    update_time: int,
+) -> int | None:
+    before_update = [
+        (index, trigger, trigger_time)
+        for index, trigger in enumerate(triggers)
+        if (trigger_time := optional_int(trigger.get("event_time_ms"))) is not None
+        and trigger_time <= update_time
+    ]
+    update_identities = _event_identity_fields(update)
+    if update_identities:
+        identity_matches = []
+        comparable_identity_exists = False
+        for index, trigger, trigger_time in before_update:
+            trigger_identities = _event_identity_fields(trigger)
+            identity_match = _shared_identity_fields_match(
+                trigger_identities,
+                update_identities,
+            )
+            if identity_match is None:
+                continue
+            comparable_identity_exists = True
+            if identity_match:
+                identity_matches.append((index, trigger_time))
+        if identity_matches:
+            return max(identity_matches, key=lambda item: item[1])[0]
+        if comparable_identity_exists:
+            return None
+    return max(before_update, key=lambda item: item[2])[0] if before_update else None
 
 
 def _job_window_ids_from_triggers(
@@ -1552,31 +1603,7 @@ def _derive_adaptation_latency(
             if update_time is None:
                 continue
             update_window = str(update.get("window_id", "") or "")
-            candidate_index = next(
-                (
-                    index
-                    for index, trigger in enumerate(unused)
-                    if update_window
-                    and str(trigger.get("window_id", "") or "") == update_window
-                    and (optional_int(trigger.get("event_time_ms")) or update_time + 1)
-                    <= update_time
-                ),
-                None,
-            )
-            if candidate_index is None:
-                candidate_index = next(
-                    (
-                        index
-                        for index, trigger in enumerate(unused)
-                        if (
-                            not update_window
-                            or not str(trigger.get("window_id", "") or "")
-                        )
-                        and (optional_int(trigger.get("event_time_ms")) or update_time + 1)
-                        <= update_time
-                    ),
-                    None,
-                )
+            candidate_index = _trigger_candidate_index(unused, update, update_time)
             if candidate_index is None:
                 continue
             trigger = unused.pop(candidate_index)

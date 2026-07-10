@@ -112,17 +112,22 @@ The main plotting command emits exactly:
 Fig. 1, Dynamic Accuracy Recovery, shows Teacher-supervised F1 over frame ID
 for Sunny, Rainy, and Snowy. Each method curve is the mean across repeats, with
 a standard-deviation band. The plotter does not interpolate missing frame IDs.
+Trigger and update markers show paired adaptation cycles; unpaired trigger or
+update events are omitted from the marker layer and reported.
 
-Fig. 2, Accuracy vs Total Retraining Time, shows one repeated-run ellipse per
-scenario and method. The X center is mean total retraining time in seconds; the
-Y center is mean post-update Teacher-supervised F1 over a 300-frame window.
+Fig. 2, Accuracy vs Average Training Time, shows one repeated-run ellipse per
+scenario and method. The X center is mean training time in seconds from
+`summary.mean_training_ms`; the Y center is mean F1 from `summary.mean_f1`.
 Ellipse width and height are standard deviations across repeated runs. A point
 without an ellipse is used when fewer than two valid repeats are available.
 
-Fig. 3, Average Time Cost for Retraining Breakdown, shows averaged stacked time
-components. Component definitions are documented in
-`docs/experiments/plank_road_baselines_plot_spec.md`. Unmeasured components are
-omitted and reported; missing latency or accuracy values are not invented.
+Fig. 3, Average Time Cost for Retraining Breakdown, shows averaged stacked
+retraining-time components on a seconds-scale left axis and mean online
+inference latency from `summary.mean_latency_ms` as right-axis lollipop markers.
+Component definitions are documented in
+`docs/experiments/plank_road_baselines_plot_spec.md`. Unmeasured components or
+missing inference-latency values are omitted and reported; missing latency or
+accuracy values are not invented.
 
 ## Missing Data Rules
 

@@ -137,6 +137,15 @@ def _write_complete_normalized(normalized: Path, *, repeats: int = 3) -> None:
                         video_slug=scenario.lower(),
                         edge_count=1,
                         mean_f1=0.7 + method_index * 0.02,
+                        mean_latency_ms=(
+                            40.0 + scenario_index * 5.0 + method_index * 20.0 + repeat
+                        ),
+                        p50_latency_ms=(
+                            35.0 + scenario_index * 5.0 + method_index * 20.0 + repeat
+                        ),
+                        p95_latency_ms=(
+                            55.0 + scenario_index * 5.0 + method_index * 20.0 + repeat
+                        ),
                         mean_adaptation_ms=update_time_ms - trigger_time_ms,
                         mean_training_ms=latency_kwargs["training_ms"],
                         num_training_jobs=1,
@@ -197,13 +206,37 @@ def test_complete_normalized_data_generates_exactly_three_figure_sets(tmp_path: 
         "Rainy": "video_data/rainy.mp4",
         "Snowy": "video_data/snowy.mp4",
     }
-    assert report["post_update_window_frames"] == 300
     assert report["accuracy_definition"] == "teacher_supervised_f1"
+    assert report["fig2_metric_definition"] == (
+        "X is summary.mean_training_ms / 1000 seconds; Y is summary.mean_f1. "
+        "Runs missing either value are omitted from Fig.2 and reported as partial data."
+    )
     assert report["figure_metadata"]["fig2_accuracy_retraining_time_tradeoff"][
         "ellipses_drawn"
     ]
+    fig3_metadata = report["figure_metadata"]["fig3_retraining_time_breakdown"]
+    assert (
+        fig3_metadata["layout"]
+        == "single_panel_dual_axis_retraining_and_inference_latency"
+    )
+    assert fig3_metadata["inference_layer"] == (
+        "right-axis lollipop markers overlaid on stacked retraining bars"
+    )
+    assert fig3_metadata["right_axis"] == "Inference Latency (ms)"
+    assert fig3_metadata["inference_panel_axis"] == "Inference Latency (ms)"
+    assert fig3_metadata["inference_latency_ms"]["Sunny/Ours"] == 42.0
+    assert round(
+        fig3_metadata["inference_latency_error_bar"]["Sunny/Ours"],
+        6,
+    ) == 0.57735
+    assert fig3_metadata["inference_latency_error_bar_definition"] == (
+        "standard error of summary.mean_latency_ms across runs"
+    )
     fig1_metadata = report["figure_metadata"]["fig1_dynamic_accuracy_recovery"]
-    assert fig1_metadata["event_markers"] == "individual trigger/update frames"
+    assert fig1_metadata["event_markers"] == "paired trigger/update frames"
+    assert fig1_metadata["event_marker_policy"] == (
+        "only trigger_decision events paired to a later model_update_applied are shown"
+    )
     assert fig1_metadata["event_counts"]["Sunny/Ours"] == {
         "trigger_decision": 3,
         "model_update_applied": 3,
@@ -233,6 +266,95 @@ def test_fig2_draws_point_and_warns_when_repeats_are_insufficient(tmp_path: Path
         "point drawn without ellipse due to insufficient repeats" in warning
         for warning in report["partial_data"]["fig2_accuracy_retraining_time_tradeoff"]
     )
+
+
+def test_fig1_omits_unpaired_trigger_markers(tmp_path: Path) -> None:
+    normalized = tmp_path / "normalized"
+    figures = tmp_path / "figures"
+    _write_complete_normalized(normalized, repeats=1)
+    event_rows = read_csv(normalized / "adaptation_events.csv")
+    event_rows.append(
+        empty_row(
+            ADAPTATION_FIELDS,
+            comparison_id="c",
+            run_id="sunny-0-r1",
+            method="plank_road",
+            edge_id=1,
+            scenario_name="Sunny",
+            video_slug="sunny",
+            event_name="trigger_decision",
+            event_time_ms=20_000,
+            frame_id=450,
+            window_id="unpaired-window",
+        )
+    )
+    write_csv(normalized / "adaptation_events.csv", ADAPTATION_FIELDS, event_rows)
+
+    report = plot_figures(normalized, figures)
+
+    metadata = report["figure_metadata"]["fig1_dynamic_accuracy_recovery"]
+    assert metadata["event_counts"]["Sunny/Ours"] == {
+        "trigger_decision": 1,
+        "model_update_applied": 1,
+    }
+    assert metadata["unpaired_event_counts"]["Sunny/Ours"] == {
+        "trigger_decision": 1,
+        "model_update_applied": 0,
+    }
+    assert any(
+        "Sunny/Ours omitted unpaired Fig.1 events: 1 trigger_decision, "
+        "0 model_update_applied" in warning
+        for warning in report["partial_data"]["fig1_dynamic_accuracy_recovery"]
+    )
+
+
+def test_fig1_omits_markers_with_conflicting_shared_identities(tmp_path: Path) -> None:
+    normalized = tmp_path / "normalized"
+    figures = tmp_path / "figures"
+    _write_complete_normalized(normalized, repeats=1)
+    event_rows = read_csv(normalized / "adaptation_events.csv")
+    for row in event_rows:
+        if (
+            row["scenario_name"] == "Sunny"
+            and row["method"] == "plank_road"
+            and row["run_id"] == "sunny-0-r1"
+            and row["event_name"] == "model_update_applied"
+        ):
+            row["job_id"] = "conflicting-job"
+    write_csv(normalized / "adaptation_events.csv", ADAPTATION_FIELDS, event_rows)
+
+    report = plot_figures(normalized, figures)
+
+    metadata = report["figure_metadata"]["fig1_dynamic_accuracy_recovery"]
+    assert metadata["event_counts"]["Sunny/Ours"] == {
+        "trigger_decision": 0,
+        "model_update_applied": 0,
+    }
+    assert metadata["unpaired_event_counts"]["Sunny/Ours"] == {
+        "trigger_decision": 1,
+        "model_update_applied": 1,
+    }
+
+
+def test_fig2_uses_summary_mean_f1_and_mean_training_time(tmp_path: Path) -> None:
+    normalized = tmp_path / "normalized"
+    figures = tmp_path / "figures"
+    _write_complete_normalized(normalized, repeats=1)
+    summary_rows = read_csv(normalized / "summary.csv")
+    for row in summary_rows:
+        if row["scenario_name"] == "Snowy" and row["method"] == "plank_road":
+            row["mean_f1"] = "0.91"
+            row["mean_training_ms"] = "42000"
+            row["mean_adaptation_ms"] = "999000"
+    write_csv(normalized / "summary.csv", SUMMARY_FIELDS, summary_rows)
+
+    report = plot_figures(normalized, figures)
+
+    center = report["figure_metadata"]["fig2_accuracy_retraining_time_tradeoff"][
+        "point_centers"
+    ]["Snowy/Ours"]
+    assert center["mean_training_time_s"] == 42.0
+    assert center["mean_f1"] == 0.91
 
 
 def test_fig3_omits_missing_components_without_inventing_values(tmp_path: Path) -> None:
@@ -284,6 +406,31 @@ def test_fig3_averages_repeated_component_observations_instead_of_summing(
     assert component_seconds["Sunny/Ours"]["Ours-Retrain"] == 1.5
 
 
+def test_fig3_omits_missing_inference_latency_without_skipping_breakdown(
+    tmp_path: Path,
+) -> None:
+    normalized = tmp_path / "normalized"
+    figures = tmp_path / "figures"
+    _write_complete_normalized(normalized, repeats=1)
+    summary_rows = read_csv(normalized / "summary.csv")
+    for row in summary_rows:
+        if row["scenario_name"] == "Sunny" and row["method"] == "plank_road":
+            row["mean_latency_ms"] = ""
+    write_csv(normalized / "summary.csv", SUMMARY_FIELDS, summary_rows)
+
+    report = plot_figures(normalized, figures)
+
+    metadata = report["figure_metadata"]["fig3_retraining_time_breakdown"]
+    assert "fig3_retraining_time_breakdown" in report["generated_figures"]
+    assert "Sunny/Ours" not in metadata["inference_latency_ms"]
+    assert metadata["component_seconds"]["Sunny/Ours"]["Ours-Retrain"] > 0
+    assert any(
+        "Sunny/Ours/sunny-0-r1: mean_latency_ms missing for Fig.3 inference latency"
+        in warning
+        for warning in report["partial_data"]["fig3_retraining_time_breakdown"]
+    )
+
+
 def test_single_scenario_results_do_not_draw_empty_scenario_panels(tmp_path: Path) -> None:
     normalized = tmp_path / "normalized"
     figures = tmp_path / "figures"
@@ -311,45 +458,45 @@ def test_single_scenario_results_do_not_draw_empty_scenario_panels(tmp_path: Pat
     assert metadata["fig3_retraining_time_breakdown"]["selected_scenarios"] == ["Snowy"]
 
 
-def test_missing_accuracy_skips_fig1_and_fig2_and_removes_stale_outputs(
+def test_missing_frame_accuracy_skips_fig1_but_fig2_uses_summary(
     tmp_path: Path,
 ) -> None:
     normalized = tmp_path / "normalized"
     figures = tmp_path / "figures"
     _write_complete_normalized(normalized)
     write_csv(normalized / "frame_metrics.csv", FRAME_FIELDS, [])
-    for stem in (
-        "fig1_dynamic_accuracy_recovery",
-        "fig2_accuracy_retraining_time_tradeoff",
-    ):
-        for suffix in EXPORT_SUFFIXES:
-            (figures / f"{stem}{suffix}").parent.mkdir(parents=True, exist_ok=True)
-            (figures / f"{stem}{suffix}").write_text("stale", encoding="utf-8")
+    for suffix in EXPORT_SUFFIXES:
+        (figures / f"fig1_dynamic_accuracy_recovery{suffix}").parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        (figures / f"fig1_dynamic_accuracy_recovery{suffix}").write_text(
+            "stale",
+            encoding="utf-8",
+        )
 
     report = plot_figures(normalized, figures)
 
     assert report["skipped_figures"]["fig1_dynamic_accuracy_recovery"] == (
         "accuracy data missing"
     )
-    assert report["skipped_figures"]["fig2_accuracy_retraining_time_tradeoff"] == (
-        "accuracy data missing"
-    )
-    for stem in (
-        "fig1_dynamic_accuracy_recovery",
-        "fig2_accuracy_retraining_time_tradeoff",
-    ):
-        for suffix in EXPORT_SUFFIXES:
-            assert not (figures / f"{stem}{suffix}").exists()
+    assert "fig2_accuracy_retraining_time_tradeoff" in report["generated_figures"]
+    for suffix in EXPORT_SUFFIXES:
+        assert not (figures / f"fig1_dynamic_accuracy_recovery{suffix}").exists()
     assert (figures / "fig3_retraining_time_breakdown.svg").exists()
 
 
-def test_fig2_skips_runs_without_exact_trigger_to_update_interval(
+def test_fig2_skips_runs_missing_summary_mean_values(
     tmp_path: Path,
 ) -> None:
     normalized = tmp_path / "normalized"
     figures = tmp_path / "figures"
     _write_complete_normalized(normalized)
-    write_csv(normalized / "adaptation_events.csv", ADAPTATION_FIELDS, [])
+    summary_rows = read_csv(normalized / "summary.csv")
+    for row in summary_rows:
+        row["mean_f1"] = ""
+        row["mean_training_ms"] = ""
+    write_csv(normalized / "summary.csv", SUMMARY_FIELDS, summary_rows)
 
     report = plot_figures(normalized, figures)
 
@@ -358,13 +505,13 @@ def test_fig2_skips_runs_without_exact_trigger_to_update_interval(
     )
     assert not (figures / "fig2_accuracy_retraining_time_tradeoff.pdf").exists()
     assert any(
-        "trigger-to-update interval missing"
+        "mean_training_ms missing"
         in warning
         for warning in report["partial_data"]["fig2_accuracy_retraining_time_tradeoff"]
     )
 
 
-def test_fig2_does_not_pair_mismatched_job_or_window_ids(tmp_path: Path) -> None:
+def test_fig2_ignores_adaptation_event_identity_mismatches(tmp_path: Path) -> None:
     normalized = tmp_path / "normalized"
     figures = tmp_path / "figures"
     _write_complete_normalized(normalized)
@@ -377,13 +524,10 @@ def test_fig2_does_not_pair_mismatched_job_or_window_ids(tmp_path: Path) -> None
 
     report = plot_figures(normalized, figures)
 
-    assert report["skipped_figures"]["fig2_accuracy_retraining_time_tradeoff"] == (
-        "accuracy/time tradeoff data missing"
-    )
-    assert any(
-        "trigger-to-update interval missing" in warning
-        for warning in report["partial_data"]["fig2_accuracy_retraining_time_tradeoff"]
-    )
+    assert "fig2_accuracy_retraining_time_tradeoff" in report["generated_figures"]
+    assert report["figure_metadata"]["fig2_accuracy_retraining_time_tradeoff"][
+        "point_centers"
+    ]
 
 
 def test_plain_f1_without_teacher_definition_skips_accuracy_figures(tmp_path: Path) -> None:
@@ -400,9 +544,7 @@ def test_plain_f1_without_teacher_definition_skips_accuracy_figures(tmp_path: Pa
     assert report["skipped_figures"]["fig1_dynamic_accuracy_recovery"] == (
         "accuracy data missing"
     )
-    assert report["skipped_figures"]["fig2_accuracy_retraining_time_tradeoff"] == (
-        "accuracy data missing"
-    )
+    assert "fig2_accuracy_retraining_time_tradeoff" in report["generated_figures"]
     assert "fig3_retraining_time_breakdown" in report["generated_figures"]
 
 
