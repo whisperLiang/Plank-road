@@ -48,9 +48,8 @@ REMOVED_FIGURE_STEMS = (
 )
 EXPORT_SUFFIXES = (".svg", ".pdf", ".tiff", ".png")
 EXPORT_DPI = 600
-SCENARIO_ORDER = ("Sunny", "Rainy", "Snowy")
+SCENARIO_ORDER = ("Sunny", "Rainy", "Snowy", "Snowy & Foggy")
 DEFAULT_VIDEO_PATHS = {
-    "Sunny": "video_data/sunny.mp4",
     "Rainy": "video_data/rainy.mp4",
     "Snowy": "video_data/snowy.mp4",
 }
@@ -156,8 +155,6 @@ def _scenario_name(value: object) -> str:
     text = str(value or "").strip()
     folded = "".join(ch.lower() if ch.isalnum() else "_" for ch in text)
     folded = "_".join(part for part in folded.split("_") if part)
-    if folded in {"sunny", "sun"}:
-        return "Sunny"
     if folded in {"rainy", "rain"}:
         return "Rainy"
     if folded in {"snowy", "snow"}:

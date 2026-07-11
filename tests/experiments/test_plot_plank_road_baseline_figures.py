@@ -14,6 +14,7 @@ from tools.experiments.experiment_common import (
 )
 from tools.experiments.plot_plank_road_baseline_figures import (
     EXPORT_SUFFIXES,
+    SCENARIO_ORDER,
     plot_figures,
 )
 
@@ -200,11 +201,12 @@ def test_complete_normalized_data_generates_exactly_three_figure_sets(tmp_path: 
         assert {Path(path).suffix for path in outputs} == set(EXPORT_SUFFIXES)
         assert all(Path(path).exists() for path in outputs)
     assert report["method_order"] == list(METHOD_LABELS)
-    assert report["scenario_order"] == list(SCENARIOS)
+    assert report["scenario_order"] == list(SCENARIO_ORDER)
     assert report["video_paths"] == {
         "Sunny": "video_data/sunny.mp4",
         "Rainy": "video_data/rainy.mp4",
         "Snowy": "video_data/snowy.mp4",
+        "Snowy & Foggy": "video_data/snowy_foggy.mp4",
     }
     assert report["accuracy_definition"] == "teacher_supervised_f1"
     assert report["fig2_metric_definition"] == (
@@ -458,6 +460,38 @@ def test_single_scenario_results_do_not_draw_empty_scenario_panels(tmp_path: Pat
     assert metadata["fig3_retraining_time_breakdown"]["selected_scenarios"] == ["Snowy"]
 
 
+def test_snowy_foggy_is_a_formal_single_scenario(tmp_path: Path) -> None:
+    normalized = tmp_path / "normalized"
+    figures = tmp_path / "figures"
+    _write_complete_normalized(normalized, repeats=1)
+    for filename, fields in (
+        ("frame_metrics.csv", FRAME_FIELDS),
+        ("adaptation_events.csv", ADAPTATION_FIELDS),
+        ("latency_breakdown.csv", LATENCY_FIELDS),
+        ("summary.csv", SUMMARY_FIELDS),
+    ):
+        rows = [
+            row
+            for row in read_csv(normalized / filename)
+            if row["scenario_name"] == "Snowy"
+        ]
+        for row in rows:
+            row["scenario_name"] = "snowy_foggy"
+            row["video_slug"] = "snowy_foggy"
+        write_csv(normalized / filename, fields, rows)
+
+    report = plot_figures(normalized, figures)
+
+    metadata = report["figure_metadata"]
+    assert metadata["fig1_dynamic_accuracy_recovery"]["selected_scenario"] == "Snowy & Foggy"
+    assert metadata["fig2_accuracy_retraining_time_tradeoff"]["selected_scenarios"] == [
+        "Snowy & Foggy"
+    ]
+    assert metadata["fig3_retraining_time_breakdown"]["selected_scenarios"] == [
+        "Snowy & Foggy"
+    ]
+
+
 def test_missing_frame_accuracy_skips_fig1_but_fig2_uses_summary(
     tmp_path: Path,
 ) -> None:
@@ -565,7 +599,7 @@ def test_non_suwon_scenarios_are_ignored_and_reported(tmp_path: Path) -> None:
 
     report = plot_figures(normalized, figures)
 
-    assert report["scenario_order"] == list(SCENARIOS)
+    assert report["scenario_order"] == list(SCENARIO_ORDER)
     assert report["generated_figures"] == {}
     assert report["skipped_figures"] == {
         "fig1_dynamic_accuracy_recovery": "formal Suwon scenario data missing",

@@ -17,7 +17,7 @@ baseline:
  enabled: false
  method: accuracy_trigger_cloud_retraining
  training:
-  batch_size: 32
+  batch_size: 16
   num_epoch: 30
   learning_rate: 1e-3
   optimizer_name: adam
@@ -294,7 +294,7 @@ server:
   log_internal_ids: false
   # Configured upper bound; RF-DETR small rounds shrink this toward the
   # target step count and retry at 16 if CUDA runs out of memory.
-  batch_size: 32
+  batch_size: 16
   feature_cache_mode: auto
   feature_cache:
    view_source: recent_training_window
