@@ -219,7 +219,7 @@ def test_experiment_run_config_is_validated(
         f"""
 experiment_run:
   experiment_id: suwon5a_weather
-  scenario: sunny
+  scenario: rainy
   edge_count: 1
   repeat: 1
   {field}: {value}

@@ -34,7 +34,7 @@ from experiments.drift_detection_validity.signal_validity_analysis import (
 
 def test_real_weather_scene_config_requires_explicit_scene_fields(tmp_path: Path) -> None:
     videos = {}
-    for scene_id in ("sunny", "rainy", "snowy"):
+    for scene_id in ("rainy", "snowy"):
         path = tmp_path / f"{scene_id}.mp4"
         path.write_bytes(b"placeholder")
         videos[scene_id] = path
@@ -44,11 +44,6 @@ def test_real_weather_scene_config_requires_explicit_scene_fields(tmp_path: Path
                 "data": {
                     "scene_videos": [
                         {
-                            "scene_label": "Sunny",
-                            "video_path": str(videos["sunny"]),
-                        },
-                        {
-                            "scene_id": "rainy",
                             "scene_label": "Rainy",
                             "video_path": str(videos["rainy"]),
                         },
@@ -67,12 +62,7 @@ def test_real_weather_scene_config_requires_explicit_scene_fields(tmp_path: Path
                 "data": {
                     "scene_videos": [
                         {
-                            "scene_id": "sunny",
-                            "video_path": str(videos["sunny"]),
-                        },
-                        {
                             "scene_id": "rainy",
-                            "scene_label": "Rainy",
                             "video_path": str(videos["rainy"]),
                         },
                         {
@@ -89,11 +79,6 @@ def test_real_weather_scene_config_requires_explicit_scene_fields(tmp_path: Path
             {
                 "data": {
                     "scene_videos": [
-                        {
-                            "scene_id": "sunny",
-                            "scene_label": "Sunny",
-                            "video_path": str(videos["sunny"]),
-                        },
                         {
                             "scene_id": "snowy",
                             "scene_label": "Snowy",
@@ -114,11 +99,6 @@ def test_real_weather_scene_config_requires_explicit_scene_fields(tmp_path: Path
             "data": {
                 "scene_videos": [
                     {
-                        "scene_id": "sunny",
-                        "scene_label": "Sunny",
-                        "video_path": str(videos["sunny"]),
-                    },
-                    {
                         "scene_id": "rainy",
                         "scene_label": "Rainy",
                         "video_path": str(videos["rainy"]),
@@ -132,7 +112,7 @@ def test_real_weather_scene_config_requires_explicit_scene_fields(tmp_path: Path
             }
         }
     )
-    assert [row["scene_id"] for row in rows] == ["sunny", "rainy", "snowy"]
+    assert [row["scene_id"] for row in rows] == ["rainy", "snowy"]
 
 
 def test_iou_matching_detection_f1_and_window_aggregation() -> None:
@@ -153,16 +133,16 @@ def test_iou_matching_detection_f1_and_window_aggregation() -> None:
     assert score["recall"] == pytest.approx(1.0)
 
     student_records = [
-        {"global_frame_id": 0, "domain": "sunny", "prediction": student},
+        {"global_frame_id": 0, "domain": "rainy", "prediction": student},
         {
             "global_frame_id": 1,
-            "domain": "sunny",
+            "domain": "rainy",
             "prediction": {"boxes": [], "labels": [], "scores": []},
         },
     ]
     teacher_records = [
-        {"global_frame_id": 0, "domain": "sunny", "prediction": teacher},
-        {"global_frame_id": 1, "domain": "sunny", "prediction": teacher},
+        {"global_frame_id": 0, "domain": "rainy", "prediction": teacher},
+        {"global_frame_id": 1, "domain": "rainy", "prediction": teacher},
     ]
     windows = window_detection_f1(student_records, teacher_records, window_size=2, stride=2)
     assert len(windows) == 1
@@ -185,21 +165,21 @@ def test_ema_and_clean_baseline_normalization() -> None:
     }
     records = [
         {
-            "domain": "sunny",
+            "domain": "rainy",
             "domain_index": 0,
             "mean_confidence": 0.9,
             "output_entropy": 0.1,
             "_boundary_feature_vector": np.asarray([0.0, 0.0]),
         },
         {
-            "domain": "sunny",
+            "domain": "rainy",
             "domain_index": 0,
             "mean_confidence": 0.8,
             "output_entropy": 0.2,
             "_boundary_feature_vector": np.asarray([0.1, 0.0]),
         },
         {
-            "domain": "rainy",
+            "domain": "snowy",
             "domain_index": 1,
             "mean_confidence": 0.4,
             "output_entropy": 0.8,
@@ -237,7 +217,7 @@ def test_harmful_event_extraction_trigger_cooldown_and_matching() -> None:
         {
             "window_start_frame": index * 10,
             "window_end_frame": index * 10 + 9,
-            "domain_majority": "sunny" if index < 2 else "rainy",
+            "domain_majority": "rainy" if index < 2 else "snowy",
             "f1_drop": 0.0 if index < 2 else 0.2,
             "mean_full_drift_score_z": 2.0 if index >= 2 else 0.0,
         }
@@ -249,7 +229,7 @@ def test_harmful_event_extraction_trigger_cooldown_and_matching() -> None:
         harmful_consecutive_windows=2,
     )
     assert events == [
-        {"frame": 20, "end_frame": 79, "domain": "rainy", "transition_frame": 20}
+        {"frame": 20, "end_frame": 79, "domain": "snowy", "transition_frame": 20}
     ]
 
     triggers = replay_triggers(

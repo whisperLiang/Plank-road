@@ -149,7 +149,7 @@ WINDOW_METRIC_FIELDS = [
 ]
 
 REAL_WEATHER_SEQUENCE = "suwon5a_real_weather"
-REQUIRED_SCENE_IDS = ("sunny", "rainy", "snowy")
+REQUIRED_SCENE_IDS = ("rainy", "snowy")
 REQUIRED_SCENE_FIELDS = ("scene_id", "scene_label", "video_path")
 
 
@@ -179,7 +179,7 @@ def _scene_video_rows(config: Mapping[str, Any]) -> list[dict[str, Any]]:
         raise ValueError("data.scene_videos must contain at least one scene.")
     if len(scenes_value) != len(REQUIRED_SCENE_IDS):
         raise ValueError(
-            "data.scene_videos must contain exactly three scenes: "
+            "data.scene_videos must contain exactly two scenes: "
             f"{', '.join(REQUIRED_SCENE_IDS)}."
         )
     scenes = list(scenes_value)
@@ -677,7 +677,7 @@ def _write_html_report(
                 ".note{color:#5a626d;font-size:14px;line-height:1.5}",
                 "</style></head><body>",
                 "<h1>Suwon #5a real weather scene test</h1>",
-                "<p class=\"note\">All frames are sampled from real videos. Detection metrics compare the student detector against teacher pseudo-labels at IoU=0.5. Drift metrics use the sunny scene as the clean baseline, label harmful windows by teacher-pseudo-label F1 drop, and evaluate Plank-road signals without using teacher predictions at trigger time.</p>",
+                "<p class=\"note\">All frames are sampled from real videos. Detection metrics compare the student detector against teacher pseudo-labels at IoU=0.5. Drift metrics use the rainy scene as the clean baseline, label harmful windows by teacher-pseudo-label F1 drop, and evaluate Plank-road signals without using teacher predictions at trigger time.</p>",
                 f"<img src=\"{html.escape(relative(summary_plot))}\" alt=\"summary plot\">",
                 (
                     f"<img src=\"{html.escape(relative(drift_plot))}\" alt=\"drift detection plot\">"

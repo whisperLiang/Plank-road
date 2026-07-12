@@ -11,10 +11,6 @@ student_model: rfdetr_nano
 teacher_model: rtdetr_x
 
 scenarios:
-  - scenario_name: Sunny
-    scenario_slug: sunny
-    video_path: video_data/sunny.mp4
-    frame_range: [0, 1999]
   - scenario_name: Rainy
     scenario_slug: rainy
     video_path: video_data/rainy.mp4

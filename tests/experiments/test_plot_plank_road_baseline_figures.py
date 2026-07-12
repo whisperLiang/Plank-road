@@ -25,7 +25,7 @@ METHODS = (
     "ekya_style_cloud_scheduling",
 )
 METHOD_LABELS = ("Ours", "Pure Edge", "Accuracy-Trigger", "Ekya-style")
-SCENARIOS = ("Sunny", "Rainy", "Snowy")
+SCENARIOS = ("Rainy", "Snowy")
 FIGURE_STEMS = (
     "fig1_dynamic_accuracy_recovery",
     "fig2_accuracy_retraining_time_tradeoff",
@@ -164,10 +164,6 @@ def _write_complete_normalized(normalized: Path, *, repeats: int = 3) -> None:
                 "accuracy_definition": "teacher_supervised_f1",
                 "scenarios": [
                     {
-                        "scenario_name": "Sunny",
-                        "video_source": "video_data/sunny.mp4",
-                    },
-                    {
                         "scenario_name": "Rainy",
                         "video_source": "video_data/rainy.mp4",
                     },
@@ -203,10 +199,8 @@ def test_complete_normalized_data_generates_exactly_three_figure_sets(tmp_path: 
     assert report["method_order"] == list(METHOD_LABELS)
     assert report["scenario_order"] == list(SCENARIO_ORDER)
     assert report["video_paths"] == {
-        "Sunny": "video_data/sunny.mp4",
         "Rainy": "video_data/rainy.mp4",
         "Snowy": "video_data/snowy.mp4",
-        "Snowy & Foggy": "video_data/snowy_foggy.mp4",
     }
     assert report["accuracy_definition"] == "teacher_supervised_f1"
     assert report["fig2_metric_definition"] == (
@@ -226,9 +220,9 @@ def test_complete_normalized_data_generates_exactly_three_figure_sets(tmp_path: 
     )
     assert fig3_metadata["right_axis"] == "Inference Latency (ms)"
     assert fig3_metadata["inference_panel_axis"] == "Inference Latency (ms)"
-    assert fig3_metadata["inference_latency_ms"]["Sunny/Ours"] == 42.0
+    assert fig3_metadata["inference_latency_ms"]["Rainy/Ours"] == 42.0
     assert round(
-        fig3_metadata["inference_latency_error_bar"]["Sunny/Ours"],
+        fig3_metadata["inference_latency_error_bar"]["Rainy/Ours"],
         6,
     ) == 0.57735
     assert fig3_metadata["inference_latency_error_bar_definition"] == (
@@ -239,7 +233,7 @@ def test_complete_normalized_data_generates_exactly_three_figure_sets(tmp_path: 
     assert fig1_metadata["event_marker_policy"] == (
         "only trigger_decision events paired to a later model_update_applied are shown"
     )
-    assert fig1_metadata["event_counts"]["Sunny/Ours"] == {
+    assert fig1_metadata["event_counts"]["Rainy/Ours"] == {
         "trigger_decision": 3,
         "model_update_applied": 3,
     }
@@ -279,11 +273,11 @@ def test_fig1_omits_unpaired_trigger_markers(tmp_path: Path) -> None:
         empty_row(
             ADAPTATION_FIELDS,
             comparison_id="c",
-            run_id="sunny-0-r1",
+            run_id="rainy-0-r1",
             method="plank_road",
             edge_id=1,
-            scenario_name="Sunny",
-            video_slug="sunny",
+            scenario_name="Rainy",
+            video_slug="rainy",
             event_name="trigger_decision",
             event_time_ms=20_000,
             frame_id=450,
@@ -295,16 +289,16 @@ def test_fig1_omits_unpaired_trigger_markers(tmp_path: Path) -> None:
     report = plot_figures(normalized, figures)
 
     metadata = report["figure_metadata"]["fig1_dynamic_accuracy_recovery"]
-    assert metadata["event_counts"]["Sunny/Ours"] == {
+    assert metadata["event_counts"]["Rainy/Ours"] == {
         "trigger_decision": 1,
         "model_update_applied": 1,
     }
-    assert metadata["unpaired_event_counts"]["Sunny/Ours"] == {
+    assert metadata["unpaired_event_counts"]["Rainy/Ours"] == {
         "trigger_decision": 1,
         "model_update_applied": 0,
     }
     assert any(
-        "Sunny/Ours omitted unpaired Fig.1 events: 1 trigger_decision, "
+        "Rainy/Ours omitted unpaired Fig.1 events: 1 trigger_decision, "
         "0 model_update_applied" in warning
         for warning in report["partial_data"]["fig1_dynamic_accuracy_recovery"]
     )
@@ -317,9 +311,9 @@ def test_fig1_omits_markers_with_conflicting_shared_identities(tmp_path: Path) -
     event_rows = read_csv(normalized / "adaptation_events.csv")
     for row in event_rows:
         if (
-            row["scenario_name"] == "Sunny"
+            row["scenario_name"] == "Rainy"
             and row["method"] == "plank_road"
-            and row["run_id"] == "sunny-0-r1"
+            and row["run_id"] == "rainy-0-r1"
             and row["event_name"] == "model_update_applied"
         ):
             row["job_id"] = "conflicting-job"
@@ -328,11 +322,11 @@ def test_fig1_omits_markers_with_conflicting_shared_identities(tmp_path: Path) -
     report = plot_figures(normalized, figures)
 
     metadata = report["figure_metadata"]["fig1_dynamic_accuracy_recovery"]
-    assert metadata["event_counts"]["Sunny/Ours"] == {
+    assert metadata["event_counts"]["Rainy/Ours"] == {
         "trigger_decision": 0,
         "model_update_applied": 0,
     }
-    assert metadata["unpaired_event_counts"]["Sunny/Ours"] == {
+    assert metadata["unpaired_event_counts"]["Rainy/Ours"] == {
         "trigger_decision": 1,
         "model_update_applied": 1,
     }
@@ -389,11 +383,11 @@ def test_fig3_averages_repeated_component_observations_instead_of_summing(
         empty_row(
             LATENCY_FIELDS,
             comparison_id="c",
-            run_id="sunny-0-r1",
+            run_id="rainy-0-r1",
             method="plank_road",
             edge_id=1,
-            scenario_name="Sunny",
-            video_slug="sunny",
+            scenario_name="Rainy",
+            video_slug="rainy",
             window_id="w-1",
             training_ms=2000,
         )
@@ -405,7 +399,7 @@ def test_fig3_averages_repeated_component_observations_instead_of_summing(
     component_seconds = report["figure_metadata"]["fig3_retraining_time_breakdown"][
         "component_seconds"
     ]
-    assert component_seconds["Sunny/Ours"]["Ours-Retrain"] == 1.5
+    assert component_seconds["Rainy/Ours"]["Ours-Retrain"] == 1.5
 
 
 def test_fig3_omits_missing_inference_latency_without_skipping_breakdown(
@@ -416,7 +410,7 @@ def test_fig3_omits_missing_inference_latency_without_skipping_breakdown(
     _write_complete_normalized(normalized, repeats=1)
     summary_rows = read_csv(normalized / "summary.csv")
     for row in summary_rows:
-        if row["scenario_name"] == "Sunny" and row["method"] == "plank_road":
+        if row["scenario_name"] == "Rainy" and row["method"] == "plank_road":
             row["mean_latency_ms"] = ""
     write_csv(normalized / "summary.csv", SUMMARY_FIELDS, summary_rows)
 
@@ -424,10 +418,10 @@ def test_fig3_omits_missing_inference_latency_without_skipping_breakdown(
 
     metadata = report["figure_metadata"]["fig3_retraining_time_breakdown"]
     assert "fig3_retraining_time_breakdown" in report["generated_figures"]
-    assert "Sunny/Ours" not in metadata["inference_latency_ms"]
-    assert metadata["component_seconds"]["Sunny/Ours"]["Ours-Retrain"] > 0
+    assert "Rainy/Ours" not in metadata["inference_latency_ms"]
+    assert metadata["component_seconds"]["Rainy/Ours"]["Ours-Retrain"] > 0
     assert any(
-        "Sunny/Ours/sunny-0-r1: mean_latency_ms missing for Fig.3 inference latency"
+        "Rainy/Ours/rainy-0-r1: mean_latency_ms missing for Fig.3 inference latency"
         in warning
         for warning in report["partial_data"]["fig3_retraining_time_breakdown"]
     )
@@ -458,38 +452,6 @@ def test_single_scenario_results_do_not_draw_empty_scenario_panels(tmp_path: Pat
         "Snowy"
     ]
     assert metadata["fig3_retraining_time_breakdown"]["selected_scenarios"] == ["Snowy"]
-
-
-def test_snowy_foggy_is_a_formal_single_scenario(tmp_path: Path) -> None:
-    normalized = tmp_path / "normalized"
-    figures = tmp_path / "figures"
-    _write_complete_normalized(normalized, repeats=1)
-    for filename, fields in (
-        ("frame_metrics.csv", FRAME_FIELDS),
-        ("adaptation_events.csv", ADAPTATION_FIELDS),
-        ("latency_breakdown.csv", LATENCY_FIELDS),
-        ("summary.csv", SUMMARY_FIELDS),
-    ):
-        rows = [
-            row
-            for row in read_csv(normalized / filename)
-            if row["scenario_name"] == "Snowy"
-        ]
-        for row in rows:
-            row["scenario_name"] = "snowy_foggy"
-            row["video_slug"] = "snowy_foggy"
-        write_csv(normalized / filename, fields, rows)
-
-    report = plot_figures(normalized, figures)
-
-    metadata = report["figure_metadata"]
-    assert metadata["fig1_dynamic_accuracy_recovery"]["selected_scenario"] == "Snowy & Foggy"
-    assert metadata["fig2_accuracy_retraining_time_tradeoff"]["selected_scenarios"] == [
-        "Snowy & Foggy"
-    ]
-    assert metadata["fig3_retraining_time_breakdown"]["selected_scenarios"] == [
-        "Snowy & Foggy"
-    ]
 
 
 def test_missing_frame_accuracy_skips_fig1_but_fig2_uses_summary(

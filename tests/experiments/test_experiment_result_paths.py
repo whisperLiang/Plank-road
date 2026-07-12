@@ -16,13 +16,13 @@ from tools.experiments.experiment_common import ManifestError, load_manifest, sc
 def test_paths_are_dimension_first_and_repeat_separated() -> None:
     root = "results/experiments"
 
-    first = edge_run_dir(root, "exp", "Sunny", 2, 1, "plank_road", 1)
-    second = edge_run_dir(root, "exp", "Sunny", 2, 2, "plank_road", 1)
-    rerun = edge_run_dir(root, "exp", "Sunny", 2, "r01", "plank_road", 1)
-    cloud = cloud_run_dir(root, "exp", "Sunny", 2, 1, "plank_road")
+    first = edge_run_dir(root, "exp", "Rainy", 2, 1, "plank_road", 1)
+    second = edge_run_dir(root, "exp", "Rainy", 2, 2, "plank_road", 1)
+    rerun = edge_run_dir(root, "exp", "Rainy", 2, "r01", "plank_road", 1)
+    cloud = cloud_run_dir(root, "exp", "Rainy", 2, 1, "plank_road")
 
     assert first == Path(
-        "results/experiments/exp/raw_logs/sunny_n2_r01_plank_road/edge_1"
+        "results/experiments/exp/raw_logs/rainy_n2_r01_plank_road/edge_1"
     )
     assert rerun == first
     assert second != first
@@ -34,7 +34,7 @@ def test_edge_paths_reject_edge_ids_above_declared_edge_count() -> None:
         edge_run_dir(
             "results/experiments",
             "exp",
-            "sunny",
+            "rainy",
             1,
             1,
             "plank_road",
@@ -45,7 +45,7 @@ def test_edge_paths_reject_edge_ids_above_declared_edge_count() -> None:
         cloud_repository_edge_run_dir(
             "results/experiments",
             "exp",
-            "sunny",
+            "rainy",
             1,
             1,
             "plank_road",
@@ -63,9 +63,9 @@ def test_manifest_expands_matrix_and_reports_generated_paths(tmp_path: Path) -> 
                 "methods": ["plank_road", "pure_edge_local_updating"],
                 "scenarios": [
                     {
-                        "scenario_name": "Sunny",
-                        "scenario_slug": "sunny",
-                        "video_path": "video_data/sunny.mp4",
+                        "scenario_name": "Rainy",
+                        "scenario_slug": "rainy",
+                        "video_path": "video_data/rainy.mp4",
                     }
                 ],
                 "edge_counts": [1, 2],
@@ -85,12 +85,12 @@ def test_manifest_expands_matrix_and_reports_generated_paths(tmp_path: Path) -> 
         for item in manifest["runs"]
         if item["method"] == "plank_road" and item["edge_count"] == 2 and item["repeat"] == 2
     )
-    assert run["run_id"] == "sunny_n2_r02_plank_road"
+    assert run["run_id"] == "rainy_n2_r02_plank_road"
     assert run["raw_logs"]["cloud"] == (
-        "raw_logs/sunny_n2_r02_plank_road/cloud"
+        "raw_logs/rainy_n2_r02_plank_road/cloud"
     )
     assert run["raw_logs"]["edges"]["2"] == (
-        "raw_logs/sunny_n2_r02_plank_road/edge_2"
+        "raw_logs/rainy_n2_r02_plank_road/edge_2"
     )
 
 
@@ -104,9 +104,9 @@ def test_manifest_rejects_edge_ids_above_declared_edge_count(tmp_path: Path) -> 
                 "methods": ["plank_road"],
                 "scenarios": [
                     {
-                        "scenario_name": "Sunny",
-                        "scenario_slug": "sunny",
-                        "video_path": "video_data/sunny.mp4",
+                        "scenario_name": "Rainy",
+                        "scenario_slug": "rainy",
+                        "video_path": "video_data/rainy.mp4",
                     }
                 ],
                 "edge_counts": [1],

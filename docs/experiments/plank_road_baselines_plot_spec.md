@@ -8,9 +8,8 @@ as SVG, PDF, TIFF, and PNG. The figures compare the same method order:
 3. `accuracy_trigger_cloud_retraining` -> Accuracy-Trigger
 4. `ekya_style_cloud_scheduling` -> Ekya-style
 
-The scenario order is Sunny, Rainy, Snowy, mapped explicitly to:
+The scenario order is Rainy, Snowy, mapped explicitly to:
 
-- Sunny: `video_data/sunny.mp4`
 - Rainy: `video_data/rainy.mp4`
 - Snowy: `video_data/snowy.mp4`
 

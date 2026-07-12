@@ -48,7 +48,7 @@ REMOVED_FIGURE_STEMS = (
 )
 EXPORT_SUFFIXES = (".svg", ".pdf", ".tiff", ".png")
 EXPORT_DPI = 600
-SCENARIO_ORDER = ("Sunny", "Rainy", "Snowy", "Snowy & Foggy")
+SCENARIO_ORDER = ("Rainy", "Snowy")
 DEFAULT_VIDEO_PATHS = {
     "Rainy": "video_data/rainy.mp4",
     "Snowy": "video_data/snowy.mp4",

@@ -27,7 +27,7 @@ do not launch edge or cloud processes and do not synthesize missing metrics.
 Final paper figures require:
 
 ```text
-Sunny / Rainy / Snowy Suwon #5a videos
+Rainy / Snowy Suwon #5a videos
 x
 Ours / Pure Edge / Accuracy-Trigger / Ekya-style
 x
@@ -42,7 +42,6 @@ The weather scenario mapping is explicit:
 
 | Scenario | Video file |
 |---|---|
-| Sunny | `video_data/sunny.mp4` |
 | Rainy | `video_data/rainy.mp4` |
 | Snowy | `video_data/snowy.mp4` |
 
@@ -110,7 +109,7 @@ The main plotting command emits exactly:
 ## Figure Semantics
 
 Fig. 1, Dynamic Accuracy Recovery, shows Teacher-supervised F1 over frame ID
-for Sunny, Rainy, and Snowy. Each method curve is the mean across repeats, with
+for Rainy and Snowy. Each method curve is the mean across repeats, with
 a standard-deviation band. The plotter does not interpolate missing frame IDs.
 Trigger and update markers show paired adaptation cycles; unpaired trigger or
 update events are omitted from the marker layer and reported.

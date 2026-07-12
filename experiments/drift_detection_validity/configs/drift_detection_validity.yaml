@@ -16,9 +16,6 @@ data:
   start_margin_seconds: 2.0
   end_margin_seconds: 2.0
   scene_videos:
-    - scene_id: sunny
-      scene_label: Sunny
-      video_path: video_data/sunny.mp4
     - scene_id: rainy
       scene_label: Rainy
       video_path: video_data/rainy.mp4
