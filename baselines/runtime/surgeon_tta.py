@@ -21,7 +21,6 @@ from edge.sample_quality import (
     EntropyQualityStats,
 )
 from edge.window_drift_detector import WindowDriftDetector
-from model_management.activation_sparsity import apply_das_to_model, compute_tgi
 from model_management.model_zoo import build_detection_model, get_model_family
 
 _SIGMOID_FOREGROUND_PROBABILITY_FLOOR = 0.5
@@ -44,7 +43,6 @@ class PendingLocalTTAUpdate:
     batch_size: int
     num_epoch: int
     loss: float
-    das_enabled: bool
     trainable_param_count: int
     low_quality_sample_count: int
     started_perf: float
@@ -292,7 +290,6 @@ class SurgeonLocalTTAUpdater:
         baseline_cfg = getattr(config, "baseline", None)
         self.method_cfg = getattr(baseline_cfg, "pure_edge_local_updating", None)
         self.training_cfg = getattr(baseline_cfg, "training", None)
-        self.das_cfg = getattr(config, "das", None)
         quality_cfg = getattr(config, "sample_quality", None)
         drift_cfg = getattr(config, "window_drift", None)
 
@@ -393,21 +390,17 @@ class SurgeonLocalTTAUpdater:
         self._running_thread: threading.Thread | None = None
         self._pending_local_update: PendingLocalTTAUpdate | None = None
         self._closed = threading.Event()
-        self._das_trainer = None
-        self._das_model_id: int | None = None
 
     def attach_edge(self, edge) -> None:
         self._edge = edge
         logger.info(
             "[PureEdgeSURGEON] attached training_frame_count={} "
-            "train_sample_count={} num_epoch={} batch_size={} quality_mode={} "
-            "das_enabled={}",
+            "train_sample_count={} num_epoch={} batch_size={} quality_mode={}",
             self.training_frame_count,
             self.train_sample_count,
             self.num_epoch,
             self.batch_size,
             self.quality_mode,
-            bool(getattr(self.das_cfg, "enabled", False)),
         )
 
     def observe_sample(
@@ -696,7 +689,6 @@ class SurgeonLocalTTAUpdater:
             batch_size=int(train_result["batch_size"]),
             num_epoch=int(self.num_epoch),
             loss=float(train_result["loss"]),
-            das_enabled=bool(train_result["das_enabled"]),
             trainable_param_count=int(train_result["trainable_param_count"]),
             low_quality_sample_count=len(samples),
             started_perf=float(started_perf),
@@ -768,7 +760,6 @@ class SurgeonLocalTTAUpdater:
             loss=float(update.loss),
             duration_ms=float(duration_ms),
             shadow_train_ms=float(update.shadow_train_ms),
-            das_enabled=bool(update.das_enabled),
             trainable_param_count=int(update.trainable_param_count),
             model_version_before=str(update.model_version_before),
             model_version_after=str(model_version_after),
@@ -920,7 +911,6 @@ class SurgeonLocalTTAUpdater:
             int(self.num_epoch),
         )
         try:
-            das_trainer = self._ensure_das_trainer(trainable_model)
             self._select_trainable_parameters(trainable_model)
             trainable_params = [
                 param for param in trainable_model.parameters() if param.requires_grad
@@ -931,13 +921,6 @@ class SurgeonLocalTTAUpdater:
             optimizer = self._make_optimizer(trainable_params)
             if hasattr(trainable_model, "train"):
                 trainable_model.train(True)
-            if das_trainer is not None:
-                self._probe_das(
-                    adapter,
-                    _move_batch_to_device(mini_batches[0], training_device),
-                    trainable_model,
-                    das_trainer,
-                )
             losses: list[float] = []
             for epoch_index in range(self.num_epoch):
                 epoch_started = time.perf_counter()
@@ -997,7 +980,7 @@ class SurgeonLocalTTAUpdater:
                 logger.info(
                     "[PureEdgeSURGEON][Train] epoch={}/{} loss={:.6f} "
                     "entropy_loss={:.6f} consistency_loss={:.6f} samples={} "
-                    "mini_batch_size={} selected_logits={}/{} model_version={} das_enabled={} "
+                    "mini_batch_size={} selected_logits={}/{} model_version={} "
                     "epoch_ms={:.3f}",
                     epoch,
                     self.num_epoch,
@@ -1009,7 +992,6 @@ class SurgeonLocalTTAUpdater:
                     epoch_selected_logit_count,
                     epoch_logit_count,
                     model_version_before,
-                    bool(das_trainer is not None),
                     epoch_ms,
                 )
                 self.metrics.record(
@@ -1025,7 +1007,6 @@ class SurgeonLocalTTAUpdater:
                     mini_batch_size=int(mini_batch_size),
                     logit_count=int(epoch_logit_count),
                     selected_logit_count=int(epoch_selected_logit_count),
-                    das_enabled=bool(das_trainer is not None),
                     model_version=str(model_version_before),
                     epoch_ms=float(epoch_ms),
                 )
@@ -1040,13 +1021,11 @@ class SurgeonLocalTTAUpdater:
                 loss=float(final_loss),
                 shadow_train_ms=float(shadow_train_ms),
                 model_version_before=str(model_version_before),
-                das_enabled=bool(das_trainer is not None),
                 trainable_param_count=int(trainable_param_count),
             )
             return {
                 "batch_size": total_sample_count,
                 "loss": final_loss,
-                "das_enabled": das_trainer is not None,
                 "trainable_param_count": trainable_param_count,
                 "shadow_train_ms": shadow_train_ms,
                 "trained_state_dict": _clone_state_dict_to_cpu(trainable_model.state_dict()),
@@ -1059,9 +1038,6 @@ class SurgeonLocalTTAUpdater:
                 module_training_state,
                 previous_mode,
             )
-            if self._das_model_id == id(trainable_model):
-                self._das_trainer = None
-                self._das_model_id = None
 
     def _apply_shadow_update_locked(
         self,
@@ -1104,32 +1080,6 @@ class SurgeonLocalTTAUpdater:
             return torch.device(configured)
         device = snapshot.get("device")
         return device if isinstance(device, torch.device) else torch.device(str(device or "cpu"))
-
-    def _ensure_das_trainer(self, model: torch.nn.Module):
-        if not bool(getattr(self.das_cfg, "enabled", False)):
-            return None
-        if self._das_trainer is not None and self._das_model_id == id(model):
-            return self._das_trainer
-        self._das_trainer = apply_das_to_model(
-            model,
-            bn_only=bool(getattr(self.das_cfg, "bn_only", True)),
-            probe_samples=int(getattr(self.das_cfg, "probe_samples", 10)),
-            strategy=str(getattr(self.das_cfg, "strategy", "tgi")),
-            use_spectral_entropy=bool(getattr(self.das_cfg, "use_spectral_entropy", False)),
-            device=_model_device(model),
-        )
-        self._das_model_id = id(model)
-        return self._das_trainer
-
-    def _probe_das(self, adapter, batch, model, das_trainer) -> None:
-        das_trainer.deactivate_sparsity()
-        _clear_gradients(model)
-        outputs = adapter.forward_tta_outputs(batch)
-        loss, _ = adapter.entropy_loss(outputs)
-        loss.backward()
-        ratios = _compute_pruning_ratios(model)
-        _clear_gradients(model)
-        das_trainer.activate_sparsity(ratios)
 
     def _select_trainable_parameters(self, model: torch.nn.Module) -> None:
         for param in model.parameters():
@@ -1417,43 +1367,6 @@ def _enable_norm_affine_parameters(model: torch.nn.Module) -> int:
                 param.requires_grad_(True)
                 selected += int(param.numel())
     return selected
-
-
-def _compute_pruning_ratios(model: torch.nn.Module) -> dict[str, float]:
-    names: list[str] = []
-    params: list[torch.Tensor] = []
-    grads: list[torch.Tensor] = []
-    for name, param in model.named_parameters():
-        if param.grad is None:
-            continue
-        names.append(name)
-        params.append(param)
-        grads.append(param.grad.detach().clone())
-    if not names:
-        return {}
-    layer_memories: dict[str, float] = {}
-    memory_sum = 0.0
-    for module_name, module in model.named_modules():
-        if not hasattr(module, "activation_size"):
-            continue
-        key = f"{module_name}.weight" if module_name else "weight"
-        memory = float(getattr(module, "activation_size", 1) or 1)
-        layer_memories[key] = memory
-        memory_sum += memory
-    tgi = compute_tgi(
-        params,
-        grads,
-        names,
-        [layer_memories.get(name, 1.0) for name in names],
-        memory_sum,
-    )
-    finite = {key: float(value) for key, value in tgi.items() if math.isfinite(float(value))}
-    if not finite:
-        return {}
-    max_score = max(finite.values())
-    if max_score <= 0.0:
-        return {key: 0.0 for key in finite}
-    return {key: min(1.0, max(0.0, 1.0 - value / max_score)) for key, value in finite.items()}
 
 
 def _model_device(model: object) -> torch.device:

@@ -428,15 +428,6 @@ class PipelineLifecycleMixin:
         os.makedirs(self.split_contract_root, exist_ok=True)
         self._fixed_split_runtime_template_cache = get_fixed_split_runtime_template_cache()
 
-        # Dynamic Activation Sparsity (SURGEON) config
-        das_cfg = getattr(config, "das", None)
-        self.das_enabled = bool(getattr(das_cfg, "enabled", False)) if das_cfg else False
-        self.das_bn_only = bool(getattr(das_cfg, "bn_only", False)) if das_cfg else False
-        self.das_probe_samples = int(getattr(das_cfg, "probe_samples", 10)) if das_cfg else 10
-        self.das_strategy = str(getattr(das_cfg, "strategy", "tgi")) if das_cfg else "tgi"
-        if das_cfg and bool(getattr(das_cfg, "use_spectral_entropy", False)):
-            self.das_strategy = "entropy"
-
         self._edge_locks_guard = threading.Lock()
         self._edge_locks: dict[str, threading.Lock] = {}
         self._job_state_lock = threading.Lock()

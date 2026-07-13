@@ -73,13 +73,6 @@ def _config(tmp_path: Path) -> SimpleNamespace:
             low_quality_rate_threshold=0.5,
             persistence_windows=1,
         ),
-        das=SimpleNamespace(
-            enabled=False,
-            bn_only=True,
-            probe_samples=2,
-            strategy="tgi",
-            use_spectral_entropy=False,
-        ),
     )
 
 
@@ -206,34 +199,6 @@ def _finish_pending_tta(adapter: BaselineEdgeAdapter) -> None:
     assert adapter._surgeon_tta is not None
     assert adapter._surgeon_tta.wait_for_idle(timeout=5.0)
     assert adapter._surgeon_tta.try_apply_pending_update()
-
-
-def test_das_shadow_training_releases_cached_trainer(tmp_path) -> None:
-    model = ToyTTAModel()
-    model.eval()
-    edge = FakeEdge(model)
-    config = _config(tmp_path)
-    config.das.enabled = True
-    adapter = BaselineEdgeAdapter(
-        config=config,
-        baseline_method="pure_edge_local_updating",
-        run_id="pure-surgeon-das-test",
-        edge_id=1,
-        transport=None,
-    )
-    try:
-        adapter.before_video_start(edge)
-        _sample(adapter, 1)
-        _sample(adapter, 2)
-        assert adapter._surgeon_tta is not None
-        assert adapter._surgeon_tta.wait_for_idle(timeout=5.0)
-        assert adapter._surgeon_tta._pending_local_update is not None
-        assert adapter._surgeon_tta._das_trainer is None
-        assert adapter._surgeon_tta._das_model_id is None
-        assert adapter._surgeon_tta.try_apply_pending_update()
-        assert edge.model_version == "surgeon_1"
-    finally:
-        adapter.close()
 
 
 class RFDETRLikeWrapper(torch.nn.Module):

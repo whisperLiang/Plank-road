@@ -86,5 +86,3 @@ class FixedSplitTrainingContext:
     tinynext_proxy_evaluator: Callable[..., Mapping[str, object]] | None = None
     retrain_profile: Any = None
     logger: Any = None
-    oom_fallback_batch_size: int = 16
-    is_recoverable_oom: Callable[[BaseException], bool] | None = None

@@ -264,8 +264,6 @@ server:
    max_active_gpu_workers: auto
    default_estimated_job_memory_gb: 18
    adaptive_peak_memory_estimation: true
-   fallback_to_exclusive_on_oom: true
-   max_exclusive_retries: 1
    lease_ttl_sec: 120
    heartbeat_interval_sec: 10
    teacher_reserved_memory_gb: 0
@@ -346,26 +344,3 @@ server:
    oom_retry_enabled: true
    min_worker_batch_size: 1
    cache_root_dir: "./cache/teacher_label_cache"
- # Dynamic Activation Sparsity (SURGEON-style layer pruning)
- # Reference: SURGEON (CVPR 2025)
- # https://github.com/kadmkbl/SURGEON
- #
- # When enabled, Conv/BN/FC layers in the **tail partition** (rpn +
- # roi_heads) are replaced with AutoFreeze versions that dynamically
- # prune activations stored for the backward pass.
- #
- # Per-layer pruning ratios are computed via TGI (Total Gradient
- # Importance = gradient_norm / sqrt(numel) × log(M_total / M_layer)).
- # Layers with higher TGI keep more activations.
- das:
-  enabled: False
-  # bn_only: True → only BN parameters are updated; Conv/FC weight
-  #   gradients are blocked.  Useful for conservative adaptation.
-  bn_only: False
-  # DAS strategy:
-  #   tgi     -> probe gradients and compute TGI-based pruning ratios
-  #   entropy -> use per-layer feature spectral entropy online without probing
-  strategy: entropy
-  # Number of samples used for gradient-importance probing each epoch.
-  # Ignored when strategy=entropy.
-  probe_samples: 10

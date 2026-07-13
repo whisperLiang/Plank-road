@@ -2,7 +2,7 @@
 
 Plank-Road is a multi-edge edge-cloud video analytics system for drift-aware continual learning under resource constraints. It targets low-latency edge inference and on-demand cloud adaptation when bandwidth, edge compute, and privacy-constrained cloud training resources are limited.
 
-The implementation combines startup-time fixed split planning, structured edge sample caching, a Lyapunov resource-aware trigger, gRPC training bundles, shard-backed feature cache, split-tail cloud retraining, and optional dynamic activation sparsity.
+The implementation combines startup-time fixed split planning, structured edge sample caching, a Lyapunov resource-aware trigger, gRPC training bundles, shard-backed feature cache, and split-tail cloud retraining.
 
 ## Overview
 
@@ -16,7 +16,7 @@ During online execution, video frames pass through differencing/filtering before
 
 The continual-learning trigger combines teacher-needed sample rate, drift signals, cloud resource pressure, upload volume, and link bandwidth. Its Lyapunov controller decides whether to skip training, upload teacher-needed raw samples only, or upload teacher-needed raw samples together with intermediate features.
 
-When training is triggered, the edge sends a gRPC bundle with cached features/results, teacher-needed raw samples, optional teacher-needed features, drift tags, and split metadata. The cloud annotates teacher-needed raw samples with the large model, reconstructs missing features when needed, retrains the split-tail network, optionally applies dynamic activation sparsity, and returns updated lightweight weights to the originating edge.
+When training is triggered, the edge sends a gRPC bundle with cached features/results, teacher-needed raw samples, optional teacher-needed features, drift tags, and split metadata. The cloud annotates teacher-needed raw samples with the large model, reconstructs missing features when needed, retrains the split-tail network, and returns updated lightweight weights to the originating edge.
 
 ## Quick Start
 
@@ -100,7 +100,7 @@ Plank-road/
 |   `-- workers/                # Edge-affine workers, assignment, MPS, GPU leases
 |-- grpc_server/                # Protobuf contract, RPC server, jobs, workspace helpers
 |   `-- protos/                 # message_transmission.proto and generated stubs
-|-- model_management/           # Detectors, inference helpers, fixed split, DAS, runtimes
+|-- model_management/           # Detectors, inference helpers, fixed split, runtimes
 |   |-- detectors/
 |   |-- inference/
 |   `-- split_runtime/
@@ -174,9 +174,6 @@ server:
       accepted_storage_formats:
         - safetensors_shard
         - npy_memmap_shard
-  das:
-    enabled: False
-    strategy: entropy
   edge_affine_workers:
     enabled: true
     mode: edge_affine_single_gpu_mps

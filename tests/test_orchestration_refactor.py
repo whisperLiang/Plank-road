@@ -77,7 +77,6 @@ def _config(tmp_path: Path) -> SimpleNamespace:
         workspace_root=str(tmp_path / "workspace"),
         continual_learning=continual_learning,
         training_frame_count=2,
-        das=None,
         tinynext_input_size=320,
     )
 

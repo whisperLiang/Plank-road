@@ -17,20 +17,7 @@ _UNIVERSAL_EXPORTS = {
     "CandidateProfile",
 }
 
-_ACTIVATION_SPARSITY_EXPORTS = {
-    "DASTrainer",
-    "apply_das_to_model",
-    "apply_das_to_tail",
-    "AutoFreezeConv2d",
-    "DASBatchNorm2d",
-    "DASGroupNorm",
-    "DASLayerNorm",
-    "AutoFreezeFC",
-    "ActivationClipper",
-    "compute_tgi",
-}
-
-__all__ = sorted(_UNIVERSAL_EXPORTS | _ACTIVATION_SPARSITY_EXPORTS | {"BoundaryPayload"})
+__all__ = sorted(_UNIVERSAL_EXPORTS | {"BoundaryPayload"})
 
 
 def __getattr__(name: str) -> Any:
@@ -38,12 +25,6 @@ def __getattr__(name: str) -> Any:
         from model_management import universal_model_split
 
         value = getattr(universal_model_split, name)
-        globals()[name] = value
-        return value
-    if name in _ACTIVATION_SPARSITY_EXPORTS:
-        from model_management import activation_sparsity
-
-        value = getattr(activation_sparsity, name)
         globals()[name] = value
         return value
     if name == "BoundaryPayload":

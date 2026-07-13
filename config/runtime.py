@@ -330,15 +330,6 @@ class ExperimentRunConfig(ConfigSection):
 
 
 @dataclass
-class DASConfig(ConfigSection):
-    enabled: bool = False
-    bn_only: bool = False
-    probe_samples: int = 10
-    strategy: str = "tgi"
-    use_spectral_entropy: bool = False
-
-
-@dataclass
 class EdgeWorkerConfig(ConfigSection):
     assignment: str = "one_worker_per_edge"
     lazy_start: bool = True
@@ -368,8 +359,6 @@ class GpuLeaseConfig(ConfigSection):
     max_active_gpu_workers: int | str = "auto"
     default_estimated_job_memory_gb: float = 18.0
     adaptive_peak_memory_estimation: bool = True
-    fallback_to_exclusive_on_oom: bool = True
-    max_exclusive_retries: int = 1
     lease_ttl_sec: float = 120.0
     heartbeat_interval_sec: float = 10.0
     teacher_reserved_memory_gb: float = 0.0
@@ -523,7 +512,6 @@ class ServerConfig(ConfigSection):
     wait_thresh: int = 10
     listen_address: str = "[::]:50051"
     continual_learning: ContinualLearningConfig = field(default_factory=ContinualLearningConfig)
-    das: DASConfig = field(default_factory=DASConfig)
     workspace_root: str = "./cache/server_workspace"
     edge_affine_workers: EdgeAffineWorkersConfig = field(default_factory=EdgeAffineWorkersConfig)
     baselines: ServerBaselinesConfig = field(default_factory=ServerBaselinesConfig)
@@ -545,7 +533,6 @@ class RuntimeConfig(ConfigSection):
     def __post_init__(self) -> None:
         self.client.experiment_results = self.experiment_results
         self.server.experiment_results = self.experiment_results
-        self.client.das = self.server.das
         self.server.training_frame_count = int(self.baseline.training.training_frame_count)
 
 
@@ -624,7 +611,6 @@ def _section(section_cls, value: Mapping[str, Any] | None):
             ContinualLearningConfig,
             known.get("continual_learning"),
         )
-        known["das"] = _section(DASConfig, known.get("das"))
         known["edge_affine_workers"] = _section(
             EdgeAffineWorkersConfig,
             known.get("edge_affine_workers"),
@@ -1823,17 +1809,6 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             "server.continual_learning.feature_cache.gc_dry_run must be a boolean, "
             f"got {feature_cache.gc_dry_run!r}"
         )
-    _validate_positive(
-        "server.das.probe_samples",
-        int(config.server.das.probe_samples),
-    )
-    das_strategy = str(config.server.das.strategy).strip().lower()
-    if das_strategy not in {"tgi", "entropy"}:
-        raise ValueError(
-            "server.das.strategy must be one of {'tgi', 'entropy'}, "
-            f"got {config.server.das.strategy!r}"
-        )
-
     if not str(config.client.server_ip).strip():
         raise ValueError("client.server_ip must be a non-empty host:port string")
     if not str(config.server.listen_address).strip():

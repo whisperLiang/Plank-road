@@ -1443,7 +1443,6 @@ def _prepare_configs(args: argparse.Namespace) -> tuple[Any, Any]:
     server_cfg.weights_path = _resolve_local_weights_path(str(args.edge_model))
     server_cfg.continual_learning.num_epoch = int(args.epochs)
     server_cfg.continual_learning.batch_size = int(args.batch_size)
-    server_cfg.das.enabled = False
     return client_cfg, server_cfg
 
 

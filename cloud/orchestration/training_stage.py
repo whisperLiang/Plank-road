@@ -24,7 +24,6 @@ from cloud.training import (
     ProxyEvalConfig,
     get_training_adapter,
 )
-from cloud.training.proxy_metadata import is_cuda_oom_error as _is_cuda_oom_error
 from cloud.training.types import FixedSplitTrainingResult
 from model_management.split_model_adapters import (
     build_split_training_loss,
@@ -258,10 +257,6 @@ class TrainingStageMixin:
             "device": self.device,
             "learning_rate": effective_learning_rate,
             "loss_fn": build_split_training_loss(model),
-            "das_enabled": self.das_enabled,
-            "das_bn_only": self.das_bn_only,
-            "das_probe_samples": self.das_probe_samples,
-            "das_strategy": self.das_strategy,
             "splitter": prepared_splitter,
             "chosen_candidate": prepared_candidate,
             "batch_size": bs,
@@ -350,7 +345,6 @@ class TrainingStageMixin:
                 tinynext_proxy_evaluator=_tinynext_proxy_evaluator,
                 retrain_profile=retrain_profile,
                 logger=logger,
-                is_recoverable_oom=_is_cuda_oom_error,
             )
         )
         self._fixed_split_proxy_evaluator().set_detection_model_eval_mode(model)

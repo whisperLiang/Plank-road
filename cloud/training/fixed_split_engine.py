@@ -51,28 +51,12 @@ class FixedSplitRetrainEngine:
         optimizer = adapter.build_optimizer(context)
 
         for epoch in range(1, int(plan.epochs) + 1):
-            try:
-                epoch_result = adapter.train_one_epoch(
-                    context,
-                    epoch=epoch,
-                    total_epochs=int(plan.epochs),
-                    optimizer=optimizer,
-                )
-            except Exception as exc:
-                optimizer = self._retry_after_oom_if_possible(
-                    context,
-                    optimizer=optimizer,
-                    best_candidate=best_candidate,
-                    baseline_state=baseline_state,
-                    exc=exc,
-                    log=log,
-                )
-                epoch_result = adapter.train_one_epoch(
-                    context,
-                    epoch=epoch,
-                    total_epochs=int(plan.epochs),
-                    optimizer=optimizer,
-                )
+            epoch_result = adapter.train_one_epoch(
+                context,
+                epoch=epoch,
+                total_epochs=int(plan.epochs),
+                optimizer=optimizer,
+            )
 
             trained_epochs = epoch
             epoch_results.append(epoch_result)
@@ -229,46 +213,6 @@ class FixedSplitRetrainEngine:
             int(result.metrics.get("total_prediction_boxes", 0) or 0),
             float(result.elapsed),
         )
-
-    @staticmethod
-    def _retry_after_oom_if_possible(
-        context: FixedSplitTrainingContext,
-        *,
-        optimizer: Any,
-        best_candidate: CandidateState | None,
-        baseline_state: dict[str, object],
-        exc: Exception,
-        log: Any,
-    ) -> Any:
-        del optimizer
-        checker = context.is_recoverable_oom
-        fallback_batch_size = max(1, int(context.oom_fallback_batch_size))
-        if checker is None or not checker(exc):
-            raise exc
-        current_batch_size = int(context.training_kwargs.get("batch_size") or 0)
-        if current_batch_size <= fallback_batch_size:
-            raise exc
-        restore_state = (
-            best_candidate.state_dict
-            if best_candidate is not None and best_candidate.state_dict is not None
-            else baseline_state
-        )
-        context.model.load_state_dict(restore_state, strict=False)
-        _set_eval(context.model)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        context.training_kwargs["batch_size"] = fallback_batch_size
-        context.plan.effective_batch_size = fallback_batch_size
-        log.warning(
-            "[FixedSplitCL][TrainPlan] model_name={} model_family={} CUDA OOM at "
-            "batch_size={}; retrying with batch_size={}",
-            context.plan.model_name,
-            context.plan.model_family,
-            current_batch_size,
-            fallback_batch_size,
-        )
-        return context.adapter.build_optimizer(context)
-
 
 def _snapshot_model_state(model: torch.nn.Module) -> dict[str, object]:
     snapshot: dict[str, object] = {}

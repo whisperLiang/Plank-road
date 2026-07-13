@@ -1951,37 +1951,22 @@ class EdgeWorker:
         stats: PendingTrainingStats,
     ) -> TrainingDecision:
         if self.resource_trigger_enabled and self.resource_trigger is not None:
-            try:
-                cloud_state, bandwidth_mbps = self._resource_probe_snapshot()
-                return self.resource_trigger.decide(
-                    drift_detected=drift_state.drift_detected,
-                    cloud_state=cloud_state,
-                    bandwidth_mbps=bandwidth_mbps,
-                    sample_stats=stats,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Resource-aware trigger decision failed: {}.", safe_error_summary(exc)
-                )
+            cloud_state, bandwidth_mbps = self._resource_probe_snapshot()
+            return self.resource_trigger.decide(
+                drift_detected=drift_state.drift_detected,
+                cloud_state=cloud_state,
+                bandwidth_mbps=bandwidth_mbps,
+                sample_stats=stats,
+            )
 
-        should_train = (
-            stats.low_quality_count >= max(1, int(getattr(self, "min_low_quality_samples", 1)))
-            or drift_state.drift_detected
-        )
         return TrainingDecision(
-            train_now=bool(should_train),
+            train_now=False,
             send_low_conf_features=False,
-            urgency=1.0 if should_train else 0.0,
+            urgency=0.0,
             compute_pressure=0.0,
             bandwidth_pressure=0.0,
-            bundle_cap_bytes=int(
-                getattr(
-                    getattr(self.config, "resource_aware_trigger", None),
-                    "bundle_max_bytes",
-                    33554432,
-                )
-            ),
-            reason="Fallback trigger using low-quality sample count and window drift.",
+            bundle_cap_bytes=0,
+            reason="Resource-aware continual-learning trigger is disabled.",
         )
 
     def collect_data(self, task: Task, frame, inference: InferenceArtifacts) -> bool:

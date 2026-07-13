@@ -11,7 +11,6 @@ from uuid import uuid4
 
 from loguru import logger
 
-from cloud.workers.gpu_lease_manager import is_oom_message
 from common.logging_sanitizer import safe_error_summary
 from grpc_server import message_transmission_pb2
 from grpc_server.training_jobs import JOB_STATUS_SUCCEEDED
@@ -397,11 +396,9 @@ class EdgeWorkerRoutedContinualLearningBackend:
         self.edge_registry = edge_registry
         self.gpu_lease_manager = gpu_lease_manager
         self._submitted_jobs: dict[tuple[int, str], _SubmitRequestSnapshot] = {}
-        self._exclusive_retries: dict[tuple[int, str], str] = {}
 
     def close(self) -> None:
         self._submitted_jobs.clear()
-        self._exclusive_retries.clear()
 
     def _client(self, edge_id: int):
         if self.edge_registry is not None:
@@ -459,21 +456,6 @@ class EdgeWorkerRoutedContinualLearningBackend:
     ) -> message_transmission_pb2.TrainingJobStatusReply:
         edge_id = int(request.edge_id)
         job_id = str(request.job_id or "")
-        mapped_job_id = self._exclusive_retries.get((edge_id, job_id))
-        if mapped_job_id:
-            expired_reply = self._expired_lease_status_reply(
-                edge_id=edge_id,
-                original_job_id=job_id,
-                lease_job_id=mapped_job_id,
-            )
-            if expired_reply is not None:
-                return expired_reply
-            return self._mapped_status_reply(
-                edge_id=edge_id,
-                original_job_id=job_id,
-                retry_job_id=mapped_job_id,
-            )
-
         expired_reply = self._expired_lease_status_reply(
             edge_id=edge_id,
             original_job_id=job_id,
@@ -483,51 +465,17 @@ class EdgeWorkerRoutedContinualLearningBackend:
             return expired_reply
 
         reply = self._client(edge_id).get_training_job_status(request)
-        if (
-            reply.found
-            and str(reply.status).upper() == "FAILED"
-            and is_oom_message(reply.message)
-            and (edge_id, job_id) not in self._exclusive_retries
-        ):
-            return self._start_exclusive_retry(edge_id, job_id, failed_reply=reply)
         return reply
 
     def download_trained_model(
         self, request
     ) -> message_transmission_pb2.DownloadTrainedModelReply:
         edge_id = int(request.edge_id)
-        original_job_id = str(request.job_id or "")
-        retry_job_id = self._exclusive_retries.get((edge_id, original_job_id))
-        target_request = request
-        if retry_job_id:
-            target_request = message_transmission_pb2.DownloadTrainedModelRequest(
-                edge_id=edge_id,
-                job_id=retry_job_id,
-            )
-        reply = self._client(edge_id).download_trained_model(target_request)
-        if retry_job_id:
-            reply = message_transmission_pb2.DownloadTrainedModelReply(
-                success=reply.success,
-                job_id=original_job_id,
-                status=reply.status,
-                model_data=reply.model_data,
-                message=reply.message,
-                protocol_version=reply.protocol_version,
-                result_model_version=reply.result_model_version,
-            )
-        return reply
+        return self._client(edge_id).download_trained_model(request)
 
     def cancel_training_job(self, request) -> message_transmission_pb2.CancelTrainingJobReply:
         edge_id = int(request.edge_id)
-        original_job_id = str(request.job_id or "")
-        retry_job_id = self._exclusive_retries.get((edge_id, original_job_id))
-        target_request = request
-        if retry_job_id:
-            target_request = message_transmission_pb2.CancelTrainingJobRequest(
-                edge_id=edge_id,
-                job_id=retry_job_id,
-            )
-        return self._client(edge_id).cancel_training_job(target_request)
+        return self._client(edge_id).cancel_training_job(request)
 
     def report_edge_model_version(
         self, request
@@ -603,147 +551,20 @@ class EdgeWorkerRoutedContinualLearningBackend:
             exclusive_gpu_lease=bool(getattr(request, "exclusive_gpu_lease", False)),
         )
 
-    def _start_exclusive_retry(
-        self,
-        edge_id: int,
-        original_job_id: str,
-        *,
-        failed_reply: message_transmission_pb2.TrainingJobStatusReply,
-    ) -> message_transmission_pb2.TrainingJobStatusReply:
-        snapshot = self._submitted_jobs.get((edge_id, original_job_id))
-        if snapshot is None:
-            return failed_reply
-        logger.warning(
-            "[EdgeWorkerRoutedBackend] CUDA OOM for edge={} job={}; "
-            "restarting worker and scheduling exclusive retry",
-            edge_id,
-            original_job_id,
-        )
-        self.worker_pool.restart_worker(edge_id)
-        retry_request = snapshot.to_request(
-            retry_request_id=f"{snapshot.request_id or original_job_id}:exclusive-retry"
-        )
-        retry_reply = self._client(edge_id).submit_training_job(
-            retry_request,
-            exclusive_gpu_lease=True,
-        )
-        if not retry_reply.accepted or not retry_reply.job_id:
-            return message_transmission_pb2.TrainingJobStatusReply(
-                found=True,
-                job_id=original_job_id,
-                edge_id=edge_id,
-                status="FAILED",
-                queue_position=-1,
-                message=(
-                    failed_reply.message
-                    + f"; exclusive retry submission failed: {retry_reply.message}"
-                ),
-                request_id=failed_reply.request_id,
-                job_type=failed_reply.job_type,
-                submitted_at_ms=failed_reply.submitted_at_ms,
-                started_at_ms=failed_reply.started_at_ms,
-                finished_at_ms=failed_reply.finished_at_ms,
-                protocol_version=failed_reply.protocol_version,
-                base_model_version=failed_reply.base_model_version,
-                result_model_version=failed_reply.result_model_version,
-                worker_id=failed_reply.worker_id,
-            )
-        self._exclusive_retries[(edge_id, original_job_id)] = str(retry_reply.job_id)
-        self._submitted_jobs[(edge_id, str(retry_reply.job_id))] = snapshot
-        return self._mapped_status_reply(
-            edge_id=edge_id,
-            original_job_id=original_job_id,
-            retry_job_id=str(retry_reply.job_id),
-            fallback_status=retry_reply.status or "QUEUED",
-            fallback_queue_position=int(retry_reply.queue_position),
-            fallback_message="exclusive retry scheduled after CUDA OOM",
-        )
-
-    def _mapped_status_reply(
-        self,
-        *,
-        edge_id: int,
-        original_job_id: str,
-        retry_job_id: str,
-        fallback_status: str = "",
-        fallback_queue_position: int = -1,
-        fallback_message: str = "",
-    ) -> message_transmission_pb2.TrainingJobStatusReply:
-        retry_reply = self._client(edge_id).get_training_job_status(
-            message_transmission_pb2.TrainingJobStatusRequest(
-                edge_id=edge_id,
-                job_id=retry_job_id,
-            )
-        )
-        if not retry_reply.found:
-            return message_transmission_pb2.TrainingJobStatusReply(
-                found=True,
-                job_id=original_job_id,
-                edge_id=edge_id,
-                status=fallback_status or "QUEUED",
-                queue_position=fallback_queue_position,
-                message=fallback_message or "exclusive retry scheduled",
-            )
-        return message_transmission_pb2.TrainingJobStatusReply(
-            found=True,
-            job_id=original_job_id,
-            edge_id=retry_reply.edge_id,
-            status=retry_reply.status,
-            queue_position=retry_reply.queue_position,
-            message=retry_reply.message,
-            request_id=retry_reply.request_id,
-            job_type=retry_reply.job_type,
-            result_available=retry_reply.result_available,
-            submitted_at_ms=retry_reply.submitted_at_ms,
-            started_at_ms=retry_reply.started_at_ms,
-            finished_at_ms=retry_reply.finished_at_ms,
-            protocol_version=retry_reply.protocol_version,
-            base_model_version=retry_reply.base_model_version,
-            result_model_version=retry_reply.result_model_version,
-            worker_id=retry_reply.worker_id,
-        )
-
-
 @dataclass(frozen=True)
 class _SubmitRequestSnapshot:
     protocol_version: str
-    edge_id: int
     request_id: str
     job_type: int
-    cache_path: str
-    send_low_conf_features: bool
-    frame_indices: tuple[int, ...]
-    payload_zip: bytes
-    payload_bundle_path: str
     base_model_version: str
 
     @classmethod
     def from_request(cls, request) -> "_SubmitRequestSnapshot":
         return cls(
             protocol_version=str(getattr(request, "protocol_version", "") or ""),
-            edge_id=int(request.edge_id),
             request_id=str(request.request_id or ""),
             job_type=int(request.job_type),
-            cache_path=str(request.cache_path or ""),
-            send_low_conf_features=bool(request.send_low_conf_features),
-            frame_indices=tuple(int(value) for value in request.frame_indices),
-            payload_zip=bytes(request.payload_zip or b""),
-            payload_bundle_path=str(getattr(request, "payload_bundle_path", "") or ""),
             base_model_version=str(request.base_model_version or ""),
-        )
-
-    def to_request(self, *, retry_request_id: str | None = None):
-        return SimpleNamespace(
-            protocol_version=self.protocol_version,
-            edge_id=self.edge_id,
-            request_id=str(retry_request_id if retry_request_id is not None else self.request_id),
-            job_type=self.job_type,
-            cache_path=self.cache_path,
-            send_low_conf_features=self.send_low_conf_features,
-            frame_indices=list(self.frame_indices),
-            payload_zip=self.payload_zip,
-            payload_bundle_path=self.payload_bundle_path,
-            base_model_version=self.base_model_version,
         )
 
 
