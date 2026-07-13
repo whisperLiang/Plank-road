@@ -5,6 +5,13 @@ import pytest
 from config.runtime import load_runtime_config
 
 
+def test_default_config_loads_for_main_runtime() -> None:
+    config = load_runtime_config("./config/config.yaml")
+
+    assert config.baseline.enabled is False
+    assert config.server.edge_model_name == "yolo26n"
+
+
 @pytest.mark.parametrize(
     ("field", "replacement"),
     [

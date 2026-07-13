@@ -1017,7 +1017,10 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     resolved_teacher_model = str(
         _configured_value(ekya_cfg.teacher_model, config.server.golden)
     )
-    if not bool(ekya_cfg.allow_model_override):
+    ekya_baseline_active = bool(config.baseline.enabled) and str(config.baseline.method) == (
+        "ekya_style_cloud_scheduling"
+    )
+    if ekya_baseline_active and not bool(ekya_cfg.allow_model_override):
         if resolved_student_model != "rfdetr_nano":
             raise ValueError(
                 "server.baselines.ekya_style_cloud_scheduling.student_model "
