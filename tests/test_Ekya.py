@@ -9,25 +9,25 @@ import numpy as np
 import pytest
 from loguru import logger
 
-from cloud.baselines.ekya_style_cloud_scheduling.cloud_frame_receiver import CloudFrameReceiver
-from cloud.baselines.ekya_style_cloud_scheduling.config import parse_ekya_style_config
-from cloud.baselines.ekya_style_cloud_scheduling.frame_buffer import (
+from cloud.baselines.Ekya.cloud_frame_receiver import CloudFrameReceiver
+from cloud.baselines.Ekya.config import parse_ekya_style_config
+from cloud.baselines.Ekya.frame_buffer import (
     CloudFrameBuffer,
     CompletedFrameWindow,
     UploadedFrameRecord,
 )
-from cloud.baselines.ekya_style_cloud_scheduling.protocol import (
+from cloud.baselines.Ekya.protocol import (
     DetectionResultPacket,
     DisplayEventPacket,
     FrameUploadPacket,
 )
-from cloud.baselines.ekya_style_cloud_scheduling.scheduler import (
+from cloud.baselines.Ekya.scheduler import (
     EkyaThiefStyleScheduler,
     MicroProfileResult,
     SchedulerDecision,
 )
-from cloud.baselines.ekya_style_cloud_scheduling.trainer import TrainingResult
-from cloud.baselines.ekya_style_cloud_scheduling.unified_logger import EkyaUnifiedLogger
+from cloud.baselines.Ekya.trainer import TrainingResult
+from cloud.baselines.Ekya.unified_logger import EkyaUnifiedLogger
 from tools.experiments.experiment_common import read_csv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -83,7 +83,7 @@ def _runtime(tmp_path: Path):
                 proxy_eval_validation_fraction=0.25,
                 max_concurrent_jobs=1,
             ),
-            baselines=SimpleNamespace(ekya_style_cloud_scheduling=ekya),
+            baselines=SimpleNamespace(Ekya=ekya),
         ),
         client=SimpleNamespace(
             source=SimpleNamespace(video_path="./video_data/road.mp4"),
@@ -108,7 +108,7 @@ def _runtime(tmp_path: Path):
 
 def _packet(frame_idx: int, *, edge_id: int = 1, camera_id: int = 0) -> FrameUploadPacket:
     return FrameUploadPacket(
-        method="ekya_style_cloud_scheduling",
+        method="Ekya",
         run_id="run",
         edge_id=int(edge_id),
         camera_id=int(camera_id),
@@ -296,12 +296,12 @@ def _controller_for_admission_tests(
     drop_when_active: bool = True,
     max_concurrent_train_jobs: int = 1,
 ):
-    from cloud.baselines.ekya_style_cloud_scheduling.controller import (
+    from cloud.baselines.Ekya.controller import (
         EkyaStyleCloudSchedulingController,
     )
 
     runtime = _runtime(tmp_path)
-    retraining = runtime.server.baselines.ekya_style_cloud_scheduling.retraining
+    retraining = runtime.server.baselines.Ekya.retraining
     retraining.drop_training_when_active_same_connection = bool(drop_when_active)
     retraining.training_admission_scope = scope
     retraining.max_concurrent_train_jobs = int(max_concurrent_train_jobs)
@@ -325,7 +325,7 @@ def _training_candidate_for_test(
     score: float = 0.1,
     window_id: str | None = None,
 ):
-    from cloud.baselines.ekya_style_cloud_scheduling.controller import TrainingCandidate
+    from cloud.baselines.Ekya.controller import TrainingCandidate
 
     window = _decoded_window(
         edge_id=edge_id,
@@ -360,7 +360,7 @@ def _training_candidate_for_test(
 
 
 def test_window_to_samples_preserves_frames_and_skips_incomplete_records() -> None:
-    from cloud.baselines.ekya_style_cloud_scheduling.dataset import window_to_samples
+    from cloud.baselines.Ekya.dataset import window_to_samples
 
     window = _decoded_window()
     window.records[2].decoded_frame_bgr = None
@@ -373,7 +373,7 @@ def test_window_to_samples_preserves_frames_and_skips_incomplete_records() -> No
 
 
 def test_split_and_subsample_samples_are_deterministic() -> None:
-    from cloud.baselines.ekya_style_cloud_scheduling.dataset import (
+    from cloud.baselines.Ekya.dataset import (
         split_train_val_samples,
         subsample_samples,
         window_to_samples,
@@ -401,7 +401,7 @@ def test_split_and_subsample_samples_are_deterministic() -> None:
 def test_controller_training_window_includes_previous_decision_window(
     tmp_path: Path,
 ) -> None:
-    from cloud.baselines.ekya_style_cloud_scheduling.controller import (
+    from cloud.baselines.Ekya.controller import (
         EkyaStyleCloudSchedulingController,
         TrainingCandidate,
     )
@@ -474,7 +474,7 @@ def test_controller_training_window_includes_previous_decision_window(
 def test_controller_training_window_rejects_unlabeled_previous_window(
     tmp_path: Path,
 ) -> None:
-    from cloud.baselines.ekya_style_cloud_scheduling.controller import (
+    from cloud.baselines.Ekya.controller import (
         EkyaStyleCloudSchedulingController,
     )
 
@@ -512,7 +512,7 @@ def test_controller_training_window_rejects_unlabeled_previous_window(
 
 def test_ekya_config_validation_rejects_wrong_default_student(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
-    runtime.server.baselines.ekya_style_cloud_scheduling.student_model = "tinynext_s"
+    runtime.server.baselines.Ekya.student_model = "tinynext_s"
 
     with pytest.raises(ValueError, match="student_model"):
         parse_ekya_style_config(runtime, run_id="run")
@@ -526,7 +526,7 @@ def test_ekya_training_admission_config_defaults_and_validation(tmp_path: Path) 
     assert cfg.retraining.drop_training_when_active_same_connection is True
     assert cfg.retraining.training_admission_scope == "edge_camera"
 
-    runtime.server.baselines.ekya_style_cloud_scheduling.retraining.training_admission_scope = (
+    runtime.server.baselines.Ekya.retraining.training_admission_scope = (
         "unsupported"
     )
     with pytest.raises(ValueError, match="training_admission_scope"):
@@ -546,7 +546,7 @@ def test_ekya_removed_scheduler_config_fields_are_rejected(
     field_name: str,
 ) -> None:
     runtime = _runtime(tmp_path)
-    setattr(runtime.server.baselines.ekya_style_cloud_scheduling.scheduler, field_name, 1)
+    setattr(runtime.server.baselines.Ekya.scheduler, field_name, 1)
 
     with pytest.raises(ValueError, match=field_name):
         parse_ekya_style_config(runtime, run_id="run")
@@ -554,7 +554,7 @@ def test_ekya_removed_scheduler_config_fields_are_rejected(
 
 def test_ekya_legacy_jpeg_quality_config_is_rejected(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
-    runtime.server.baselines.ekya_style_cloud_scheduling.edge_streaming.jpeg_quality = -1
+    runtime.server.baselines.Ekya.edge_streaming.jpeg_quality = -1
 
     with pytest.raises(ValueError, match="jpeg_quality"):
         parse_ekya_style_config(runtime, run_id="run")
@@ -598,11 +598,11 @@ def test_ekya_config_inherits_shared_plank_road_settings() -> None:
     runtime.client.source.video_path = "./video_data/shared.mp4"
     runtime.client.source.max_count = 120
     runtime.client.final_detection_threshold = 0.42
-    runtime.baseline.accuracy_trigger_cloud_retraining.trigger_window_size = 12
-    runtime.baseline.accuracy_trigger_cloud_retraining.agreement_score_threshold = 0.11
-    runtime.baseline.accuracy_trigger_cloud_retraining.agreement_iou_threshold = 0.6
-    runtime.baseline.accuracy_trigger_cloud_retraining.training_strategy = "freeze"
-    runtime.baseline.accuracy_trigger_cloud_retraining.trainable_param_ratio = 0.25
+    runtime.baseline.CATR.trigger_window_size = 12
+    runtime.baseline.CATR.agreement_score_threshold = 0.11
+    runtime.baseline.CATR.agreement_iou_threshold = 0.6
+    runtime.baseline.CATR.training_strategy = "freeze"
+    runtime.baseline.CATR.trainable_param_ratio = 0.25
     runtime.baseline.training.training_frame_count = 24
     runtime.baseline.training.microprofile_epochs = 3
     runtime.baseline.training.min_training_samples = 2
@@ -648,7 +648,7 @@ def test_ekya_config_inherits_shared_plank_road_settings() -> None:
 def test_ekya_teacher_labeler_batches_window_by_configured_teacher_batch(
     tmp_path: Path,
 ) -> None:
-    from cloud.baselines.ekya_style_cloud_scheduling.teacher_labeler import TeacherLabeler
+    from cloud.baselines.Ekya.teacher_labeler import TeacherLabeler
 
     class BatchTeacher:
         def __init__(self) -> None:
@@ -666,7 +666,7 @@ def test_ekya_teacher_labeler_batches_window_by_configured_teacher_batch(
             ]
 
     runtime = _runtime(tmp_path)
-    runtime.server.baselines.ekya_style_cloud_scheduling.teacher_labeling.batch_size = 2
+    runtime.server.baselines.Ekya.teacher_labeling.batch_size = 2
     cfg = parse_ekya_style_config(runtime, run_id="run")
     teacher = BatchTeacher()
 
@@ -684,12 +684,12 @@ def test_ekya_teacher_labeler_batches_window_by_configured_teacher_batch(
 def test_ekya_cloud_inference_config_passes_final_detection_threshold(
     tmp_path: Path,
 ) -> None:
-    from cloud.baselines.ekya_style_cloud_scheduling.cloud_inference import (
+    from cloud.baselines.Ekya.cloud_inference import (
         CloudInferenceEngine,
     )
 
     runtime = _runtime(tmp_path)
-    runtime.server.baselines.ekya_style_cloud_scheduling.cloud_inference.score_threshold = 0.61
+    runtime.server.baselines.Ekya.cloud_inference.score_threshold = 0.61
     cfg = parse_ekya_style_config(runtime, run_id="run")
 
     object_detection_config = CloudInferenceEngine(cfg)._object_detection_config(runtime)
@@ -698,7 +698,7 @@ def test_ekya_cloud_inference_config_passes_final_detection_threshold(
 
 
 def test_ekya_cloud_inference_filters_artifacts_with_cloud_threshold() -> None:
-    from cloud.baselines.ekya_style_cloud_scheduling.cloud_inference import _infer_detector
+    from cloud.baselines.Ekya.cloud_inference import _infer_detector
 
     class Detector:
         def small_inference(self, _frame):
@@ -722,7 +722,7 @@ def test_ekya_cloud_inference_filters_artifacts_with_cloud_threshold() -> None:
 
 def test_ekya_protocol_json_roundtrip_preserves_bytes() -> None:
     packet = FrameUploadPacket(
-        method="ekya_style_cloud_scheduling",
+        method="Ekya",
         run_id="run",
         edge_id=1,
         camera_id=0,
@@ -826,7 +826,7 @@ def test_ekya_scheduler_non_positive_gain_respects_inference_only_flag() -> None
     assert decision.candidate_score == pytest.approx(-0.1)
     assert decision.decision_reason == "no_positive_gain_inference_only"
 
-    scheduler_cfg = runtime.server.baselines.ekya_style_cloud_scheduling.scheduler
+    scheduler_cfg = runtime.server.baselines.Ekya.scheduler
     scheduler_cfg.allow_inference_only_when_no_gain = False
     cfg = parse_ekya_style_config(runtime, run_id="run").scheduler
     decision = EkyaThiefStyleScheduler(cfg).schedule(
@@ -928,9 +928,9 @@ def test_microprofile_runs_training_loop_and_not_static_formula(
 ) -> None:
     import torch
 
-    import cloud.baselines.ekya_style_cloud_scheduling.microprofiler as mp
-    from cloud.baselines.ekya_style_cloud_scheduling.evaluator import DetectionEvalResult
-    from cloud.baselines.ekya_style_cloud_scheduling.microprofiler import (
+    import cloud.baselines.Ekya.microprofiler as mp
+    from cloud.baselines.Ekya.evaluator import DetectionEvalResult
+    from cloud.baselines.Ekya.microprofiler import (
         DetectionMicroProfiler,
     )
 
@@ -965,13 +965,13 @@ def test_microprofile_runs_training_loop_and_not_static_formula(
         )
 
     runtime = _runtime(tmp_path)
-    runtime.server.baselines.ekya_style_cloud_scheduling.microprofile.microprofile_epochs = 1
+    runtime.server.baselines.Ekya.microprofile.microprofile_epochs = 1
     runtime.server.continual_learning.rfdetr_fixed_split_learning_rate = 0.1
     cfg = parse_ekya_style_config(runtime, run_id="run")
     monkeypatch.setattr(mp, "run_one_training_epoch", counting_epoch)
     monkeypatch.setattr(mp, "evaluate_model_on_samples", evaluate)
     monkeypatch.setattr(
-        "cloud.baselines.ekya_style_cloud_scheduling.training_runtime.resolve_training_device",
+        "cloud.baselines.Ekya.training_runtime.resolve_training_device",
         lambda: torch.device("cpu"),
     )
     base = TinyTrainModel().state_dict()
@@ -1449,7 +1449,7 @@ def test_unified_logger_records_missing_and_dropped_counts(tmp_path: Path) -> No
         num_frames=2,
     )
     result = DetectionResultPacket(
-        method="ekya_style_cloud_scheduling",
+        method="Ekya",
         run_id="run",
         edge_id=1,
         camera_id=0,
@@ -1474,7 +1474,7 @@ def test_unified_logger_records_missing_and_dropped_counts(tmp_path: Path) -> No
     logger.record_detection_result(result)
     logger.record_display_event(
         DisplayEventPacket(
-            method="ekya_style_cloud_scheduling",
+            method="Ekya",
             run_id="run",
             edge_id=1,
             camera_id=0,
@@ -1491,7 +1491,7 @@ def test_unified_logger_records_missing_and_dropped_counts(tmp_path: Path) -> No
     )
     logger.record_display_event(
         DisplayEventPacket(
-            method="ekya_style_cloud_scheduling",
+            method="Ekya",
             run_id="run",
             edge_id=1,
             camera_id=0,
@@ -1517,7 +1517,7 @@ def test_unified_logger_records_missing_and_dropped_counts(tmp_path: Path) -> No
 
 
 def test_ekya_cloud_server_uses_dedicated_controller_without_edge_affine(tmp_path: Path) -> None:
-    from cloud.baselines.ekya_style_cloud_scheduling.controller import (
+    from cloud.baselines.Ekya.controller import (
         EkyaStyleCloudSchedulingController,
     )
     from cloud_server import CloudServer, _experiment_method_for
@@ -1532,14 +1532,14 @@ def test_ekya_cloud_server_uses_dedicated_controller_without_edge_affine(tmp_pat
         max_artifact_bytes=1024 * 1024,
     )
     baseline_config = SimpleNamespace(
-        method="ekya_style_cloud_scheduling",
+        method="Ekya",
     )
 
     server = CloudServer(
         config,
         mode="baseline",
         baseline_config=baseline_config,
-        baseline_method="ekya_style_cloud_scheduling",
+        baseline_method="Ekya",
         experiment_id="comparison",
         scenario="road",
         edge_count=1,
@@ -1554,17 +1554,17 @@ def test_ekya_cloud_server_uses_dedicated_controller_without_edge_affine(tmp_pat
         / "experiments"
         / "comparison"
         / "raw_logs"
-        / "road_n1_r01_ekya_style_cloud_scheduling"
+        / "road_n1_r01_Ekya"
         / "cloud"
     )
-    assert _experiment_method_for("ekya_style_cloud_scheduling") == "ekya_style_cloud_scheduling"
+    assert _experiment_method_for("Ekya") == "Ekya"
 
 
 def test_ekya_edge_route_archives_before_edge_worker_construction() -> None:
     source = (PROJECT_ROOT / "edge_client.py").read_text(encoding="utf-8")
 
     ekya_branch = source.index(
-        'if args.mode == "baseline" and baseline_method == EKYA_STYLE_METHOD:'
+        'if args.mode == "baseline" and baseline_method == EKYA_METHOD:'
     )
     run_dir_call = source.index("run_dir = edge_run_dir(", ekya_branch)
     stream_call = source.index("_run_ekya_style_edge_stream(", ekya_branch)
@@ -1580,9 +1580,9 @@ def test_trainer_saves_nonempty_adoptable_checkpoint_and_epoch_log(
 ) -> None:
     import torch
 
-    import cloud.baselines.ekya_style_cloud_scheduling.trainer as trainer_module
-    from cloud.baselines.ekya_style_cloud_scheduling.evaluator import DetectionEvalResult
-    from cloud.baselines.ekya_style_cloud_scheduling.trainer import EkyaCloudTrainer
+    import cloud.baselines.Ekya.trainer as trainer_module
+    from cloud.baselines.Ekya.evaluator import DetectionEvalResult
+    from cloud.baselines.Ekya.trainer import EkyaCloudTrainer
 
     class TinyTrainModel(torch.nn.Module):
         def __init__(self) -> None:
@@ -1614,7 +1614,7 @@ def test_trainer_saves_nonempty_adoptable_checkpoint_and_epoch_log(
     cfg = parse_ekya_style_config(runtime, run_id="run")
     decision = SimpleNamespace(trains=True)
     monkeypatch.setattr(
-        "cloud.baselines.ekya_style_cloud_scheduling.training_runtime.resolve_training_device",
+        "cloud.baselines.Ekya.training_runtime.resolve_training_device",
         lambda: torch.device("cpu"),
     )
 
@@ -1659,10 +1659,10 @@ def test_trainer_saves_nonempty_adoptable_checkpoint_and_epoch_log(
 def test_controller_adopts_real_checkpoint_and_increments_model_version(tmp_path: Path) -> None:
     import torch
 
-    from cloud.baselines.ekya_style_cloud_scheduling.controller import (
+    from cloud.baselines.Ekya.controller import (
         EkyaStyleCloudSchedulingController,
     )
-    from cloud.baselines.ekya_style_cloud_scheduling.trainer import TrainingResult
+    from cloud.baselines.Ekya.trainer import TrainingResult
 
     class TinyTrainModel(torch.nn.Module):
         def __init__(self, value: float = 0.0) -> None:
@@ -1678,7 +1678,7 @@ def test_controller_adopts_real_checkpoint_and_increments_model_version(tmp_path
     torch.save(
         {
             "state_dict": TinyTrainModel(2.0).state_dict(),
-            "metadata": {"method": "ekya_style_cloud_scheduling"},
+            "metadata": {"method": "Ekya"},
         },
         checkpoint_path,
     )
@@ -1725,10 +1725,10 @@ def test_controller_adopts_real_checkpoint_and_increments_model_version(tmp_path
 def test_controller_keeps_model_updates_per_edge(tmp_path: Path) -> None:
     import torch
 
-    from cloud.baselines.ekya_style_cloud_scheduling.controller import (
+    from cloud.baselines.Ekya.controller import (
         EkyaStyleCloudSchedulingController,
     )
-    from cloud.baselines.ekya_style_cloud_scheduling.trainer import TrainingResult
+    from cloud.baselines.Ekya.trainer import TrainingResult
 
     class TinyTrainModel(torch.nn.Module):
         def __init__(self, value: float = 0.0) -> None:
@@ -1745,7 +1745,7 @@ def test_controller_keeps_model_updates_per_edge(tmp_path: Path) -> None:
     torch.save(
         {
             "state_dict": TinyTrainModel(5.0).state_dict(),
-            "metadata": {"method": "ekya_style_cloud_scheduling"},
+            "metadata": {"method": "Ekya"},
         },
         checkpoint_path,
     )
@@ -1790,10 +1790,10 @@ def test_controller_keeps_model_updates_per_edge(tmp_path: Path) -> None:
 def test_controller_model_update_log_reports_not_adopted_reason(tmp_path: Path) -> None:
     import torch
 
-    from cloud.baselines.ekya_style_cloud_scheduling.controller import (
+    from cloud.baselines.Ekya.controller import (
         EkyaStyleCloudSchedulingController,
     )
-    from cloud.baselines.ekya_style_cloud_scheduling.trainer import TrainingResult
+    from cloud.baselines.Ekya.trainer import TrainingResult
 
     class TinyTrainModel(torch.nn.Module):
         def __init__(self, value: float = 0.0) -> None:
@@ -1846,7 +1846,7 @@ def test_controller_model_update_log_reports_not_adopted_reason(tmp_path: Path) 
 def test_production_ekya_code_has_no_static_microprofile_or_checkpoint_paths() -> None:
     production_text = "\n".join(
         path.read_text(encoding="utf-8")
-        for path in (PROJECT_ROOT / "cloud/baselines/ekya_style_cloud_scheduling").glob("*.py")
+        for path in (PROJECT_ROOT / "cloud/baselines/Ekya").glob("*.py")
     )
 
     forbidden = [

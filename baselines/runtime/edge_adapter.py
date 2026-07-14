@@ -152,7 +152,7 @@ class BaselineEdgeAdapter:
 
     def before_video_start(self, edge) -> None:
         self._edge = edge
-        if self.baseline_method == "pure_edge_local_updating":
+        if self.baseline_method == "SURGEON":
             self._surgeon_tta = SurgeonLocalTTAUpdater(self.config, self.metrics)
             self._surgeon_tta.attach_edge(edge)
         logger.info(
@@ -239,7 +239,7 @@ class BaselineEdgeAdapter:
                 latency_ms,
             )
             self._surgeon_tta.try_apply_pending_update()
-        if self.baseline_method == "accuracy_trigger_cloud_retraining":
+        if self.baseline_method == "CATR":
             self._observe_accuracy_trigger_source_frame(
                 frame_id=int(frame_index),
                 selected_payload=payload if decision.upload_frame else None,
@@ -249,7 +249,7 @@ class BaselineEdgeAdapter:
 
     def on_unsampled_frame(self, *, frame, frame_index: int, latest_visual: dict[str, Any]) -> None:
         del frame, latest_visual
-        if self.baseline_method == "accuracy_trigger_cloud_retraining":
+        if self.baseline_method == "CATR":
             self._observe_accuracy_trigger_source_frame(
                 frame_id=int(frame_index),
                 selected_payload=None,
@@ -264,7 +264,7 @@ class BaselineEdgeAdapter:
         worker = self._worker
         if self._surgeon_tta is not None:
             self._surgeon_tta.close()
-        if self.baseline_method == "accuracy_trigger_cloud_retraining":
+        if self.baseline_method == "CATR":
             self._flush_accuracy_trigger_window_buffer(
                 inline=not (worker is not None and worker.is_alive())
             )
@@ -309,7 +309,7 @@ class BaselineEdgeAdapter:
             self._registered = True
         if isinstance(payload, BaselineWindowPayload):
             if not hasattr(self.transport, "upload_accuracy_trigger_window"):
-                raise RuntimeError("transport does not support Accuracy-Trigger window upload")
+                raise RuntimeError("transport does not support CATR window upload")
             upload_metrics = measure_accuracy_trigger_window_upload(payload)
             self.metrics.record(
                 "bundle_upload_started",
@@ -531,7 +531,7 @@ class BaselineEdgeAdapter:
         }
 
     def _poll_active_training(self) -> None:
-        if self.baseline_method == "accuracy_trigger_cloud_retraining":
+        if self.baseline_method == "CATR":
             self._discover_cloud_scheduled_training()
             self._poll_cloud_scheduled_training()
             return
@@ -861,7 +861,7 @@ class BaselineEdgeAdapter:
                 message=str(exc),
             )
         finally:
-            if self.baseline_method == "accuracy_trigger_cloud_retraining" and active.command_id:
+            if self.baseline_method == "CATR" and active.command_id:
                 if update_applied:
                     self._ack_cloud_command(
                         active.command_id,

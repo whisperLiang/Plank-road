@@ -1305,7 +1305,7 @@ def test_cloud_server_baseline_loads_teacher_detector_only(
         accuracy_config,
         mode="baseline",
         baseline_config=runtime.baseline,
-        baseline_method="accuracy_trigger_cloud_retraining",
+        baseline_method="CATR",
         yaml_path="./config/config.yaml",
     )
     try:

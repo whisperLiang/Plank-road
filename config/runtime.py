@@ -14,7 +14,11 @@ from common.experiment_results import (
     normalize_scenario_slug,
     sanitize_component,
 )
-from config.baseline import validate_baseline_method
+from config.baseline import ALLOWED_BASELINE_METHODS, validate_baseline_method
+
+_CANONICAL_ENV_PATH_SEGMENTS = {
+    method.casefold(): method for method in ALLOWED_BASELINE_METHODS
+}
 
 
 @dataclass
@@ -298,11 +302,11 @@ class BaselineTrainingConfig(ConfigSection):
 @dataclass
 class BaselineConfig(ConfigSection):
     enabled: bool = False
-    method: str = "accuracy_trigger_cloud_retraining"
+    method: str = "CATR"
     edge: BaselineEdgeConfig = field(default_factory=BaselineEdgeConfig)
     training: BaselineTrainingConfig = field(default_factory=BaselineTrainingConfig)
-    pure_edge_local_updating: PureEdgeBaselineConfig = field(default_factory=PureEdgeBaselineConfig)
-    accuracy_trigger_cloud_retraining: AccuracyTriggerBaselineConfig = field(
+    SURGEON: PureEdgeBaselineConfig = field(default_factory=PureEdgeBaselineConfig)
+    CATR: AccuracyTriggerBaselineConfig = field(
         default_factory=AccuracyTriggerBaselineConfig
     )
 
@@ -459,7 +463,7 @@ class EkyaStyleCloudSchedulingServerConfig(ConfigSection):
 
 @dataclass
 class ServerBaselinesConfig(ConfigSection):
-    ekya_style_cloud_scheduling: EkyaStyleCloudSchedulingServerConfig = field(
+    Ekya: EkyaStyleCloudSchedulingServerConfig = field(
         default_factory=EkyaStyleCloudSchedulingServerConfig
     )
 
@@ -629,9 +633,9 @@ def _section(section_cls, value: Mapping[str, Any] | None):
         known["gpu_lease"] = _section(GpuLeaseConfig, known.get("gpu_lease"))
         known["worker"] = _section(WorkerServiceConfig, known.get("worker"))
     elif section_cls is ServerBaselinesConfig:
-        known["ekya_style_cloud_scheduling"] = _section(
+        known["Ekya"] = _section(
             EkyaStyleCloudSchedulingServerConfig,
-            known.get("ekya_style_cloud_scheduling"),
+            known.get("Ekya"),
         )
     elif section_cls is EkyaStyleCloudSchedulingServerConfig:
         known["edge_streaming"] = _section(
@@ -663,13 +667,13 @@ def _section(section_cls, value: Mapping[str, Any] | None):
             BaselineTrainingConfig,
             known.get("training"),
         )
-        known["pure_edge_local_updating"] = _section(
+        known["SURGEON"] = _section(
             PureEdgeBaselineConfig,
-            known.get("pure_edge_local_updating"),
+            known.get("SURGEON"),
         )
-        known["accuracy_trigger_cloud_retraining"] = _section(
+        known["CATR"] = _section(
             AccuracyTriggerBaselineConfig,
-            known.get("accuracy_trigger_cloud_retraining"),
+            known.get("CATR"),
         )
     elif section_cls is RuntimeConfig:
         known["experiment_run"] = _section(
@@ -699,7 +703,10 @@ def _apply_env_overrides(raw_config: Mapping[str, Any]) -> dict[str, Any]:
         if not env_name.startswith(prefix):
             continue
         path = [
-            segment.strip().lower()
+            _CANONICAL_ENV_PATH_SEGMENTS.get(
+                segment.strip().casefold(),
+                segment.strip().lower(),
+            )
             for segment in env_name[len(prefix) :].split("__")
             if segment.strip()
         ]
@@ -737,11 +744,11 @@ def _reject_removed_ekya_config_fields(
     ekya_cfg: EkyaStyleCloudSchedulingServerConfig,
 ) -> None:
     removed_by_section = {
-        "server.baselines.ekya_style_cloud_scheduling": (
+        "server.baselines.Ekya": (
             ekya_cfg,
             {"enabled", "offline_cloud_video_debug", "logging"},
         ),
-        "server.baselines.ekya_style_cloud_scheduling.edge_streaming": (
+        "server.baselines.Ekya.edge_streaming": (
             ekya_cfg.edge_streaming,
             {
                 "enabled",
@@ -753,7 +760,7 @@ def _reject_removed_ekya_config_fields(
                 "display_cloud_results_only",
             },
         ),
-        "server.baselines.ekya_style_cloud_scheduling.cloud_inference": (
+        "server.baselines.Ekya.cloud_inference": (
             ekya_cfg.cloud_inference,
             {
                 "high_priority",
@@ -762,11 +769,11 @@ def _reject_removed_ekya_config_fields(
                 "drop_stale_display_packets",
             },
         ),
-        "server.baselines.ekya_style_cloud_scheduling.teacher_labeling": (
+        "server.baselines.Ekya.teacher_labeling": (
             ekya_cfg.teacher_labeling,
             {"enabled", "cache_labels", "run_async"},
         ),
-        "server.baselines.ekya_style_cloud_scheduling.microprofile": (
+        "server.baselines.Ekya.microprofile": (
             ekya_cfg.microprofile,
             {
                 "enabled",
@@ -777,11 +784,11 @@ def _reject_removed_ekya_config_fields(
                 "candidate_hyperparameters",
             },
         ),
-        "server.baselines.ekya_style_cloud_scheduling.evaluation": (
+        "server.baselines.Ekya.evaluation": (
             ekya_cfg.evaluation,
             {"metric_mode"},
         ),
-        "server.baselines.ekya_style_cloud_scheduling.scheduler": (
+        "server.baselines.Ekya.scheduler": (
             ekya_cfg.scheduler,
             {
                 "retraining_period_s",
@@ -789,7 +796,7 @@ def _reject_removed_ekya_config_fields(
                 "fail_on_microprofile_overrun",
             },
         ),
-        "server.baselines.ekya_style_cloud_scheduling.retraining": (
+        "server.baselines.Ekya.retraining": (
             ekya_cfg.retraining,
             {"enabled", "save_checkpoints", "run_async", "optimizer_name", "weight_decay"},
         ),
@@ -801,7 +808,7 @@ def _reject_removed_ekya_config_fields(
     if removed:
         names = ", ".join(removed)
         raise ValueError(
-            f"Ekya-style cloud scheduling no longer supports these config fields: {names}. "
+            f"Ekya cloud scheduling no longer supports these config fields: {names}. "
             "The corresponding behavior is fixed by the baseline implementation."
         )
 
@@ -823,8 +830,8 @@ def _reject_removed_config_fields(config: RuntimeConfig) -> None:
             },
         ),
         "baseline": (config.baseline, {"run_id", "results_root"}),
-        "baseline.pure_edge_local_updating": (
-            config.baseline.pure_edge_local_updating,
+        "baseline.SURGEON": (
+            config.baseline.SURGEON,
             {"trigger_low_quality_samples", "max_local_buffer_samples"},
         ),
         "runtime": (config, {"sample_pool"}),
@@ -1007,9 +1014,9 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         "baseline.training.min_training_samples",
         int(baseline_training.min_training_samples),
     )
-    ekya_cfg = config.server.baselines.ekya_style_cloud_scheduling
+    ekya_cfg = config.server.baselines.Ekya
     _reject_removed_ekya_config_fields(ekya_cfg)
-    accuracy_cfg = config.baseline.accuracy_trigger_cloud_retraining
+    accuracy_cfg = config.baseline.CATR
     continual_learning = config.server.continual_learning
     resolved_student_model = str(
         _configured_value(ekya_cfg.student_model, config.server.edge_model_name)
@@ -1018,17 +1025,17 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         _configured_value(ekya_cfg.teacher_model, config.server.golden)
     )
     ekya_baseline_active = bool(config.baseline.enabled) and str(config.baseline.method) == (
-        "ekya_style_cloud_scheduling"
+        "Ekya"
     )
     if ekya_baseline_active and not bool(ekya_cfg.allow_model_override):
         if resolved_student_model != "rfdetr_nano":
             raise ValueError(
-                "server.baselines.ekya_style_cloud_scheduling.student_model "
+                "server.baselines.Ekya.student_model "
                 "must be rfdetr_nano unless allow_model_override=true"
             )
         if resolved_teacher_model != "rtdetr_x":
             raise ValueError(
-                "server.baselines.ekya_style_cloud_scheduling.teacher_model "
+                "server.baselines.Ekya.teacher_model "
                 "must be rtdetr_x unless allow_model_override=true"
             )
     cloud_score_threshold = _configured_value(
@@ -1036,7 +1043,7 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         config.client.final_detection_threshold,
     )
     _validate_positive(
-        "server.baselines.ekya_style_cloud_scheduling.cloud_inference.score_threshold",
+        "server.baselines.Ekya.cloud_inference.score_threshold",
         float(cloud_score_threshold),
         allow_zero=True,
     )
@@ -1049,11 +1056,11 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         continual_learning.teacher_annotation_threshold,
     )
     _validate_positive(
-        "server.baselines.ekya_style_cloud_scheduling.teacher_labeling.batch_size",
+        "server.baselines.Ekya.teacher_labeling.batch_size",
         int(teacher_batch_size),
     )
     _validate_positive(
-        "server.baselines.ekya_style_cloud_scheduling.teacher_labeling.score_threshold",
+        "server.baselines.Ekya.teacher_labeling.score_threshold",
         float(teacher_threshold),
         allow_zero=True,
     )
@@ -1068,24 +1075,24 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         config.client.source.max_count,
     )
     _validate_positive(
-        "server.baselines.ekya_style_cloud_scheduling.window_size",
+        "server.baselines.Ekya.window_size",
         int(resolved_window_size),
     )
     if training_frame_count < int(resolved_window_size):
         raise ValueError(
             "baseline.training.training_frame_count must be >= "
-            "server.baselines.ekya_style_cloud_scheduling.window_size"
+            "server.baselines.Ekya.window_size"
         )
     if int(resolved_num_frames) < int(resolved_window_size):
         raise ValueError(
-            "server.baselines.ekya_style_cloud_scheduling.num_frames must be >= window_size"
+            "server.baselines.Ekya.num_frames must be >= window_size"
         )
     microprofile_epochs = _configured_value(
         ekya_cfg.microprofile.microprofile_epochs,
         baseline_training.microprofile_epochs,
     )
     _validate_positive(
-        "server.baselines.ekya_style_cloud_scheduling.microprofile.microprofile_epochs",
+        "server.baselines.Ekya.microprofile.microprofile_epochs",
         int(microprofile_epochs),
     )
     train_val_split = _configured_value(
@@ -1094,7 +1101,7 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     )
     if float(train_val_split) <= 0.0 or float(train_val_split) >= 1.0:
         raise ValueError(
-            "server.baselines.ekya_style_cloud_scheduling.dataset."
+            "server.baselines.Ekya.dataset."
             "train_val_split must be in (0, 1)"
         )
     min_train_samples = _configured_value(
@@ -1103,11 +1110,11 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     )
     min_val_samples = _configured_value(ekya_cfg.dataset.min_val_samples, 1)
     _validate_positive(
-        "server.baselines.ekya_style_cloud_scheduling.dataset.min_train_samples",
+        "server.baselines.Ekya.dataset.min_train_samples",
         int(min_train_samples),
     )
     _validate_positive(
-        "server.baselines.ekya_style_cloud_scheduling.dataset.min_val_samples",
+        "server.baselines.Ekya.dataset.min_val_samples",
         int(min_val_samples),
     )
     evaluation_score_threshold = _configured_value(
@@ -1120,12 +1127,12 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     )
     if float(evaluation_score_threshold) < 0.0:
         raise ValueError(
-            "server.baselines.ekya_style_cloud_scheduling.evaluation."
+            "server.baselines.Ekya.evaluation."
             "score_threshold must be non-negative"
         )
     if float(evaluation_iou_threshold) <= 0.0 or float(evaluation_iou_threshold) > 1.0:
         raise ValueError(
-            "server.baselines.ekya_style_cloud_scheduling.evaluation."
+            "server.baselines.Ekya.evaluation."
             "iou_threshold must be in (0, 1]"
         )
     ekya_train_mode = (
@@ -1141,7 +1148,7 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     )
     if ekya_train_mode not in {"full", "freeze"}:
         raise ValueError(
-            "server.baselines.ekya_style_cloud_scheduling.retraining."
+            "server.baselines.Ekya.retraining."
             "train_mode must be full or freeze"
         )
     trainable_param_ratio = (
@@ -1153,17 +1160,17 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     )
     if ekya_train_mode == "freeze" and trainable_param_ratio is None:
         raise ValueError(
-            "server.baselines.ekya_style_cloud_scheduling.retraining."
+            "server.baselines.Ekya.retraining."
             "trainable_param_ratio is required when train_mode=freeze"
         )
     if trainable_param_ratio is not None:
         _validate_positive(
-            "server.baselines.ekya_style_cloud_scheduling.retraining.trainable_param_ratio",
+            "server.baselines.Ekya.retraining.trainable_param_ratio",
             float(trainable_param_ratio),
         )
         if float(trainable_param_ratio) > 1.0:
             raise ValueError(
-                "server.baselines.ekya_style_cloud_scheduling.retraining."
+                "server.baselines.Ekya.retraining."
                 "trainable_param_ratio must be <= 1"
             )
     max_train_jobs = _configured_value(
@@ -1171,7 +1178,7 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         continual_learning.max_concurrent_jobs,
     )
     _validate_positive(
-        "server.baselines.ekya_style_cloud_scheduling.retraining.max_concurrent_train_jobs",
+        "server.baselines.Ekya.retraining.max_concurrent_train_jobs",
         int(max_train_jobs),
     )
     optimizer_name = (
@@ -1207,32 +1214,32 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         float(baseline_training.training_failure_backoff_sec),
         allow_zero=True,
     )
-    pure_edge = config.baseline.pure_edge_local_updating
+    pure_edge = config.baseline.SURGEON
     if str(pure_edge.label_source) not in {"pseudo_label", "local_gt_dir", "none"}:
         raise ValueError(
-            "baseline.pure_edge_local_updating.label_source must be one of "
+            "baseline.SURGEON.label_source must be one of "
             "pseudo_label, local_gt_dir, none"
         )
     if bool(pure_edge.use_cloud_teacher):
-        raise ValueError("baseline.pure_edge_local_updating.use_cloud_teacher must remain false")
+        raise ValueError("baseline.SURGEON.use_cloud_teacher must remain false")
     if str(pure_edge.training_strategy or "").strip() != "surgeon_tta":
-        raise ValueError("baseline.pure_edge_local_updating.training_strategy must be surgeon_tta")
+        raise ValueError("baseline.SURGEON.training_strategy must be surgeon_tta")
     quality_mode = str(pure_edge.quality_mode or "").strip().lower()
     if quality_mode not in {"output_only_when_no_boundary", "strict_boundary"}:
         raise ValueError(
-            "baseline.pure_edge_local_updating.quality_mode must be one of "
+            "baseline.SURGEON.quality_mode must be one of "
             "output_only_when_no_boundary, strict_boundary"
         )
     pure_edge.quality_mode = quality_mode
     trainable_scope = str(pure_edge.trainable_scope or "").strip().lower()
     if trainable_scope != "norm_affine":
         raise ValueError(
-            "baseline.pure_edge_local_updating.trainable_scope must be norm_affine"
+            "baseline.SURGEON.trainable_scope must be norm_affine"
         )
     pure_edge.trainable_scope = trainable_scope
     if pure_edge.training_frame_count is not None:
         _validate_positive(
-            "baseline.pure_edge_local_updating.training_frame_count",
+            "baseline.SURGEON.training_frame_count",
             int(pure_edge.training_frame_count),
         )
     effective_pure_edge_training_frame_count = (
@@ -1242,101 +1249,101 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     )
     if pure_edge.train_sample_count is not None:
         _validate_positive(
-            "baseline.pure_edge_local_updating.train_sample_count",
+            "baseline.SURGEON.train_sample_count",
             int(pure_edge.train_sample_count),
         )
         if int(pure_edge.train_sample_count) > int(effective_pure_edge_training_frame_count):
             raise ValueError(
-                "baseline.pure_edge_local_updating.train_sample_count must be <= "
+                "baseline.SURGEON.train_sample_count must be <= "
                 "the effective pure-edge training_frame_count"
             )
     legacy_tta_steps = (getattr(pure_edge, "_extras", {}) or {}).get("tta_steps")
     if legacy_tta_steps is not None:
         _validate_positive(
-            "baseline.pure_edge_local_updating.tta_steps",
+            "baseline.SURGEON.tta_steps",
             int(legacy_tta_steps),
         )
     _validate_positive(
-        "baseline.pure_edge_local_updating.consistency_weight",
+        "baseline.SURGEON.consistency_weight",
         float(pure_edge.consistency_weight),
         allow_zero=True,
     )
     _validate_positive(
-        "baseline.pure_edge_local_updating.entropy_margin_ratio",
+        "baseline.SURGEON.entropy_margin_ratio",
         float(pure_edge.entropy_margin_ratio),
         allow_zero=True,
     )
     if float(pure_edge.entropy_margin_ratio) > 1.0:
-        raise ValueError("baseline.pure_edge_local_updating.entropy_margin_ratio must be <= 1")
+        raise ValueError("baseline.SURGEON.entropy_margin_ratio must be <= 1")
     edge_policy = str(config.baseline.edge.split_runtime_policy or "").strip().lower()
     if edge_policy != "disabled":
         raise ValueError("baseline.edge.split_runtime_policy must be disabled")
     _validate_positive(
-        "baseline.accuracy_trigger_cloud_retraining.training_failure_backoff_sec",
-        float(config.baseline.accuracy_trigger_cloud_retraining.training_failure_backoff_sec),
+        "baseline.CATR.training_failure_backoff_sec",
+        float(config.baseline.CATR.training_failure_backoff_sec),
         allow_zero=True,
     )
     _validate_positive(
-        "baseline.accuracy_trigger_cloud_retraining.trainable_param_ratio",
-        float(config.baseline.accuracy_trigger_cloud_retraining.trainable_param_ratio),
+        "baseline.CATR.trainable_param_ratio",
+        float(config.baseline.CATR.trainable_param_ratio),
     )
-    accuracy_cfg = config.baseline.accuracy_trigger_cloud_retraining
+    accuracy_cfg = config.baseline.CATR
     if float(accuracy_cfg.trainable_param_ratio) > 1.0:
         raise ValueError(
-            "baseline.accuracy_trigger_cloud_retraining.trainable_param_ratio must be <= 1"
+            "baseline.CATR.trainable_param_ratio must be <= 1"
         )
     _validate_positive(
-        "baseline.accuracy_trigger_cloud_retraining.trigger_window_size",
+        "baseline.CATR.trigger_window_size",
         int(accuracy_cfg.trigger_window_size),
     )
     _validate_positive(
-        "baseline.accuracy_trigger_cloud_retraining.min_history_windows",
+        "baseline.CATR.min_history_windows",
         int(accuracy_cfg.min_history_windows),
     )
     _validate_positive(
-        "baseline.accuracy_trigger_cloud_retraining.accuracy_drop_sigma",
+        "baseline.CATR.accuracy_drop_sigma",
         float(accuracy_cfg.accuracy_drop_sigma),
         allow_zero=True,
     )
     _validate_positive(
-        "baseline.accuracy_trigger_cloud_retraining.history_decay",
+        "baseline.CATR.history_decay",
         float(accuracy_cfg.history_decay),
     )
     if float(accuracy_cfg.history_decay) > 1.0:
         raise ValueError(
-            "baseline.accuracy_trigger_cloud_retraining.history_decay must be <= 1"
+            "baseline.CATR.history_decay must be <= 1"
         )
     if str(accuracy_cfg.metric or "").strip() != "teacher_f1":
         raise ValueError(
-            "baseline.accuracy_trigger_cloud_retraining.metric must be teacher_f1"
+            "baseline.CATR.metric must be teacher_f1"
         )
     for name in ("agreement_iou_threshold", "agreement_score_threshold"):
         value = float(getattr(accuracy_cfg, name))
         _validate_positive(
-            f"baseline.accuracy_trigger_cloud_retraining.{name}",
+            f"baseline.CATR.{name}",
             value,
             allow_zero=True,
         )
         if value > 1.0:
             raise ValueError(
-                f"baseline.accuracy_trigger_cloud_retraining.{name} must be <= 1"
+                f"baseline.CATR.{name} must be <= 1"
             )
     empty_policy = str(accuracy_cfg.agreement_empty_empty_policy or "").strip().lower()
     if empty_policy not in {"score_one", "exclude", "score_zero"}:
         raise ValueError(
-            "baseline.accuracy_trigger_cloud_retraining.agreement_empty_empty_policy "
+            "baseline.CATR.agreement_empty_empty_policy "
             "must be one of score_one, exclude, score_zero"
         )
     accuracy_cfg.agreement_empty_empty_policy = empty_policy
     if accuracy_cfg.absolute_accuracy_floor is not None:
         _validate_positive(
-            "baseline.accuracy_trigger_cloud_retraining.absolute_accuracy_floor",
+            "baseline.CATR.absolute_accuracy_floor",
             float(accuracy_cfg.absolute_accuracy_floor),
             allow_zero=True,
         )
         if float(accuracy_cfg.absolute_accuracy_floor) > 1.0:
             raise ValueError(
-                "baseline.accuracy_trigger_cloud_retraining.absolute_accuracy_floor "
+                "baseline.CATR.absolute_accuracy_floor "
                 "must be <= 1"
             )
     allowed_baseline_training = {"freeze"}
@@ -1345,7 +1352,7 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     ).strip()
     if accuracy_strategy not in allowed_baseline_training:
         raise ValueError(
-            "baseline.accuracy_trigger_cloud_retraining.training_strategy must be "
+            "baseline.CATR.training_strategy must be "
             "freeze"
         )
     feature_upload = config.client.feature_upload

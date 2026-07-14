@@ -387,7 +387,7 @@ def test_controller_isolates_model_keys_and_resets_after_update() -> None:
     command = controller.poll_commands(run_id="run-a", edge_id=1)[0]
     assert command["run_id"] == "run-a"
     assert command["edge_id"] == 1
-    assert command["baseline_method"] == "accuracy_trigger_cloud_retraining"
+    assert command["baseline_method"] == "CATR"
     assert command["base_model_version"] == "0"
 
     controller.mark_model_update_applied(
@@ -556,7 +556,7 @@ def test_cloud_controller_submits_bundle_with_reused_teacher_targets(tmp_path) -
     annotator = RecordingSharedAnnotator([_box() for _ in range(6)])
 
     controller = DistributedBaselineController(
-        baseline_method="accuracy_trigger_cloud_retraining",
+        baseline_method="CATR",
         run_id="run-a",
         results_root=str(tmp_path),
         training_backend=backend,
@@ -607,7 +607,7 @@ def test_cloud_controller_submits_bundle_with_reused_teacher_targets(tmp_path) -
 
     commands = controller.poll_command(
         run_id="run-a",
-        baseline_method="accuracy_trigger_cloud_retraining",
+        baseline_method="CATR",
         edge_id=1,
     )
     assert commands == []
@@ -617,13 +617,13 @@ def test_cloud_controller_submits_bundle_with_reused_teacher_targets(tmp_path) -
     backend.result_model_version = "1"
     commands = controller.poll_command(
         run_id="run-a",
-        baseline_method="accuracy_trigger_cloud_retraining",
+        baseline_method="CATR",
         edge_id=1,
     )
     assert commands
     assert commands[0]["run_id"] == "run-a"
     assert commands[0]["edge_id"] == 1
-    assert commands[0]["baseline_method"] == "accuracy_trigger_cloud_retraining"
+    assert commands[0]["baseline_method"] == "CATR"
     assert commands[0]["job_id"] == "job-1"
 
 
@@ -631,7 +631,7 @@ def test_cloud_controller_rejects_legacy_accuracy_frame_upload(tmp_path) -> None
     backend = RecordingTrainingBackend()
     annotator = RecordingSharedAnnotator([_box()])
     controller = DistributedBaselineController(
-        baseline_method="accuracy_trigger_cloud_retraining",
+        baseline_method="CATR",
         run_id="run-a",
         results_root=str(tmp_path),
         training_backend=backend,
@@ -654,7 +654,7 @@ def test_cloud_controller_window_annotation_is_single_batch_without_pending_queu
     backend = RecordingTrainingBackend()
     annotator = RecordingSharedAnnotator([_box(), _box(), _box()])
     controller = DistributedBaselineController(
-        baseline_method="accuracy_trigger_cloud_retraining",
+        baseline_method="CATR",
         run_id="run-a",
         results_root=str(tmp_path),
         training_backend=backend,
@@ -687,7 +687,7 @@ def test_cloud_controller_accepts_empty_source_window_without_teacher_work(tmp_p
     backend = RecordingTrainingBackend()
     annotator = RecordingSharedAnnotator([])
     controller = DistributedBaselineController(
-        baseline_method="accuracy_trigger_cloud_retraining",
+        baseline_method="CATR",
         run_id="run-a",
         results_root=str(tmp_path),
         training_backend=backend,
@@ -701,7 +701,7 @@ def test_cloud_controller_accepts_empty_source_window_without_teacher_work(tmp_p
     response = controller.upload_accuracy_trigger_window(
         BaselineWindowPayload.empty_source_window(
             run_id="run-a",
-            baseline_method="accuracy_trigger_cloud_retraining",
+            baseline_method="CATR",
             edge_id=1,
             model_name="tiny",
             model_version="0",
@@ -729,7 +729,7 @@ def test_cloud_controller_defers_retryable_window_annotation_without_dropping_wi
     backend = RecordingTrainingBackend()
     annotator = RetryOnceSharedAnnotator([_box(), _box()])
     controller = DistributedBaselineController(
-        baseline_method="accuracy_trigger_cloud_retraining",
+        baseline_method="CATR",
         run_id="run-a",
         results_root=str(tmp_path),
         training_backend=backend,
@@ -752,7 +752,7 @@ def test_cloud_controller_defers_retryable_window_annotation_without_dropping_wi
 
     controller.heartbeat(
         run_id="run-a",
-        baseline_method="accuracy_trigger_cloud_retraining",
+        baseline_method="CATR",
         edge_id=1,
     )
 
@@ -772,7 +772,7 @@ def test_cloud_controller_window_annotation_log_reports_batch_request(tmp_path) 
     backend = RecordingTrainingBackend()
     annotator = RecordingSharedAnnotator([_box(), _box(), _box()])
     controller = DistributedBaselineController(
-        baseline_method="accuracy_trigger_cloud_retraining",
+        baseline_method="CATR",
         run_id="run-a",
         results_root=str(tmp_path),
         training_backend=backend,
@@ -811,7 +811,7 @@ def test_cloud_controller_logs_prediction_schema_warning_once_per_window(tmp_pat
     backend = RecordingTrainingBackend()
     annotator = RecordingSharedAnnotator([{}])
     controller = DistributedBaselineController(
-        baseline_method="accuracy_trigger_cloud_retraining",
+        baseline_method="CATR",
         run_id="run-a",
         results_root=str(tmp_path),
         training_backend=backend,
@@ -849,7 +849,7 @@ def test_cloud_controller_logs_prediction_schema_warning_once_per_window(tmp_pat
 
 def test_cloud_controller_validates_accuracy_window_frame_contract(tmp_path) -> None:
     controller = DistributedBaselineController(
-        baseline_method="accuracy_trigger_cloud_retraining",
+        baseline_method="CATR",
         run_id="run-a",
         results_root=str(tmp_path),
         training_backend=RecordingTrainingBackend(),
@@ -877,7 +877,7 @@ def test_cloud_controller_validates_accuracy_window_frame_contract(tmp_path) -> 
 
 def test_cloud_controller_requires_shared_teacher_annotator(tmp_path) -> None:
     controller = DistributedBaselineController(
-        baseline_method="accuracy_trigger_cloud_retraining",
+        baseline_method="CATR",
         run_id="run-a",
         results_root=str(tmp_path),
         training_backend=RecordingTrainingBackend(),
@@ -1024,7 +1024,7 @@ def _payload(
 ) -> BaselineFramePayload:
     return BaselineFramePayload(
         run_id=run_id,
-        baseline_method="accuracy_trigger_cloud_retraining",
+        baseline_method="CATR",
         edge_id=edge_id,
         frame_id=int(frame_id),
         timestamp_ms=int(frame_id),

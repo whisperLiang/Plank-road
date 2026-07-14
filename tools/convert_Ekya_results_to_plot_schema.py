@@ -15,7 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from tools.experiments.experiment_common import (  # noqa: E402
     ADAPTATION_FIELDS,
     CSV_SCHEMAS,
-    EKYA_CANONICAL_METHOD,
+    EKYA_METHOD,
     FRAME_FIELDS,
     LATENCY_FIELDS,
     SUMMARY_FIELDS,
@@ -30,8 +30,8 @@ from tools.experiments.experiment_common import (  # noqa: E402
     write_csv,
 )
 
-RAW_METHOD = "ekya_style_cloud_scheduling"
-PLOT_METHOD = EKYA_CANONICAL_METHOD
+RAW_METHOD = "Ekya"
+PLOT_METHOD = EKYA_METHOD
 FrameKey = tuple[int, int, int]
 
 
@@ -39,7 +39,7 @@ def convert_ekya_style_results(
     *,
     raw_dir: Path,
     output_dir: Path,
-    comparison_id: str = "ekya_style_cloud_scheduling",
+    comparison_id: str = "Ekya",
     scenario_name: str = "road",
     video_slug: str = "road",
     plot_method: str = PLOT_METHOD,
@@ -66,7 +66,7 @@ def convert_ekya_style_results(
 def build_ekya_style_row_sets(
     *,
     raw_dir: Path,
-    comparison_id: str = "ekya_style_cloud_scheduling",
+    comparison_id: str = "Ekya",
     scenario_name: str = "road",
     video_slug: str = "road",
     plot_method: str = PLOT_METHOD,
@@ -608,7 +608,7 @@ def _dropped_display_count(raw_dir: Path) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Convert Ekya-style raw results to existing Plank-road plot inputs."
+        description="Convert Ekya raw results to existing Plank-road plot inputs."
     )
     parser.add_argument("--run_id", required=True)
     parser.add_argument("--result_dir", default="./results/cloud", type=Path)
@@ -630,7 +630,7 @@ def main(argv: list[str] | None = None) -> int:
     report = convert_ekya_style_results(
         raw_dir=raw_dir,
         output_dir=output_dir,
-        comparison_id=args.experiment_id or args.comparison_id or "ekya_style_cloud_scheduling",
+        comparison_id=args.experiment_id or args.comparison_id or "Ekya",
         scenario_name=args.scenario_name,
         video_slug=args.video_slug,
     )
@@ -640,7 +640,7 @@ def main(argv: list[str] | None = None) -> int:
             target_normalized_dir=args.append_to_normalized_dir,
         )
     print(
-        "Converted Ekya-style results: "
+        "Converted Ekya results: "
         f"frames={report['evaluated_frame_count']} "
         f"missing={report['missing_result_count']} "
         f"dropped={report['dropped_display_count']}"

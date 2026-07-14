@@ -8,10 +8,10 @@ from typing import Any
 import numpy as np
 import torch
 
-from cloud.baselines.ekya_style_cloud_scheduling.config import (
+from cloud.baselines.Ekya.config import (
     EkyaStyleCloudSchedulingConfig,
 )
-from cloud.baselines.ekya_style_cloud_scheduling.protocol import (
+from cloud.baselines.Ekya.protocol import (
     DetectionResultPacket,
     FrameUploadPacket,
     now_s,

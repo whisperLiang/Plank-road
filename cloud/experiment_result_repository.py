@@ -13,7 +13,7 @@ from loguru import logger
 
 from common.experiment_results import (
     EXPERIMENT_METHODS,
-    PURE_EDGE_METHOD,
+    SURGEON_METHOD,
     ExperimentIdentity,
     ExperimentJsonlWriter,
     cloud_repository_edge_run_dir,
@@ -95,7 +95,7 @@ class CloudExperimentManifestWriter:
             method=method,
             run_id=run_id,
         )
-        if identity.method == PURE_EDGE_METHOD:
+        if identity.method == SURGEON_METHOD:
             return
         self._upsert(
             identity=identity,
@@ -413,7 +413,7 @@ class CloudExperimentResultRepository:
             method=method,
             run_id=run_id,
         )
-        if identity.method == PURE_EDGE_METHOD:
+        if identity.method == SURGEON_METHOD:
             return
         key = (
             identity.experiment_id,

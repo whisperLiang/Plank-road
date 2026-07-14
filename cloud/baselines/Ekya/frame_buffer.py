@@ -9,7 +9,7 @@ from typing import Any
 import cv2
 import numpy as np
 
-from cloud.baselines.ekya_style_cloud_scheduling.protocol import FrameUploadPacket
+from cloud.baselines.Ekya.protocol import FrameUploadPacket
 
 FrameKey = tuple[int, int, int]
 

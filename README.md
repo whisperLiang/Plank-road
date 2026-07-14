@@ -94,7 +94,7 @@ Plank-road/
 |   `-- feature_shard/          # Edge-side safetensors/npy feature shard writers
 |-- cloud/                      # Cloud ingest, orchestration, resource state, model updates
 |   |-- annotation/             # Teacher annotation service and label cache
-|   |-- baselines/              # Cloud-side baseline controllers, including Ekya-style scheduling
+|   |-- baselines/              # Cloud-side baseline controllers, including Ekya scheduling
 |   |-- feature_cache/          # Cloud feature shard store, planner, materializer, GC
 |   |-- orchestration/          # Fixed-split training pipeline stages
 |   `-- workers/                # Edge-affine workers, assignment, MPS, GPU leases
@@ -183,7 +183,7 @@ server:
       default_estimated_job_memory_gb: 18
 ```
 
-Ekya-style cloud scheduling is configured under the cloud baseline section. It
+Ekya cloud scheduling is configured under the cloud baseline section. It
 streams JPEG frames from the edge, returns cloud inference results online, labels
 completed windows with the teacher, microprofiles candidate hyperparameters, and
 optionally adopts retrained student checkpoints.
@@ -191,7 +191,7 @@ optionally adopts retrained student checkpoints.
 ```yaml
 server:
   baselines:
-    ekya_style_cloud_scheduling:
+    Ekya:
       edge_streaming:
         upload_queue_size: 8
       retraining:
@@ -201,7 +201,7 @@ server:
 The baseline inherits shared experiment settings from the main Plank-Road
 configuration: `server.edge_model_name`, `server.golden`, `experiment_run`,
 `server.continual_learning`, `baseline.training`, and
-`baseline.accuracy_trigger_cloud_retraining`.
+`baseline.CATR`.
 
 ## Usage
 
@@ -311,29 +311,33 @@ CLI values such as `--scenario`, `--video_path`, `--max_count`, and `--repeat`
 override `experiment_run`. The runtime run id is generated from those dimensions
 and the method. Different repeated runs must use different `repeat` values.
 
-The supported baseline methods are:
+The supported baseline method identifiers are:
 
 ```text
-pure_edge_local_updating
-accuracy_trigger_cloud_retraining
-ekya_style_cloud_scheduling
+SURGEON
+CATR
+Ekya
 ```
+
+The same identifiers are used directly in configuration, CLI arguments, RPC
+payloads, run ids, and result paths. Legacy long-form identifiers are not
+accepted.
 
 Cloud-backed baseline updates use the shared training-job API with one generic
 baseline job type. The cloud-backed production baseline training strategy is
-`training_strategy: freeze`; Pure Edge uses local `surgeon_tta`:
+`training_strategy: freeze`; SURGEON uses local `surgeon_tta`:
 
 ```yaml
 baseline:
   edge:
     split_runtime_policy: disabled
-  pure_edge_local_updating:
+  SURGEON:
     training_strategy: surgeon_tta
     quality_mode: output_only_when_no_boundary
     trainable_scope: norm_affine
     consistency_weight: 0.01
     entropy_margin_ratio: 0.4
-  accuracy_trigger_cloud_retraining:
+  CATR:
     training_strategy: freeze
     training_failure_backoff_sec: 30
   training:
@@ -345,95 +349,95 @@ baseline:
     training_frame_count: 128
 ```
 
-`accuracy_trigger_cloud_retraining` uses edge predictions only for trigger and
+CATR uses edge predictions only for trigger and
 evaluation metadata; cloud training targets come from the cloud teacher unless
 an explicit ablation opts into edge targets.
 
-#### Accuracy-Trigger Cloud Retraining
+#### CATR
 
 Cloud:
 
 ```shell
-python cloud_server.py --yaml_path ./config/config.yaml --mode baseline --baseline_method accuracy_trigger_cloud_retraining --listen_address "[::]:50051"
+python cloud_server.py --yaml_path ./config/config.yaml --mode baseline --baseline_method CATR --listen_address "[::]:50051"
 ```
 
-Accuracy-Trigger edge device 1:
+CATR edge device 1:
 
 ```shell
-python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method accuracy_trigger_cloud_retraining --edge_id 1 --server_ip 192.168.66.205:50051 --cache_path ./cache/edge_1 --headless
+python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method CATR --edge_id 1 --server_ip 192.168.66.205:50051 --cache_path ./cache/edge_1 --headless
 ```
 
-Accuracy-Trigger edge device 2:
+CATR edge device 2:
 
 ```shell
-python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method accuracy_trigger_cloud_retraining --edge_id 2 --server_ip 192.168.66.205:50051 --cache_path ./cache/edge_2 --video_path ./video_data/cam1-rin.mp4 --headless
+python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method CATR --edge_id 2 --server_ip 192.168.66.205:50051 --cache_path ./cache/edge_2 --video_path ./video_data/cam1-rin.mp4 --headless
 ```
 
-#### Pure Edge Local Updating
+#### SURGEON
 
-Cloud result receiver (no Pure Edge cloud training):
+Cloud result receiver (no SURGEON cloud training):
 
 ```shell
-python cloud_server.py --yaml_path ./config/config.yaml --mode baseline --baseline_method pure_edge_local_updating --listen_address "[::]:50051"
+python cloud_server.py --yaml_path ./config/config.yaml --mode baseline --baseline_method SURGEON --listen_address "[::]:50051"
 ```
 
-Pure Edge edge device 1:
+SURGEON edge device 1:
 
 ```shell
-python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method pure_edge_local_updating --edge_id 1 --cache_path ./cache/edge_1 --headless
+python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method SURGEON --edge_id 1 --cache_path ./cache/edge_1 --headless
 ```
 
-Pure Edge Local Updating writes metrics locally under
-`results/baselines_distributed/{run_id}/pure_edge_local_updating/edge_{edge_id}/metrics.jsonl`
+SURGEON writes metrics locally under
+`results/baselines_distributed/{run_id}/SURGEON/edge_{edge_id}/metrics.jsonl`
 and mirrors experiment artifacts under `cache/experiment_results/...` when
 experiment archival is enabled. When `experiment_results.enabled: true`, the
 completed experiment artifacts are uploaded to the cloud result repository at
-shutdown when `experiment_results.upload_enabled: true`; the Pure Edge
+shutdown when `experiment_results.upload_enabled: true`; the SURGEON
 inference/training path still does not upload frames, metrics, or teacher
 requests during execution. The cloud gRPC server must be running for shutdown
 upload, and `client.server_ip` must point to it. If no cloud process is
 desired, keep `experiment_results.enabled: true` and set
 `experiment_results.upload_enabled: false` to retain local archival only.
 
-#### Ekya-Style Cloud Scheduling
+#### Ekya
 
-The Ekya-style baseline uses a bidirectional gRPC stream. Each sampled edge frame
+The Ekya baseline uses a bidirectional gRPC stream. Each sampled edge frame
 is uploaded as JPEG, the cloud immediately returns the student-model detection
 result for display, and completed windows trigger teacher labeling,
 microprofiling, scheduling, and optional retraining on the cloud. This path is
 implemented under
-[cloud/baselines/ekya_style_cloud_scheduling/](./cloud/baselines/ekya_style_cloud_scheduling/).
+[cloud/baselines/Ekya/](./cloud/baselines/Ekya/).
 
 Cloud:
 
 ```shell
-python cloud_server.py --yaml_path ./config/config.yaml --mode baseline --baseline_method ekya_style_cloud_scheduling --listen_address "[::]:50051"
+python cloud_server.py --yaml_path ./config/config.yaml --mode baseline --baseline_method Ekya --listen_address "[::]:50051"
 ```
 
-Ekya-style edge:
+Ekya edge:
 
 ```shell
-python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method ekya_style_cloud_scheduling --edge_id 1 --server_ip 192.168.66.205:50051 --headless
+python edge_client.py --yaml_path ./config/config.yaml --mode baseline --baseline_method Ekya --edge_id 1 --server_ip 192.168.66.205:50051 --headless
 ```
 
 Cloud-side raw logs are written under
-`results/cloud/{run_id}/baselines/ekya_style_cloud_scheduling/`, including
+`results/cloud/{run_id}/baselines/Ekya/`, including
 `per_frame_metrics.csv`, `per_window_metrics.csv`, `training_events.csv`,
 `scheduler_events.csv`, `model_update_events.csv`, `upload_events.csv`,
 `sampled_frames.json`, and `summary.json`. Edge display events are mirrored
-under `results/edge/{run_id}/baselines/ekya_style_cloud_scheduling/`.
+under `results/edge/{run_id}/baselines/Ekya/`.
 
-Convert one Ekya-style run into the existing plot schema with:
+Convert one Ekya run into the existing plot schema with:
 
 ```shell
-python tools/convert_ekya_style_results_to_plot_schema.py --run_id road_n1_r01_ekya_style_cloud_scheduling --result_dir results/cloud --experiment_id road_baselines --scenario_name road --video_slug road --append_to_normalized_dir results/experiments/road_baselines/normalized
+python tools/convert_Ekya_results_to_plot_schema.py --run_id road_n1_r01_Ekya --result_dir results/cloud --experiment_id road_baselines --scenario_name road --video_slug road --append_to_normalized_dir results/experiments/road_baselines/normalized
 ```
 
 ## Experiment Post-processing and Figures
 
 The baseline figure pipeline compares `plank_road`,
-`pure_edge_local_updating`, `accuracy_trigger_cloud_retraining`, and
-`ekya_style_cloud_scheduling`.
+`SURGEON`, `CATR`, and
+`Ekya`.
 
 Start from
 [configs/experiments/plank_road_baselines_manifest.example.yaml](./configs/experiments/plank_road_baselines_manifest.example.yaml).
@@ -454,7 +458,7 @@ results/experiments/{experiment_id}/
 `experiment_results.root_dir` is the cloud repository and
 `experiment_results.local_root_dir` is the edge staging directory. Experiment
 artifact upload is offline archival traffic. It does not enter sample ingestion,
-teacher annotation, retraining, or `upload_breakdown.csv`. Pure Edge therefore
+teacher annotation, retraining, or `upload_breakdown.csv`. SURGEON therefore
 remains a zero-cloud-communication method for experiment metrics; by default it
 stages result files locally after shutdown and skips cloud artifact upload.
 
@@ -480,12 +484,12 @@ Teacher replay reports Teacher-supervised F1, not ground-truth accuracy, and is
 excluded from online latency and communication metrics. Missing values stay
 empty and skipped or partial figures are reported in `figures/plot_report.json`.
 
-Ekya-style raw logs can be consumed directly by the normalizer when the matrix
-manifest includes method `ekya_style_cloud_scheduling` and the raw files are in
-the generated `{scenario_slug}_n{edge_count}_r{repeat}_ekya_style_cloud_scheduling`
+Ekya raw logs can be consumed directly by the normalizer when the matrix
+manifest includes method `Ekya` and the raw files are in
+the generated `{scenario_slug}_n{edge_count}_r{repeat}_Ekya`
 directory. For ad hoc
 conversion, use
-`tools/convert_ekya_style_results_to_plot_schema.py`; it writes the same
+`tools/convert_Ekya_results_to_plot_schema.py`; it writes the same
 canonical method identity.
 
 Legacy external Ekya summary data uses

@@ -115,7 +115,7 @@ def build_baseline_training_bundle(
         if not frame_entries:
             raise RuntimeError("baseline training bundle contains no raw frames")
         normalized_training_config = dict(training_config or {})
-        if str(baseline_method) == "accuracy_trigger_cloud_retraining":
+        if str(baseline_method) == "CATR":
             normalized_training_config.setdefault("trainable_param_ratio", 0.3)
         manifest: dict[str, Any] = {
             "run_id": str(run_id),
@@ -183,7 +183,7 @@ class BaselineUploadClient:
 
     def upload_frame(self, payload: BaselineFramePayload) -> None:
         request = _frame_payload_to_proto(payload)
-        if payload.baseline_method == "accuracy_trigger_cloud_retraining":
+        if payload.baseline_method == "CATR":
             reply = self.stub.UploadKeyFrame(request)
         else:
             reply = self.stub.UploadFrame(request)

@@ -5,10 +5,10 @@ import time
 from pathlib import Path
 from typing import Any
 
-from cloud.baselines.ekya_style_cloud_scheduling.config import (
+from cloud.baselines.Ekya.config import (
     EkyaStyleCloudSchedulingConfig,
 )
-from cloud.baselines.ekya_style_cloud_scheduling.frame_buffer import CompletedFrameWindow
+from cloud.baselines.Ekya.frame_buffer import CompletedFrameWindow
 
 
 class TeacherLabeler:

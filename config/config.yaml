@@ -15,7 +15,8 @@ experiment_results:
 
 baseline:
  enabled: false
- method: accuracy_trigger_cloud_retraining
+ # Baseline method identifiers: SURGEON, CATR, Ekya.
+ method: CATR
  training:
   batch_size: 16
   num_epoch: 30
@@ -23,17 +24,17 @@ baseline:
   optimizer_name: adam
   weight_decay: 0.0
   training_frame_count: 128
- pure_edge_local_updating:
+ SURGEON:
   training_strategy: surgeon_tta
   quality_mode: output_only_when_no_boundary
   trainable_scope: norm_affine
   train_sample_count: 16
   consistency_weight: 0.01
   entropy_margin_ratio: 0.4
- accuracy_trigger_cloud_retraining:
+ CATR:
   # Engineering variant for this refactor: this reuses the existing
   # Plank-Road frame filter as the keyframe selector, while training
-  # trigger decisions are strictly cloud-side Accuracy-Trigger decisions.
+  # trigger decisions are strictly cloud-side CATR decisions.
   # Number of source video frames per fixed trigger window.
   # Filtering only affects how many keyframes are uploaded inside this
   # source-frame window.
@@ -221,7 +222,7 @@ server:
  # cloud-owned workspace used for uploaded retraining bundles
  workspace_root: "./cache/server_workspace"
  baselines:
-  ekya_style_cloud_scheduling:
+  Ekya:
    seed: 42
    edge_streaming:
     upload_queue_size: 8

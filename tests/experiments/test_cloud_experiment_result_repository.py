@@ -58,9 +58,9 @@ def _request(
     "method",
     [
         "plank_road",
-        "pure_edge_local_updating",
-        "accuracy_trigger_cloud_retraining",
-        "ekya_style_cloud_scheduling",
+        "SURGEON",
+        "CATR",
+        "Ekya",
     ],
 )
 def test_repository_stores_all_supported_methods(tmp_path: Path, method: str) -> None:
@@ -220,8 +220,8 @@ def test_auto_repository_layout_normalizes_without_manual_log_copy(
     )
     runs = (
         ("plank_road", "main-r1"),
-        ("pure_edge_local_updating", "pure-r1"),
-        ("accuracy_trigger_cloud_retraining", "accuracy-r1"),
+        ("SURGEON", "pure-r1"),
+        ("CATR", "accuracy-r1"),
     )
     summary = json.dumps({"video_source": "road.mp4"}).encode()
     frame = (

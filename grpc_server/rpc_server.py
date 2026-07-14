@@ -442,7 +442,7 @@ class MessageTransmissionServicer(message_transmission_pb2_grpc.MessageTransmiss
             yield message_transmission_pb2.EkyaServerMessage(
                 error=message_transmission_pb2.EkyaAck(
                     success=False,
-                    message="Ekya-style cloud scheduling controller is not configured",
+                    message="Ekya cloud scheduling controller is not configured",
                 )
             )
             return
@@ -583,7 +583,7 @@ def _baseline_inference_reply(
 
 
 def _ekya_frame_upload_from_proto(message):
-    from cloud.baselines.ekya_style_cloud_scheduling.protocol import FrameUploadPacket
+    from cloud.baselines.Ekya.protocol import FrameUploadPacket
 
     shape = list(message.image_shape)
     if len(shape) < 2:
@@ -605,7 +605,7 @@ def _ekya_frame_upload_from_proto(message):
 
 
 def _ekya_display_event_from_proto(message):
-    from cloud.baselines.ekya_style_cloud_scheduling.protocol import DisplayEventPacket
+    from cloud.baselines.Ekya.protocol import DisplayEventPacket
 
     return DisplayEventPacket(
         method=str(message.method),

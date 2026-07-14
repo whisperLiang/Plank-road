@@ -4,7 +4,7 @@ import csv
 import json
 from pathlib import Path
 
-from cloud.baselines.ekya_style_cloud_scheduling.unified_logger import (
+from cloud.baselines.Ekya.unified_logger import (
     DISPLAY_FIELDS,
     INFERENCE_FIELDS,
     MICROPROFILE_FIELDS,
@@ -15,13 +15,13 @@ from cloud.baselines.ekya_style_cloud_scheduling.unified_logger import (
     TRAINING_FIELDS,
     UPLOAD_EVENT_FIELDS,
 )
-from tools.convert_ekya_style_results_to_plot_schema import (
+from tools.convert_Ekya_results_to_plot_schema import (
     append_ekya_style_to_normalized_dir,
     convert_ekya_style_results,
 )
 from tools.experiments.experiment_common import (
     CSV_SCHEMAS,
-    EKYA_CANONICAL_METHOD,
+    EKYA_METHOD,
     read_csv,
     write_csv,
 )
@@ -35,7 +35,7 @@ def _raw_ekya_dir(tmp_path: Path) -> Path:
         / "cloud"
         / "ekya-run"
         / "baselines"
-        / "ekya_style_cloud_scheduling"
+        / "Ekya"
     )
 
 
@@ -262,7 +262,7 @@ def _write_raw_ekya_fixture(raw_dir: Path) -> None:
     (raw_dir / "summary.json").write_text(
         json.dumps(
             {
-                "method": "ekya_style_cloud_scheduling",
+                "method": "Ekya",
                 "run_id": "ekya-run",
                 "student_model": "rfdetr_nano",
                 "teacher_model": "rtdetr_x",
@@ -287,7 +287,7 @@ def _write_raw_ekya_fixture(raw_dir: Path) -> None:
         PER_FRAME_FIELDS,
         [
             {
-                "method": "ekya_style_cloud_scheduling",
+                "method": "Ekya",
                 "run_id": "ekya-run",
                 "video_name": "road.mp4",
                 "edge_id": 1,
@@ -309,7 +309,7 @@ def _write_raw_ekya_fixture(raw_dir: Path) -> None:
                 "edge_e2e_display_latency_ms": 80,
             },
             {
-                "method": "ekya_style_cloud_scheduling",
+                "method": "Ekya",
                 "run_id": "ekya-run",
                 "video_name": "road.mp4",
                 "edge_id": 1,
@@ -336,7 +336,7 @@ def _write_raw_ekya_fixture(raw_dir: Path) -> None:
         DISPLAY_FIELDS,
         [
             {
-                "method": "ekya_style_cloud_scheduling",
+                "method": "Ekya",
                 "run_id": "ekya-run",
                 "edge_id": 1,
                 "camera_id": 0,
@@ -353,7 +353,7 @@ def _write_raw_ekya_fixture(raw_dir: Path) -> None:
                 "displayed": True,
             },
             {
-                "method": "ekya_style_cloud_scheduling",
+                "method": "Ekya",
                 "run_id": "ekya-run",
                 "edge_id": 1,
                 "camera_id": 0,
@@ -374,7 +374,7 @@ def _write_raw_ekya_fixture(raw_dir: Path) -> None:
         PER_WINDOW_FIELDS,
         [
             {
-                "method": "ekya_style_cloud_scheduling",
+                "method": "Ekya",
                 "run_id": "ekya-run",
                 "video_name": "road.mp4",
                 "task_id": 0,
@@ -395,7 +395,7 @@ def _write_raw_ekya_fixture(raw_dir: Path) -> None:
         TRAINING_FIELDS,
         [
             {
-                "method": "ekya_style_cloud_scheduling",
+                "method": "Ekya",
                 "run_id": "ekya-run",
                 "task_id": 0,
                 "train_start_time": 10.5,
@@ -412,7 +412,7 @@ def _write_raw_ekya_fixture(raw_dir: Path) -> None:
         MODEL_UPDATE_FIELDS,
         [
             {
-                "method": "ekya_style_cloud_scheduling",
+                "method": "Ekya",
                 "run_id": "ekya-run",
                 "task_id": 0,
                 "old_model_version": "0",
@@ -430,7 +430,7 @@ def _write_raw_ekya_fixture(raw_dir: Path) -> None:
         SCHEDULER_FIELDS,
         [
             {
-                "method": "ekya_style_cloud_scheduling",
+                "method": "Ekya",
                 "run_id": "ekya-run",
                 "edge_id": 1,
                 "camera_id": 0,
@@ -451,7 +451,7 @@ def _write_raw_ekya_fixture(raw_dir: Path) -> None:
         UPLOAD_EVENT_FIELDS,
         [
             {
-                "method": "ekya_style_cloud_scheduling",
+                "method": "Ekya",
                 "run_id": "ekya-run",
                 "video_name": "road.mp4",
                 "edge_id": 1,
@@ -463,7 +463,7 @@ def _write_raw_ekya_fixture(raw_dir: Path) -> None:
                 "raw_frame_bytes": 1000,
             },
             {
-                "method": "ekya_style_cloud_scheduling",
+                "method": "Ekya",
                 "run_id": "ekya-run",
                 "video_name": "road.mp4",
                 "edge_id": 1,
@@ -489,8 +489,8 @@ def test_ekya_converter_writes_existing_csv_schemas_exactly(tmp_path: Path) -> N
 
     for filename, fields in CSV_SCHEMAS.items():
         assert _header(output_dir / filename) == fields
-    assert report["raw_method"] == "ekya_style_cloud_scheduling"
-    assert report["plot_method"] == EKYA_CANONICAL_METHOD
+    assert report["raw_method"] == "Ekya"
+    assert report["plot_method"] == EKYA_METHOD
     assert report["evaluated_frame_count"] == 3
     assert report["missing_result_count"] == 1
     assert report["dropped_display_count"] == 1
@@ -501,7 +501,7 @@ def test_ekya_converter_writes_existing_csv_schemas_exactly(tmp_path: Path) -> N
 
     frames = read_csv(output_dir / "frame_metrics.csv")
     assert [row["frame_id"] for row in frames] == ["1", "2", "3"]
-    assert {row["method"] for row in frames} == {EKYA_CANONICAL_METHOD}
+    assert {row["method"] for row in frames} == {EKYA_METHOD}
     assert frames[1]["result_source"] == "missing_result"
     assert frames[1]["num_detections"] == ""
     assert frames[2]["result_source"] == "stale_result"
@@ -629,7 +629,7 @@ def test_ekya_converter_keeps_multi_edge_frames_separate(tmp_path: Path) -> None
     (raw_dir / "summary.json").write_text(
         json.dumps(
             {
-                "method": "ekya_style_cloud_scheduling",
+                "method": "Ekya",
                 "run_id": "ekya-run",
                 "student_model": "rfdetr_nano",
                 "teacher_model": "rtdetr_x",
@@ -650,7 +650,7 @@ def test_ekya_converter_keeps_multi_edge_frames_separate(tmp_path: Path) -> None
         PER_FRAME_FIELDS,
         [
             {
-                "method": "ekya_style_cloud_scheduling",
+                "method": "Ekya",
                 "run_id": "ekya-run",
                 "video_name": "road.mp4",
                 "edge_id": 1,
@@ -672,7 +672,7 @@ def test_ekya_converter_keeps_multi_edge_frames_separate(tmp_path: Path) -> None
                 "edge_e2e_display_latency_ms": 80,
             },
             {
-                "method": "ekya_style_cloud_scheduling",
+                "method": "Ekya",
                 "run_id": "ekya-run",
                 "video_name": "road.mp4",
                 "edge_id": 2,
@@ -700,7 +700,7 @@ def test_ekya_converter_keeps_multi_edge_frames_separate(tmp_path: Path) -> None
         DISPLAY_FIELDS,
         [
             {
-                "method": "ekya_style_cloud_scheduling",
+                "method": "Ekya",
                 "run_id": "ekya-run",
                 "edge_id": 1,
                 "camera_id": 0,
@@ -715,7 +715,7 @@ def test_ekya_converter_keeps_multi_edge_frames_separate(tmp_path: Path) -> None
                 "displayed": True,
             },
             {
-                "method": "ekya_style_cloud_scheduling",
+                "method": "Ekya",
                 "run_id": "ekya-run",
                 "edge_id": 2,
                 "camera_id": 0,
@@ -736,7 +736,7 @@ def test_ekya_converter_keeps_multi_edge_frames_separate(tmp_path: Path) -> None
         PER_WINDOW_FIELDS,
         [
             {
-                "method": "ekya_style_cloud_scheduling",
+                "method": "Ekya",
                 "run_id": "ekya-run",
                 "video_name": "road.mp4",
                 "edge_id": 1,
@@ -753,7 +753,7 @@ def test_ekya_converter_keeps_multi_edge_frames_separate(tmp_path: Path) -> None
                 "num_model_updates": 1,
             },
             {
-                "method": "ekya_style_cloud_scheduling",
+                "method": "Ekya",
                 "run_id": "ekya-run",
                 "video_name": "road.mp4",
                 "edge_id": 2,
@@ -776,7 +776,7 @@ def test_ekya_converter_keeps_multi_edge_frames_separate(tmp_path: Path) -> None
         TRAINING_FIELDS,
         [
             {
-                "method": "ekya_style_cloud_scheduling",
+                "method": "Ekya",
                 "run_id": "ekya-run",
                 "edge_id": 1,
                 "camera_id": 0,
@@ -785,7 +785,7 @@ def test_ekya_converter_keeps_multi_edge_frames_separate(tmp_path: Path) -> None
                 "train_end_time": 10.7,
             },
             {
-                "method": "ekya_style_cloud_scheduling",
+                "method": "Ekya",
                 "run_id": "ekya-run",
                 "edge_id": 2,
                 "camera_id": 0,
@@ -800,7 +800,7 @@ def test_ekya_converter_keeps_multi_edge_frames_separate(tmp_path: Path) -> None
         MODEL_UPDATE_FIELDS,
         [
             {
-                "method": "ekya_style_cloud_scheduling",
+                "method": "Ekya",
                 "run_id": "ekya-run",
                 "edge_id": 1,
                 "camera_id": 0,
@@ -811,7 +811,7 @@ def test_ekya_converter_keeps_multi_edge_frames_separate(tmp_path: Path) -> None
                 "update_time": 10.8,
             },
             {
-                "method": "ekya_style_cloud_scheduling",
+                "method": "Ekya",
                 "run_id": "ekya-run",
                 "edge_id": 2,
                 "camera_id": 0,
@@ -828,7 +828,7 @@ def test_ekya_converter_keeps_multi_edge_frames_separate(tmp_path: Path) -> None
         SCHEDULER_FIELDS,
         [
             {
-                "method": "ekya_style_cloud_scheduling",
+                "method": "Ekya",
                 "run_id": "ekya-run",
                 "edge_id": 1,
                 "camera_id": 0,
@@ -836,7 +836,7 @@ def test_ekya_converter_keeps_multi_edge_frames_separate(tmp_path: Path) -> None
                 "scheduler_name": "ekya_thief_style",
             },
             {
-                "method": "ekya_style_cloud_scheduling",
+                "method": "Ekya",
                 "run_id": "ekya-run",
                 "edge_id": 2,
                 "camera_id": 0,
@@ -850,7 +850,7 @@ def test_ekya_converter_keeps_multi_edge_frames_separate(tmp_path: Path) -> None
         UPLOAD_EVENT_FIELDS,
         [
             {
-                "method": "ekya_style_cloud_scheduling",
+                "method": "Ekya",
                 "run_id": "ekya-run",
                 "video_name": "road.mp4",
                 "edge_id": 1,
@@ -862,7 +862,7 @@ def test_ekya_converter_keeps_multi_edge_frames_separate(tmp_path: Path) -> None
                 "raw_frame_bytes": 1000,
             },
             {
-                "method": "ekya_style_cloud_scheduling",
+                "method": "Ekya",
                 "run_id": "ekya-run",
                 "video_name": "road.mp4",
                 "edge_id": 2,
@@ -937,7 +937,7 @@ def test_ekya_schema_contract_appends_to_existing_normalized_and_plots(
         assert _header(combined / filename) == fields
     summary_rows = read_csv(combined / "summary.csv")
     assert any(row["method"] == "plank_road" for row in summary_rows)
-    assert any(row["method"] == EKYA_CANONICAL_METHOD for row in summary_rows)
+    assert any(row["method"] == EKYA_METHOD for row in summary_rows)
 
     report = plot_figures(combined, figures)
     assert (figures / "plot_report.json").exists()

@@ -7,17 +7,17 @@ from typing import Any
 import torch
 from loguru import logger
 
-from cloud.baselines.ekya_style_cloud_scheduling.config import (
+from cloud.baselines.Ekya.config import (
     EkyaStyleCloudSchedulingConfig,
 )
-from cloud.baselines.ekya_style_cloud_scheduling.dataset import (
+from cloud.baselines.Ekya.dataset import (
     split_train_val_samples,
     window_to_samples,
 )
-from cloud.baselines.ekya_style_cloud_scheduling.evaluator import evaluate_model_on_samples
-from cloud.baselines.ekya_style_cloud_scheduling.frame_buffer import CompletedFrameWindow
-from cloud.baselines.ekya_style_cloud_scheduling.scheduler import MicroProfileResult
-from cloud.baselines.ekya_style_cloud_scheduling.training_runtime import (
+from cloud.baselines.Ekya.evaluator import evaluate_model_on_samples
+from cloud.baselines.Ekya.frame_buffer import CompletedFrameWindow
+from cloud.baselines.Ekya.scheduler import MicroProfileResult
+from cloud.baselines.Ekya.training_runtime import (
     build_training_components,
     load_base_state_dict,
     run_one_training_epoch,

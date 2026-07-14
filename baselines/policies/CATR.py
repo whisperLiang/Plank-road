@@ -5,7 +5,7 @@ from baselines.policies.base_policy import BaseBaselinePolicy, BaselineFrameDeci
 
 class AccuracyTriggerCloudRetrainingPolicy(BaseBaselinePolicy):
     def __init__(self, config: object | None = None) -> None:
-        super().__init__("accuracy_trigger_cloud_retraining", config)
+        super().__init__("CATR", config)
         self.reuse_plank_road_frame_filter = bool(
             getattr(config, "reuse_plank_road_frame_filter", True)
         )

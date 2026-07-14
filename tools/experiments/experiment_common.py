@@ -12,7 +12,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import yaml
 
 from common.experiment_results import (
-    PURE_EDGE_METHOD,
+    CATR_METHOD,
+    EKYA_METHOD,
+    PLANK_ROAD_METHOD,
+    SURGEON_METHOD,
     ExperimentIdentity,
     normalize_edge_count,
     normalize_edge_id_for_count,
@@ -20,26 +23,28 @@ from common.experiment_results import (
     normalize_scenario_slug,
 )
 from common.video_identity import resolve_video_identity
+from config.baseline import (
+    ALLOWED_BASELINE_METHODS,
+    baseline_method_label,
+    validate_baseline_method,
+)
 
 METHODS = (
-    "plank_road",
-    "pure_edge_local_updating",
-    "accuracy_trigger_cloud_retraining",
+    PLANK_ROAD_METHOD,
+    SURGEON_METHOD,
+    CATR_METHOD,
 )
-EKYA_CANONICAL_METHOD = "ekya_style_cloud_scheduling"
-OPTIONAL_METHODS = (EKYA_CANONICAL_METHOD,)
+OPTIONAL_METHODS = (EKYA_METHOD,)
 SUPPORTED_METHODS = (*METHODS, *OPTIONAL_METHODS)
 METHOD_ORDER = (
-    "plank_road",
-    "pure_edge_local_updating",
-    "accuracy_trigger_cloud_retraining",
-    EKYA_CANONICAL_METHOD,
+    PLANK_ROAD_METHOD,
+    SURGEON_METHOD,
+    CATR_METHOD,
+    EKYA_METHOD,
 )
 METHOD_LABELS = {
-    "plank_road": "Ours",
-    "pure_edge_local_updating": "Pure Edge",
-    "accuracy_trigger_cloud_retraining": "Accuracy-Trigger",
-    EKYA_CANONICAL_METHOD: "Ekya-style",
+    PLANK_ROAD_METHOD: "Ours",
+    **{method: baseline_method_label(method) for method in ALLOWED_BASELINE_METHODS},
 }
 
 FRAME_FIELDS = [
@@ -337,11 +342,22 @@ def load_manifest(path: Path) -> dict[str, Any]:
     manifest["experiment_id"] = experiment_id
     manifest["comparison_id"] = experiment_id
     manifest["log_timezone"] = log_timezone
-    methods = list(manifest.get("methods") or [])
-    if not methods or len(set(methods)) != len(methods) or any(
-        method not in SUPPORTED_METHODS for method in methods
-    ):
-        raise ManifestError(f"methods must be unique and within: {', '.join(SUPPORTED_METHODS)}")
+    raw_methods = list(manifest.get("methods") or [])
+    methods: list[str] = []
+    try:
+        for method in raw_methods:
+            value = str(method or "").strip()
+            methods.append(
+                PLANK_ROAD_METHOD
+                if value == PLANK_ROAD_METHOD
+                else validate_baseline_method(value)
+            )
+    except ValueError as exc:
+        raise ManifestError(str(exc)) from exc
+    if not methods or len(set(methods)) != len(methods):
+        raise ManifestError(
+            "methods must be unique and use: plank_road, SURGEON, CATR, or Ekya"
+        )
     manifest["methods"] = methods
     scenarios = manifest.get("scenarios")
     if not isinstance(scenarios, list) or not scenarios:
@@ -456,7 +472,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
                         str(edge_id): f"{raw_base}/edge_{edge_id}" for edge_id in edge_ids
                     }
                     raw_logs: dict[str, Any] = {"edges": edge_paths}
-                    if method != PURE_EDGE_METHOD:
+                    if method != SURGEON_METHOD:
                         raw_logs["cloud"] = f"{raw_base}/cloud"
                     normalized_runs.append(
                         {

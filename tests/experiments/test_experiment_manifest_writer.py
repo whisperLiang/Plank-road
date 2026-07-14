@@ -43,7 +43,7 @@ def test_manifest_writer_merges_methods_edges_and_preserves_notes(tmp_path: Path
         summary=summary,
     )
     writer.upsert_edge_run(
-        method="pure_edge_local_updating",
+        method="SURGEON",
         scenario_slug="road",
         edge_count=2,
         repeat=1,
@@ -52,7 +52,7 @@ def test_manifest_writer_merges_methods_edges_and_preserves_notes(tmp_path: Path
         summary=summary,
     )
     writer.upsert_edge_run(
-        method="accuracy_trigger_cloud_retraining",
+        method="CATR",
         scenario_slug="road",
         edge_count=2,
         repeat=1,
@@ -69,8 +69,8 @@ def test_manifest_writer_merges_methods_edges_and_preserves_notes(tmp_path: Path
     assert result["edge_ids_by_count"] == {"2": [1, 2]}
     assert result["methods"] == [
         "plank_road",
-        "pure_edge_local_updating",
-        "accuracy_trigger_cloud_retraining",
+        "SURGEON",
+        "CATR",
     ]
     assert result["scenarios"][0]["notes"] == "keep me"
     assert result["scenarios"][0]["video_slug"] == "road"

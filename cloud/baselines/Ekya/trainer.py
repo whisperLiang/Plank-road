@@ -11,17 +11,17 @@ from typing import Any
 import torch
 from loguru import logger
 
-from cloud.baselines.ekya_style_cloud_scheduling.config import (
+from cloud.baselines.Ekya.config import (
     EkyaStyleCloudSchedulingConfig,
 )
-from cloud.baselines.ekya_style_cloud_scheduling.dataset import (
+from cloud.baselines.Ekya.dataset import (
     split_train_val_samples,
     window_to_samples,
 )
-from cloud.baselines.ekya_style_cloud_scheduling.evaluator import evaluate_model_on_samples
-from cloud.baselines.ekya_style_cloud_scheduling.frame_buffer import CompletedFrameWindow
-from cloud.baselines.ekya_style_cloud_scheduling.scheduler import SchedulerDecision
-from cloud.baselines.ekya_style_cloud_scheduling.training_runtime import (
+from cloud.baselines.Ekya.evaluator import evaluate_model_on_samples
+from cloud.baselines.Ekya.frame_buffer import CompletedFrameWindow
+from cloud.baselines.Ekya.scheduler import SchedulerDecision
+from cloud.baselines.Ekya.training_runtime import (
     assert_non_empty_checkpoint_state,
     build_training_components,
     cpu_state_dict,
@@ -225,7 +225,7 @@ class EkyaCloudTrainer:
             raise RuntimeError("Ekya training completed without a validated checkpoint state")
 
         metadata = {
-            "method": "ekya_style_cloud_scheduling",
+            "method": "Ekya",
             "student_model": self.config.student_model,
             "teacher_model": self.config.teacher_model,
             "edge_id": int(window.edge_id),

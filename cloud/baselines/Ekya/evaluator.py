@@ -33,7 +33,7 @@ def evaluate_model_on_samples(
     metric_mode: str = "teacher_proxy",
 ) -> DetectionEvalResult:
     if str(metric_mode or "teacher_proxy") != "teacher_proxy":
-        raise ValueError("ekya_style_cloud_scheduling supports metric_mode=teacher_proxy")
+        raise ValueError("Ekya supports metric_mode=teacher_proxy")
     sample_list = list(samples or [])
     if not sample_list:
         return DetectionEvalResult(
@@ -69,7 +69,7 @@ def evaluate_model_on_samples(
         map_value = float(stats.foreground_mean_f1)
         ap50 = float(stats.foreground_mean_f1)
         logger.debug(
-            "ekya_style_cloud_scheduling evaluator using teacher_proxy F1 for mAP/AP50"
+            "Ekya evaluator using teacher_proxy F1 for mAP/AP50"
         )
     return DetectionEvalResult(
         map=_clamp01(map_value),
@@ -201,7 +201,7 @@ def _torchmetrics_map(
         metric.reset()
     except Exception as exc:
         logger.debug(
-            "ekya_style_cloud_scheduling torchmetrics evaluation unavailable: {}",
+            "Ekya torchmetrics evaluation unavailable: {}",
             exc,
         )
         return None, None
@@ -212,7 +212,11 @@ def _prediction_tensors(prediction: Mapping[str, Any]) -> dict[str, torch.Tensor
     boxes = torch.as_tensor(_boxes(prediction.get("boxes")), dtype=torch.float32)
     labels = torch.as_tensor(_labels(prediction.get("labels"), boxes.shape[0]), dtype=torch.int64)
     scores = torch.as_tensor(_scores(prediction.get("scores"), boxes.shape[0]), dtype=torch.float32)
-    return {"boxes": boxes.reshape((-1, 4)), "labels": labels.reshape((-1,)), "scores": scores.reshape((-1,))}
+    return {
+        "boxes": boxes.reshape((-1, 4)),
+        "labels": labels.reshape((-1,)),
+        "scores": scores.reshape((-1,)),
+    }
 
 
 def _target_tensors(target: Mapping[str, Any]) -> dict[str, torch.Tensor]:

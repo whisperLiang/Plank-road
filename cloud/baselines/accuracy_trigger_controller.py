@@ -18,7 +18,7 @@ from cloud.baselines.detection_agreement import (
     normalize_detection_prediction,
 )
 
-_METHOD = "accuracy_trigger_cloud_retraining"
+_METHOD = "CATR"
 _TERMINAL_FAILURES = {"FAILED", "STALE", "CANCELLED"}
 
 
@@ -860,7 +860,7 @@ def _model_key(
 
 def _normalise_training_frame_count(value: object) -> int:
     if value in (None, "", 0):
-        raise ValueError("training_frame_count is required for Accuracy-Trigger buffer")
+        raise ValueError("training_frame_count is required for the CATR buffer")
     return max(1, int(value))
 
 

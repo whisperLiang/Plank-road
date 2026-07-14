@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from cloud.baselines.ekya_style_cloud_scheduling.config import SchedulerConfig
+from cloud.baselines.Ekya.config import SchedulerConfig
 
 
 @dataclass(frozen=True)

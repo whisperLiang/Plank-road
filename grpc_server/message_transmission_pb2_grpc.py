@@ -153,7 +153,7 @@ class MessageTransmissionServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def continual_learning_request(self, request, context):
-        """Versioned continual-learning bundle upload for the fixed-split pipeline.
+        """Continual-learning bundle upload for the fixed-split pipeline.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -271,7 +271,7 @@ class MessageTransmissionServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def EkyaFrameStream(self, request_iterator, context):
-        """Ekya-style cloud scheduling: edge streams JPEG frames and receives
+        """Ekya cloud scheduling: edge streams JPEG frames and receives
         cloud inference results in the same online stream.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)

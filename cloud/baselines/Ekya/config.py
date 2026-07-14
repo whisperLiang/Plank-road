@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-METHOD = "ekya_style_cloud_scheduling"
+METHOD = "Ekya"
 
 
 @dataclass(frozen=True)
@@ -129,55 +129,55 @@ class EkyaStyleCloudSchedulingConfig:
     def validate(self) -> None:
         if not self.allow_model_override and self.student_model != "rfdetr_nano":
             raise ValueError(
-                "ekya_style_cloud_scheduling.student_model must be rfdetr_nano "
+                "Ekya.student_model must be rfdetr_nano "
                 "unless allow_model_override=true"
             )
         if not self.allow_model_override and self.teacher_model != "rtdetr_x":
             raise ValueError(
-                "ekya_style_cloud_scheduling.teacher_model must be rtdetr_x "
+                "Ekya.teacher_model must be rtdetr_x "
                 "unless allow_model_override=true"
             )
         if self.window_size <= 0:
-            raise ValueError("ekya_style_cloud_scheduling.window_size must be positive")
+            raise ValueError("Ekya.window_size must be positive")
         if self.training_frame_count <= 0:
             raise ValueError(
-                "ekya_style_cloud_scheduling.training_frame_count must be positive"
+                "Ekya.training_frame_count must be positive"
             )
         if self.training_frame_count < self.window_size:
             raise ValueError(
-                "ekya_style_cloud_scheduling.training_frame_count must be >= window_size"
+                "Ekya.training_frame_count must be >= window_size"
             )
         if self.num_frames < self.window_size:
-            raise ValueError("ekya_style_cloud_scheduling.num_frames must be >= window_size")
+            raise ValueError("Ekya.num_frames must be >= window_size")
         self.fixed_training.validate()
         if self.microprofile.microprofile_epochs <= 0:
             raise ValueError(
-                "ekya_style_cloud_scheduling.microprofile.microprofile_epochs must be positive"
+                "Ekya.microprofile.microprofile_epochs must be positive"
             )
         if self.dataset.train_val_split <= 0.0 or self.dataset.train_val_split >= 1.0:
             raise ValueError(
-                "ekya_style_cloud_scheduling.dataset.train_val_split must be in (0, 1)"
+                "Ekya.dataset.train_val_split must be in (0, 1)"
             )
         if self.dataset.min_train_samples <= 0 or self.dataset.min_val_samples <= 0:
             raise ValueError(
-                "ekya_style_cloud_scheduling.dataset min sample counts must be positive"
+                "Ekya.dataset min sample counts must be positive"
             )
         if self.evaluation.score_threshold < 0.0:
             raise ValueError(
-                "ekya_style_cloud_scheduling.evaluation.score_threshold must be non-negative"
+                "Ekya.evaluation.score_threshold must be non-negative"
             )
         if self.evaluation.iou_threshold <= 0.0 or self.evaluation.iou_threshold > 1.0:
             raise ValueError(
-                "ekya_style_cloud_scheduling.evaluation.iou_threshold must be in (0, 1]"
+                "Ekya.evaluation.iou_threshold must be in (0, 1]"
             )
         train_mode = str(self.retraining.train_mode or "").strip().lower()
         if train_mode not in {"full", "freeze"}:
             raise ValueError(
-                "ekya_style_cloud_scheduling.retraining.train_mode must be full or freeze"
+                "Ekya.retraining.train_mode must be full or freeze"
             )
         if train_mode == "freeze" and self.retraining.trainable_param_ratio is None:
             raise ValueError(
-                "ekya_style_cloud_scheduling.retraining.trainable_param_ratio is required "
+                "Ekya.retraining.trainable_param_ratio is required "
                 "when train_mode=freeze"
             )
         if self.retraining.trainable_param_ratio is not None and (
@@ -185,7 +185,7 @@ class EkyaStyleCloudSchedulingConfig:
             or self.retraining.trainable_param_ratio > 1.0
         ):
             raise ValueError(
-                "ekya_style_cloud_scheduling.retraining.trainable_param_ratio must be in (0, 1]"
+                "Ekya.retraining.trainable_param_ratio must be in (0, 1]"
             )
         if str(self.retraining.optimizer_name or "").strip().lower() not in {
             "adamw",
@@ -193,16 +193,16 @@ class EkyaStyleCloudSchedulingConfig:
             "sgd",
         }:
             raise ValueError(
-                "ekya_style_cloud_scheduling.retraining.optimizer_name must be adamw, adam, or sgd"
+                "Ekya.retraining.optimizer_name must be adamw, adam, or sgd"
             )
         if self.retraining.weight_decay < 0.0:
-            raise ValueError("ekya_style_cloud_scheduling.retraining.weight_decay must be >= 0")
+            raise ValueError("Ekya.retraining.weight_decay must be >= 0")
         scope = str(
             self.retraining.training_admission_scope or "edge_camera"
         ).strip().lower()
         if scope not in {"edge_camera", "edge_only", "global"}:
             raise ValueError(
-                "ekya_style_cloud_scheduling.retraining.training_admission_scope "
+                "Ekya.retraining.training_admission_scope "
                 "must be edge_camera, edge_only, or global"
             )
 
@@ -222,13 +222,13 @@ def parse_ekya_style_config(
     section = _get(server_baselines, METHOD, None)
     if section is None:
         raise ValueError(
-            "server.baselines.ekya_style_cloud_scheduling is required for "
-            "ekya_style_cloud_scheduling"
+            "server.baselines.Ekya is required for "
+            "Ekya"
         )
 
     resolved_run_id = str(run_id or "")
     if not resolved_run_id:
-        raise ValueError("run_id must be non-empty for ekya_style_cloud_scheduling")
+        raise ValueError("run_id must be non-empty for Ekya")
 
     source = _get(client, "source", None)
     student_model = str(
@@ -236,13 +236,13 @@ def parse_ekya_style_config(
             _configured_value(
                 _get(section, "student_model", None), _get(server, "edge_model_name", None)
             ),
-            "ekya_style_cloud_scheduling.student_model",
+            "Ekya.student_model",
         )
     )
     teacher_model = str(
         _required_value(
             _configured_value(_get(section, "teacher_model", None), _get(server, "golden", None)),
-            "ekya_style_cloud_scheduling.teacher_model",
+            "Ekya.teacher_model",
         )
     )
     resolved_video_path = str(
@@ -251,7 +251,7 @@ def parse_ekya_style_config(
             or _configured_value(
                 _get(section, "video_path", None), _get(source, "video_path", None)
             ),
-            "ekya_style_cloud_scheduling.video_path",
+            "Ekya.video_path",
         )
     )
     resolved_result_root = Path(
@@ -263,7 +263,7 @@ def parse_ekya_style_config(
         else resolved_result_root / resolved_run_id / "baselines" / METHOD
     )
     microprofile_section = _get(section, "microprofile", None)
-    accuracy_cfg = _get(baseline, "accuracy_trigger_cloud_retraining", None)
+    accuracy_cfg = _get(baseline, "CATR", None)
     baseline_training = _get(baseline, "training", None)
     training_frame_count = int(_get(baseline_training, "training_frame_count", 128))
     trigger_window_size = int(_get(accuracy_cfg, "trigger_window_size", training_frame_count))
@@ -279,7 +279,7 @@ def parse_ekya_style_config(
                 _configured_value(
                     _get(section, "num_frames", None), _get(source, "max_count", None)
                 ),
-                "ekya_style_cloud_scheduling.num_frames",
+                "Ekya.num_frames",
             )
         ),
         window_size=int(
@@ -288,7 +288,7 @@ def parse_ekya_style_config(
                     configured_window_size,
                     trigger_window_size,
                 ),
-                "ekya_style_cloud_scheduling.window_size",
+                "Ekya.window_size",
             )
         ),
         training_frame_count=int(training_frame_count),
@@ -407,7 +407,7 @@ def _model_family(model_name: str) -> str:
 
 def _edge_streaming_config(value: object) -> EdgeStreamingConfig:
     if _has_config_value(value, "jpeg_quality"):
-        raise ValueError("ekya_style_cloud_scheduling.edge_streaming.jpeg_quality is removed")
+        raise ValueError("Ekya.edge_streaming.jpeg_quality is removed")
     return EdgeStreamingConfig(
         upload_queue_size=int(_get(value, "upload_queue_size", 8)),
     )
@@ -434,7 +434,7 @@ def _teacher_labeling_config(value: object, *, server: object) -> TeacherLabelin
                     _get(value, "batch_size", None),
                     _get(continual_learning, "teacher_batch_size", None),
                 ),
-                "ekya_style_cloud_scheduling.teacher_labeling.batch_size",
+                "Ekya.teacher_labeling.batch_size",
             )
         ),
         score_threshold=float(
@@ -443,7 +443,7 @@ def _teacher_labeling_config(value: object, *, server: object) -> TeacherLabelin
                     _get(value, "score_threshold", None),
                     _get(continual_learning, "teacher_annotation_threshold", None),
                 ),
-                "ekya_style_cloud_scheduling.teacher_labeling.score_threshold",
+                "Ekya.teacher_labeling.score_threshold",
             )
         ),
     )
@@ -486,7 +486,7 @@ def _dataset_config(value: object, *, server: object, baseline: object | None) -
 
 
 def _evaluation_config(value: object, *, baseline: object | None) -> EvaluationConfig:
-    accuracy_cfg = _get(baseline, "accuracy_trigger_cloud_retraining", None)
+    accuracy_cfg = _get(baseline, "CATR", None)
     return EvaluationConfig(
         score_threshold=float(
             _configured_value(
@@ -514,9 +514,9 @@ def _scheduler_config(value: object) -> SchedulerConfig:
         if _has_config_value(value, name)
     ]
     if removed:
-        names = ", ".join(f"ekya_style_cloud_scheduling.scheduler.{name}" for name in removed)
+        names = ", ".join(f"Ekya.scheduler.{name}" for name in removed)
         raise ValueError(
-            f"Ekya-style cloud scheduling no longer supports these config fields: {names}. "
+            f"Ekya cloud scheduling no longer supports these config fields: {names}. "
             "Training admission is controlled by microprofile score and global top-k."
         )
     return SchedulerConfig(
@@ -539,7 +539,7 @@ def _retraining_config(
 ) -> RetrainingConfig:
     continual_learning = _get(server, "continual_learning", None)
     baseline_training = _get(baseline, "training", None)
-    accuracy_cfg = _get(baseline, "accuracy_trigger_cloud_retraining", None)
+    accuracy_cfg = _get(baseline, "CATR", None)
     train_mode = (
         str(
             _configured_value(

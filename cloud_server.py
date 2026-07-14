@@ -51,12 +51,10 @@ from tools.grpc_options import grpc_message_options
 
 __all__ = ["CloudServer"]
 
-EKYA_STYLE_METHOD = "ekya_style_cloud_scheduling"
-
 
 def _experiment_method_for(method: str) -> str:
     normalized = str(method or "").strip()
-    if normalized == EKYA_STYLE_METHOD:
+    if normalized == EKYA_METHOD:
         return EKYA_METHOD
     return normalized or PLANK_ROAD_METHOD
 
@@ -170,8 +168,8 @@ class CloudServer:
                 runtime_config=runtime_config,
             )
             resolved_run_id = self.experiment_identity.run_id
-            if method == EKYA_STYLE_METHOD:
-                from cloud.baselines.ekya_style_cloud_scheduling import (
+            if method == EKYA_METHOD:
+                from cloud.baselines.Ekya import (
                     EkyaStyleCloudSchedulingController,
                     parse_ekya_style_config,
                 )
@@ -205,7 +203,7 @@ class CloudServer:
                 return
             teacher_annotator = None
             heavy_gpu_lease = None
-            if method != "pure_edge_local_updating":
+            if method != "SURGEON":
                 edge_affine = getattr(config, "edge_affine_workers", None)
                 if edge_affine is None or not bool(getattr(edge_affine, "enabled", False)):
                     raise ValueError(
@@ -694,7 +692,11 @@ if __name__ == "__main__":
         help="override server.grpc_max_workers",
     )
     parser.add_argument("--mode", choices=("main", "baseline"), default="main")
-    parser.add_argument("--baseline_method", default=None, help="baseline method for baseline mode")
+    parser.add_argument(
+        "--baseline_method",
+        default=None,
+        help="baseline method for baseline mode: SURGEON, CATR, or Ekya",
+    )
     parser.add_argument("--experiment_id", default=None, help="experiment id")
     parser.add_argument("--scenario", default=None, help="experiment scenario slug/name")
     parser.add_argument("--edge_count", type=int, default=None, help="number of edge devices")

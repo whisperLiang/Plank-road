@@ -288,7 +288,7 @@ class SurgeonLocalTTAUpdater:
         self.config = config
         self.metrics = metrics_writer
         baseline_cfg = getattr(config, "baseline", None)
-        self.method_cfg = getattr(baseline_cfg, "pure_edge_local_updating", None)
+        self.method_cfg = getattr(baseline_cfg, "SURGEON", None)
         self.training_cfg = getattr(baseline_cfg, "training", None)
         quality_cfg = getattr(config, "sample_quality", None)
         drift_cfg = getattr(config, "window_drift", None)
@@ -394,7 +394,7 @@ class SurgeonLocalTTAUpdater:
     def attach_edge(self, edge) -> None:
         self._edge = edge
         logger.info(
-            "[PureEdgeSURGEON] attached training_frame_count={} "
+            "[SURGEON] attached training_frame_count={} "
             "train_sample_count={} num_epoch={} batch_size={} quality_mode={}",
             self.training_frame_count,
             self.train_sample_count,
@@ -446,7 +446,7 @@ class SurgeonLocalTTAUpdater:
                 return
             selected = list(self._buffer)[-int(self.train_sample_count) :]
             logger.info(
-                "[PureEdgeSURGEON] local TTA triggered: low_quality={} "
+                "[SURGEON] local TTA triggered: low_quality={} "
                 "training_frame_count={} train_sample_count={} "
                 "mini_batch_size={} trigger_frame={}",
                 len(self._buffer),
@@ -586,7 +586,7 @@ class SurgeonLocalTTAUpdater:
             update = self._execute_tta(samples, trigger_frame_id, started)
         except _TTASkip as exc:
             logger.info(
-                "[PureEdgeSURGEON][Train] skipped reason={} low_quality_sample_count={}",
+                "[SURGEON][Train] skipped reason={} low_quality_sample_count={}",
                 exc.reason,
                 len(samples),
             )
@@ -597,7 +597,7 @@ class SurgeonLocalTTAUpdater:
                 low_quality_sample_count=len(samples),
             )
         except Exception as exc:  # noqa: BLE001 - metrics must capture runtime failures.
-            logger.warning("[PureEdgeSURGEON] local TTA failed: {}", exc)
+            logger.warning("[SURGEON] local TTA failed: {}", exc)
             self.metrics.record(
                 "surgeon_tta_failed",
                 frame_id=int(trigger_frame_id),
@@ -612,7 +612,7 @@ class SurgeonLocalTTAUpdater:
                     queued = True
             if queued:
                 logger.info(
-                    "[PureEdgeSURGEON] shadow training done: final_loss={:.6f} "
+                    "[SURGEON] shadow training done: final_loss={:.6f} "
                     "pending_apply=true",
                     float(update.loss),
                 )
@@ -745,7 +745,7 @@ class SurgeonLocalTTAUpdater:
 
         duration_ms = (time.perf_counter() - update.started_perf) * 1000.0
         logger.info(
-            "[PureEdgeSURGEON] local update applied: model_version={} -> {} "
+            "[SURGEON] local update applied: model_version={} -> {} "
             "apply_lock_ms={:.3f}",
             update.model_version_before,
             model_version_after,
@@ -904,7 +904,7 @@ class SurgeonLocalTTAUpdater:
             model_version_before=str(model_version_before),
         )
         logger.info(
-            "[PureEdgeSURGEON] shadow training started: samples={} "
+            "[SURGEON] shadow training started: samples={} "
             "mini_batch_size={} epochs={}",
             int(total_sample_count),
             int(mini_batch_size),
@@ -978,7 +978,7 @@ class SurgeonLocalTTAUpdater:
                 epoch_ms = (time.perf_counter() - epoch_started) * 1000.0
                 losses.append(loss_value)
                 logger.info(
-                    "[PureEdgeSURGEON][Train] epoch={}/{} loss={:.6f} "
+                    "[SURGEON][Train] epoch={}/{} loss={:.6f} "
                     "entropy_loss={:.6f} consistency_loss={:.6f} samples={} "
                     "mini_batch_size={} selected_logits={}/{} model_version={} "
                     "epoch_ms={:.3f}",

@@ -9,43 +9,43 @@ from typing import Any
 from loguru import logger
 
 from cloud.baselines.detection_agreement import teacher_f1
-from cloud.baselines.ekya_style_cloud_scheduling.cloud_frame_receiver import (
+from cloud.baselines.Ekya.cloud_frame_receiver import (
     CloudFrameReceiver,
 )
-from cloud.baselines.ekya_style_cloud_scheduling.cloud_inference import (
+from cloud.baselines.Ekya.cloud_inference import (
     CloudInferenceEngine,
 )
-from cloud.baselines.ekya_style_cloud_scheduling.config import (
+from cloud.baselines.Ekya.config import (
     EkyaStyleCloudSchedulingConfig,
 )
-from cloud.baselines.ekya_style_cloud_scheduling.frame_buffer import (
+from cloud.baselines.Ekya.frame_buffer import (
     CloudFrameBuffer,
     CompletedFrameWindow,
     stable_window_id,
 )
-from cloud.baselines.ekya_style_cloud_scheduling.microprofiler import (
+from cloud.baselines.Ekya.microprofiler import (
     DetectionMicroProfiler,
 )
-from cloud.baselines.ekya_style_cloud_scheduling.protocol import (
+from cloud.baselines.Ekya.protocol import (
     DetectionResultPacket,
     DisplayEventPacket,
     FrameUploadPacket,
 )
-from cloud.baselines.ekya_style_cloud_scheduling.scheduler import (
+from cloud.baselines.Ekya.scheduler import (
     EkyaThiefStyleScheduler,
     MicroProfileResult,
     SchedulerDecision,
 )
-from cloud.baselines.ekya_style_cloud_scheduling.teacher_labeler import TeacherLabeler
-from cloud.baselines.ekya_style_cloud_scheduling.trainer import (
+from cloud.baselines.Ekya.teacher_labeler import TeacherLabeler
+from cloud.baselines.Ekya.trainer import (
     EkyaCloudTrainer,
     TrainingResult,
 )
-from cloud.baselines.ekya_style_cloud_scheduling.unified_logger import (
+from cloud.baselines.Ekya.unified_logger import (
     EkyaUnifiedLogger,
 )
 
-METHOD = "ekya_style_cloud_scheduling"
+METHOD = "Ekya"
 
 
 @dataclass(frozen=True)
@@ -149,7 +149,7 @@ class EkyaStyleCloudSchedulingController:
         self._model_version_by_edge: dict[tuple[int, int], int] = {}
         self._total_teacher_labeling_time_s = 0.0
         logger.info(
-            "ekya_style_cloud_scheduling startup: run_id={} student={} teacher={} "
+            "Ekya startup: run_id={} student={} teacher={} "
             "video={} output_dir={}",
             config.run_id,
             config.student_model,
@@ -262,7 +262,7 @@ class EkyaStyleCloudSchedulingController:
             )
         except Exception as exc:
             logger.warning(
-                "ekya_style_cloud_scheduling window pipeline failed: window={} error={}",
+                "Ekya window pipeline failed: window={} error={}",
                 window.window_id,
                 exc,
             )
@@ -287,7 +287,7 @@ class EkyaStyleCloudSchedulingController:
                 )
                 return
             logger.info(
-                "ekya_style_cloud_scheduling window start: task_id={} frames={}..{}",
+                "Ekya window start: task_id={} frames={}..{}",
                 window.task_id,
                 window.start_frame,
                 window.end_frame,
@@ -529,7 +529,7 @@ class EkyaStyleCloudSchedulingController:
             adopted = self._maybe_adopt(training_result)
         except Exception as exc:
             logger.warning(
-                "ekya_style_cloud_scheduling training failed: window={} error={}",
+                "Ekya training failed: window={} error={}",
                 candidate.window_id,
                 exc,
             )
@@ -652,7 +652,7 @@ class EkyaStyleCloudSchedulingController:
         reason: str,
     ) -> None:
         logger.info(
-            "ekya_style_cloud_scheduling training check skipped: task_id={} "
+            "Ekya training check skipped: task_id={} "
             "window={} reason={}",
             int(window.task_id),
             window.window_id,

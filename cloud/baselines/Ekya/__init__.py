@@ -1,25 +1,25 @@
 from __future__ import annotations
 
-from cloud.baselines.ekya_style_cloud_scheduling.config import (
+from cloud.baselines.Ekya.config import (
     EkyaStyleCloudSchedulingConfig,
     FixedTrainingConfig,
     parse_ekya_style_config,
 )
-from cloud.baselines.ekya_style_cloud_scheduling.controller import (
+from cloud.baselines.Ekya.controller import (
     EkyaStyleCloudSchedulingController,
 )
-from cloud.baselines.ekya_style_cloud_scheduling.protocol import (
+from cloud.baselines.Ekya.protocol import (
     DetectionResultPacket,
     DisplayEventPacket,
     FrameUploadPacket,
 )
-from cloud.baselines.ekya_style_cloud_scheduling.scheduler import (
+from cloud.baselines.Ekya.scheduler import (
     EkyaThiefStyleScheduler,
     MicroProfileResult,
     SchedulerDecision,
 )
 
-METHOD = "ekya_style_cloud_scheduling"
+METHOD = "Ekya"
 
 __all__ = [
     "METHOD",

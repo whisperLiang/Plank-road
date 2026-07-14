@@ -16,17 +16,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from tools.convert_ekya_style_results_to_plot_schema import (  # noqa: E402
+from tools.convert_Ekya_results_to_plot_schema import (  # noqa: E402
     RAW_METHOD as EKYA_RAW_METHOD,
 )
-from tools.convert_ekya_style_results_to_plot_schema import (
+from tools.convert_Ekya_results_to_plot_schema import (
     build_ekya_style_row_sets,
 )
 from tools.experiments.experiment_common import (  # noqa: E402
     ACCURACY_FIELDS,
     ADAPTATION_FIELDS,
     CSV_SCHEMAS,
-    EKYA_CANONICAL_METHOD,
+    EKYA_METHOD,
     FRAME_FIELDS,
     LATENCY_FIELDS,
     RESOURCE_FIELDS,
@@ -246,7 +246,7 @@ def _parse_baseline_metric(
     ):
         components = [raw_bytes, feature_bytes, metadata_bytes]
         total = optional_int(payload.get("total_upload_bytes"))
-        if str(run.get("method", "")) == "accuracy_trigger_cloud_retraining":
+        if str(run.get("method", "")) == "CATR":
             total = raw_bytes
         if total is None and all(value is not None for value in components):
             total = sum(value or 0 for value in components)
@@ -1147,7 +1147,7 @@ def _window_group_key(row: Mapping[str, Any]) -> tuple[str, str, str]:
 def _is_orphan_accuracy_decision(row: Mapping[str, Any]) -> bool:
     return (
         str(row.get("window_id", "") or "") == ""
-        and str(row.get("method", "")) == "accuracy_trigger_cloud_retraining"
+        and str(row.get("method", "")) == "CATR"
         and row.get("window_accuracy") not in (None, "")
     )
 
@@ -1155,7 +1155,7 @@ def _is_orphan_accuracy_decision(row: Mapping[str, Any]) -> bool:
 def _is_accuracy_uploaded_window(row: Mapping[str, Any]) -> bool:
     return (
         str(row.get("window_id", "") or "") != ""
-        and str(row.get("method", "")) == "accuracy_trigger_cloud_retraining"
+        and str(row.get("method", "")) == "CATR"
     )
 
 
@@ -1291,13 +1291,13 @@ def _anchor_accuracy_trigger_decisions(
             str(row.get("window_id", "") or ""),
         ): row
         for row in windows
-        if str(row.get("method", "")) == "accuracy_trigger_cloud_retraining"
+        if str(row.get("method", "")) == "CATR"
         and str(row.get("window_id", "") or "")
     }
     window_upload_times: dict[tuple[str, str, str], int] = {}
     for row in events:
         if (
-            str(row.get("method", "")) != "accuracy_trigger_cloud_retraining"
+            str(row.get("method", "")) != "CATR"
             or str(row.get("event_name", "")) != "window_uploaded"
         ):
             continue
@@ -1315,7 +1315,7 @@ def _anchor_accuracy_trigger_decisions(
 
     for row in events:
         if (
-            str(row.get("method", "")) != "accuracy_trigger_cloud_retraining"
+            str(row.get("method", "")) != "CATR"
             or str(row.get("event_name", "")) != "trigger_decision"
             or str(row.get("message", "")) != "accuracy_trigger_decision"
         ):
@@ -1467,7 +1467,7 @@ def _derive_adaptation_latency(
     derived: list[dict[str, Any]] = []
     derived_total_runs: set[str] = set()
     for (run_id, method, edge_id), group in groups.items():
-        if str(method).strip() == EKYA_CANONICAL_METHOD:
+        if str(method).strip() == EKYA_METHOD:
             continue
         group.sort(key=lambda row: optional_int(row.get("event_time_ms")) or 0)
         job_window_ids = _job_window_ids_from_triggers(group)
@@ -1709,7 +1709,7 @@ def normalize(comparison_dir: Path, manifest_path: Path | None = None) -> dict[s
     for run in list(manifest["runs"]):
         scenario = scenarios[str(run["scenario_slug"])]
         raw_logs = dict(run["raw_logs"])
-        if str(run["method"]).strip() == EKYA_CANONICAL_METHOD:
+        if str(run["method"]).strip() == EKYA_METHOD:
             source_path = resolve_relative(comparison_dir, raw_logs.get("cloud"))
             if source_path is None or not source_path.exists():
                 if source_path is not None:
@@ -1724,7 +1724,7 @@ def normalize(comparison_dir: Path, manifest_path: Path | None = None) -> dict[s
                 comparison_id=str(manifest["comparison_id"]),
                 scenario_name=str(run["scenario_name"]),
                 video_slug=str(scenario.get("video_slug", "")),
-                plot_method=EKYA_CANONICAL_METHOD,
+                plot_method=EKYA_METHOD,
             )
             _apply_manifest_run_identity(
                 row_sets,
@@ -1739,7 +1739,7 @@ def normalize(comparison_dir: Path, manifest_path: Path | None = None) -> dict[s
             resources.extend(row_sets["resource_timeline.csv"])
             parsed_files.extend(str(path) for path in discover_files(ekya_raw_dir))
             notes.append(
-                f"{run['run_id']}: parsed Ekya-style raw logs from {ekya_raw_dir} "
+                f"{run['run_id']}: parsed Ekya raw logs from {ekya_raw_dir} "
                 f"({ekya_report['evaluated_frame_count']} frame rows)."
             )
             continue
@@ -1847,7 +1847,7 @@ def normalize(comparison_dir: Path, manifest_path: Path | None = None) -> dict[s
                             ) or recognized
                     if recognized:
                         parsed_files.append(str(path))
-        if run["method"] == "pure_edge_local_updating":
+        if run["method"] == "SURGEON":
             structural_zero_runs.append(str(run["run_id"]))
             notes.append(
                 f"{run['run_id']}: cloud upload fields are structural zero by method contract."

@@ -10,10 +10,10 @@ Preflight HEAD recorded before this refactor:
 
 The baseline comparison uses four methods:
 
-1. `plank_road` -> Ours
-2. `pure_edge_local_updating` -> Pure Edge
-3. `accuracy_trigger_cloud_retraining` -> Accuracy-Trigger
-4. `ekya_style_cloud_scheduling` -> Ekya-style
+1. `plank_road` (Ours)
+2. `SURGEON`
+3. `CATR`
+4. `Ekya`
 
 Production inference, training, protocol fields, scheduling, model updates,
 sample pools, caches, online RPC behavior, and baseline runtime behavior are
@@ -29,7 +29,7 @@ Final paper figures require:
 ```text
 Rainy / Snowy Suwon #5a videos
 x
-Ours / Pure Edge / Accuracy-Trigger / Ekya-style
+Ours / SURGEON / CATR / Ekya
 x
 3 to 5 repeated runs
 ```
@@ -133,7 +133,7 @@ accuracy values are not invented.
 - Missing values remain empty.
 - No synthetic data, interpolation, random data, or placeholder curves are
   generated.
-- Pure Edge cloud upload, cloud label, and model-download components are
+- SURGEON cloud upload, cloud label, and model-download components are
   structural noncomponents and are not plotted.
 - Final paper figures require all four methods for every scenario.
 
@@ -142,5 +142,5 @@ accuracy values are not invented.
 The archive RPC remains separate from Plank-road sample bundles and baseline
 frame/window RPCs. It runs only during shutdown, never populates the sample
 pool, never invokes the teacher or training pipeline, and is excluded from
-normalized method communication costs. Pure Edge may archive JSON/JSONL result
+normalized method communication costs. SURGEON may archive JSON/JSONL result
 files without ceasing to be a pure-edge method.

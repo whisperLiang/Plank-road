@@ -6,7 +6,7 @@ import time
 from dataclasses import asdict, dataclass, fields
 from typing import Any
 
-METHOD = "ekya_style_cloud_scheduling"
+METHOD = "Ekya"
 
 
 @dataclass(slots=True)

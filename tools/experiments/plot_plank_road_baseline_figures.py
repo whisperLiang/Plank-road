@@ -56,15 +56,15 @@ DEFAULT_VIDEO_PATHS = {
 FRAME_BIN_SIZE = 50
 METHOD_COLORS = {
     "plank_road": "#0F4D92",
-    "pure_edge_local_updating": "#767676",
-    "accuracy_trigger_cloud_retraining": "#B64342",
-    "ekya_style_cloud_scheduling": "#42949E",
+    "SURGEON": "#767676",
+    "CATR": "#B64342",
+    "Ekya": "#42949E",
 }
 METHOD_MARKERS = {
     "plank_road": "D",
-    "pure_edge_local_updating": "o",
-    "accuracy_trigger_cloud_retraining": "s",
-    "ekya_style_cloud_scheduling": "^",
+    "SURGEON": "o",
+    "CATR": "s",
+    "Ekya": "^",
 }
 COMPONENT_COLORS = {
     "transmit": "#7EA7C8",
@@ -77,9 +77,9 @@ COMPONENT_COLORS = {
 }
 FIG3_METHOD_TICK_LABELS = {
     "plank_road": "Ours",
-    "pure_edge_local_updating": "Pure Edge",
-    "accuracy_trigger_cloud_retraining": "Acc.-Trig.",
-    "ekya_style_cloud_scheduling": "Ekya",
+    "SURGEON": "SURGEON",
+    "CATR": "CATR",
+    "Ekya": "Ekya",
 }
 FIG3_COMPONENT_LEGEND_LABELS = {
     "transmit": "Upload / transmit",
@@ -830,24 +830,24 @@ def _component_specs(method: str) -> list[tuple[str, str, str, tuple[str, ...]]]
             ("retrain", "Ours-Retrain", "retrain", ("feature_rebuild_ms", "training_ms")),
             ("update", "Ours-Update", "update", ("model_update_download_ms", "model_apply_ms")),
         ]
-    if method == "pure_edge_local_updating":
+    if method == "SURGEON":
         return [
-            ("retrain", "PureEdge-Retrain", "retrain", ("training_ms",)),
-            ("apply", "PureEdge-Apply", "apply", ("model_apply_ms",)),
+            ("retrain", "SURGEON-Retrain", "retrain", ("training_ms",)),
+            ("apply", "SURGEON-Apply", "apply", ("model_apply_ms",)),
         ]
-    if method == "accuracy_trigger_cloud_retraining":
+    if method == "CATR":
         return [
-            ("upload", "AccuracyTrigger-Upload", "upload", ("upload_ms",)),
-            ("label", "AccuracyTrigger-Label", "label", ("teacher_annotation_ms",)),
-            ("retrain", "AccuracyTrigger-Retrain", "retrain", ("training_ms",)),
+            ("upload", "CATR-Upload", "upload", ("upload_ms",)),
+            ("label", "CATR-Label", "label", ("teacher_annotation_ms",)),
+            ("retrain", "CATR-Retrain", "retrain", ("training_ms",)),
             (
                 "update",
-                "AccuracyTrigger-Update",
+                "CATR-Update",
                 "update",
                 ("model_update_download_ms", "model_apply_ms"),
             ),
         ]
-    if method == "ekya_style_cloud_scheduling":
+    if method == "Ekya":
         return [
             ("upload", "Ekya-Upload", "upload", ("upload_ms",)),
             ("profile", "Ekya-Profile", "profile", ("microprofile_ms",)),
@@ -1303,7 +1303,7 @@ def plot_figures(
             "No interpolation, random data, synthetic data, or placeholder curves are generated.",
             "Missing values remain empty; missing components are omitted and reported "
             "as partial data.",
-            "Pure Edge cloud-upload components are structural noncomponents and are not plotted.",
+            "SURGEON cloud-upload components are structural noncomponents and are not plotted.",
         ],
     }
     (figure_dir / "plot_report.json").write_text(

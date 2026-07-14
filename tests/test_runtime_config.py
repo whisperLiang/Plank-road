@@ -13,6 +13,44 @@ def test_default_config_loads_for_main_runtime() -> None:
 
 
 @pytest.mark.parametrize(
+    ("env_name", "attribute_path", "expected"),
+    [
+        (
+            "PLANK_ROAD__BASELINE__SURGEON__TRAIN_SAMPLE_COUNT",
+            "baseline.SURGEON.train_sample_count",
+            3,
+        ),
+        (
+            "PLANK_ROAD__BASELINE__CATR__TRIGGER_WINDOW_SIZE",
+            "baseline.CATR.trigger_window_size",
+            7,
+        ),
+        (
+            "PLANK_ROAD__SERVER__BASELINES__EKYA__WINDOW_SIZE",
+            "server.baselines.Ekya.window_size",
+            9,
+        ),
+    ],
+)
+def test_env_overrides_preserve_canonical_baseline_section_names(
+    tmp_path,
+    monkeypatch,
+    env_name: str,
+    attribute_path: str,
+    expected: int,
+) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text("", encoding="utf-8")
+    monkeypatch.setenv(env_name, str(expected))
+
+    value = load_runtime_config(path)
+    for attribute in attribute_path.split("."):
+        value = getattr(value, attribute)
+
+    assert value == expected
+
+
+@pytest.mark.parametrize(
     ("field", "replacement"),
     [
         ("suffix_num_threads", "inference_num_threads"),
@@ -125,7 +163,7 @@ def test_pure_edge_training_frame_count_override_does_not_change_shared_baseline
 baseline:
   training:
     training_frame_count: 128
-  pure_edge_local_updating:
+  SURGEON:
     training_frame_count: 32
 """,
         encoding="utf-8",
@@ -134,7 +172,7 @@ baseline:
     config = load_runtime_config(path)
 
     assert config.baseline.training.training_frame_count == 128
-    assert config.baseline.pure_edge_local_updating.training_frame_count == 32
+    assert config.baseline.SURGEON.training_frame_count == 32
 
 
 def test_pure_edge_train_sample_count_does_not_change_shared_baseline(
@@ -146,7 +184,7 @@ def test_pure_edge_train_sample_count_does_not_change_shared_baseline(
 baseline:
   training:
     training_frame_count: 128
-  pure_edge_local_updating:
+  SURGEON:
     train_sample_count: 32
 """,
         encoding="utf-8",
@@ -155,7 +193,7 @@ baseline:
     config = load_runtime_config(path)
 
     assert config.baseline.training.training_frame_count == 128
-    assert config.baseline.pure_edge_local_updating.train_sample_count == 32
+    assert config.baseline.SURGEON.train_sample_count == 32
 
 
 def test_pure_edge_training_frame_count_override_requires_positive_value(
@@ -165,7 +203,7 @@ def test_pure_edge_training_frame_count_override_requires_positive_value(
     path.write_text(
         """
 baseline:
-  pure_edge_local_updating:
+  SURGEON:
     training_frame_count: 0
 """,
         encoding="utf-8",
@@ -173,7 +211,7 @@ baseline:
 
     with pytest.raises(
         ValueError,
-        match="baseline.pure_edge_local_updating.training_frame_count",
+        match="baseline.SURGEON.training_frame_count",
     ):
         load_runtime_config(path)
 
@@ -181,7 +219,7 @@ baseline:
 @pytest.mark.parametrize(
     ("yaml_value", "message"),
     [
-        ("0", "baseline.pure_edge_local_updating.train_sample_count"),
+        ("0", "baseline.SURGEON.train_sample_count"),
         ("129", "train_sample_count must be <="),
     ],
 )
@@ -196,7 +234,7 @@ def test_pure_edge_train_sample_count_is_validated(
 baseline:
   training:
     training_frame_count: 128
-  pure_edge_local_updating:
+  SURGEON:
     train_sample_count: {yaml_value}
 """,
         encoding="utf-8",
@@ -282,7 +320,7 @@ def test_removed_ekya_fixed_behavior_fields_are_rejected(tmp_path, ekya_yaml: st
         f"""
 server:
   baselines:
-    ekya_style_cloud_scheduling:
+    Ekya:
       {ekya_yaml}
 """,
         encoding="utf-8",

@@ -52,7 +52,7 @@ def test_uploader_sends_one_artifact_per_rpc_and_marks_final(monkeypatch) -> Non
     assert uploader.upload_run_artifacts(
         **IDENTITY,
         run_id="pure-r1",
-        method="pure_edge_local_updating",
+        method="SURGEON",
         edge_id=1,
         artifacts={
             "latest_inference_results.jsonl": b"{}\n",

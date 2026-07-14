@@ -21,7 +21,7 @@ from baselines.runtime.upload_client import encode_frame_for_raw_upload
 from common.experiment_results import (
     EKYA_METHOD,
     PLANK_ROAD_METHOD,
-    PURE_EDGE_METHOD,
+    SURGEON_METHOD,
     ExperimentIdentity,
     ExperimentJsonlWriter,
     collect_edge_artifacts,
@@ -47,8 +47,6 @@ from model_management.utils import draw_detection
 from tools.file_op import clear_folder
 from tools.grpc_options import grpc_message_options
 from tools.video_processor import VideoProcessor
-
-EKYA_STYLE_METHOD = "ekya_style_cloud_scheduling"
 
 
 def _task_state_name(task: Task) -> str:
@@ -294,11 +292,11 @@ def _split_learning_status(config) -> str:
 
 
 def _baseline_requires_cloud(baseline_method: str) -> bool:
-    return validate_baseline_method(baseline_method) != PURE_EDGE_METHOD
+    return validate_baseline_method(baseline_method) != SURGEON_METHOD
 
 
 def _experiment_method_for_runtime(method: str | None) -> str:
-    return EKYA_METHOD if str(method or "") == EKYA_STYLE_METHOD else str(method or "")
+    return EKYA_METHOD if str(method or "") == EKYA_METHOD else str(method or "")
 
 
 def _create_experiment_identity(
@@ -781,7 +779,7 @@ def _write_edge_summary(
             getattr(config, "experiment_teacher_model", "") or ""
         ),
         "sampled_frame_count": int(sampled_frame_count),
-        "offline_result_archival": method == "pure_edge_local_updating",
+        "offline_result_archival": method == "SURGEON",
         "archive_upload_excluded_from_communication_cost": True,
         "completed_at_ms": int(time.time() * 1000),
         "replay_snapshot_failures": {
@@ -847,8 +845,8 @@ def _run_ekya_style_edge_stream(
     headless: bool,
     output_dir: Path | None = None,
 ) -> Path:
-    from cloud.baselines.ekya_style_cloud_scheduling.config import parse_ekya_style_config
-    from cloud.baselines.ekya_style_cloud_scheduling.unified_logger import DISPLAY_FIELDS
+    from cloud.baselines.Ekya.config import parse_ekya_style_config
+    from cloud.baselines.Ekya.unified_logger import DISPLAY_FIELDS
 
     ekya_config = parse_ekya_style_config(
         runtime_config,
@@ -856,7 +854,7 @@ def _run_ekya_style_edge_stream(
         video_path=_effective_video_source(config),
     )
     edge_output_dir = Path(output_dir) if output_dir is not None else (
-        Path("results") / "edge" / baseline_run_id / "baselines" / EKYA_STYLE_METHOD
+        Path("results") / "edge" / baseline_run_id / "baselines" / EKYA_METHOD
     )
     edge_output_dir.mkdir(parents=True, exist_ok=True)
     display_events_path = edge_output_dir / "display_events.csv"
@@ -904,7 +902,7 @@ def _run_ekya_style_edge_stream(
                     timestamp_send = time.time()
                     task_id = (frame_idx - 1) // max(1, int(ekya_config.window_size))
                     upload = message_transmission_pb2.EkyaFrameUpload(
-                        method=EKYA_STYLE_METHOD,
+                        method=EKYA_METHOD,
                         run_id=baseline_run_id,
                         edge_id=int(config.edge_id),
                         camera_id=0,
@@ -943,11 +941,11 @@ def _run_ekya_style_edge_stream(
                         cv2.imshow(window_name, display_frame)
                         key = cv2.waitKey(display_delay_ms) & 0xFF
                         if key in (27, ord("q")):
-                            logger.info("Ekya-style cloud display stopped by user.")
+                            logger.info("Ekya cloud display stopped by user.")
                             break
                     timestamp_display = time.time()
                     display_event = message_transmission_pb2.EkyaDisplayEvent(
-                        method=EKYA_STYLE_METHOD,
+                        method=EKYA_METHOD,
                         run_id=baseline_run_id,
                         edge_id=int(config.edge_id),
                         camera_id=0,
@@ -968,7 +966,7 @@ def _run_ekya_style_edge_stream(
                     result_file.write(
                         json.dumps(
                             {
-                                "method": EKYA_STYLE_METHOD,
+                                "method": EKYA_METHOD,
                                 "run_id": baseline_run_id,
                                 "edge_id": int(config.edge_id),
                                 "frame_index": int(frame_idx),
@@ -1039,7 +1037,7 @@ def _close_ekya_frame_stream(
         request_queue.put(None, timeout=5.0)
         _wait_ekya_stream_close_ack(responses)
     except Exception as exc:
-        logger.warning("Ekya-style stream close handshake failed: {}", exc)
+        logger.warning("Ekya stream close handshake failed: {}", exc)
     finally:
         channel.close()
 
@@ -1055,7 +1053,7 @@ def _wait_ekya_stream_close_ack(responses) -> None:
             raise RuntimeError(message.ack.message)
         if str(message.ack.message) == "stream closed":
             return
-    raise RuntimeError("Ekya-style stream ended before close ack")
+    raise RuntimeError("Ekya stream ended before close ack")
 
 
 def _ekya_result_lists(result) -> tuple[list[list[float]], list[int], list[float], list[str]]:
@@ -1092,7 +1090,7 @@ def _count_csv_records(path: Path) -> int:
 
 def _append_display_event_row(path: Path, fields: list[str], event) -> None:
     row = {
-        "method": EKYA_STYLE_METHOD,
+        "method": EKYA_METHOD,
         "run_id": event.run_id,
         "edge_id": int(event.edge_id),
         "camera_id": int(event.camera_id),
@@ -1167,7 +1165,11 @@ if __name__ == "__main__":
         help="run without OpenCV display windows",
     )
     parser.add_argument("--mode", choices=("main", "baseline"), default="main")
-    parser.add_argument("--baseline_method", default=None, help="baseline method for baseline mode")
+    parser.add_argument(
+        "--baseline_method",
+        default=None,
+        help="baseline method for baseline mode: SURGEON, CATR, or Ekya",
+    )
     parser.add_argument("--experiment_id", default=None, help="experiment id")
     parser.add_argument("--scenario", default=None, help="experiment scenario slug/name")
     parser.add_argument("--edge_count", type=int, default=None, help="number of edge devices")
@@ -1178,7 +1180,13 @@ if __name__ == "__main__":
         help="override edge local experiment result staging root",
     )
     args = parser.parse_args()
-    if args.baseline_method == EKYA_STYLE_METHOD and args.mode != "baseline":
+    requested_baseline_method = None
+    if args.baseline_method is not None:
+        try:
+            requested_baseline_method = validate_baseline_method(args.baseline_method)
+        except ValueError as exc:
+            parser.error(str(exc))
+    if requested_baseline_method == EKYA_METHOD and args.mode != "baseline":
         args.mode = "baseline"
 
     runtime_config = load_runtime_config(args.yaml_path)
@@ -1208,7 +1216,7 @@ if __name__ == "__main__":
 
     baseline_method = None
     if args.mode == "baseline":
-        baseline_method = args.baseline_method or runtime_config.baseline.method
+        baseline_method = requested_baseline_method or runtime_config.baseline.method
         try:
             baseline_method = validate_baseline_method(baseline_method)
         except ValueError as exc:
@@ -1262,7 +1270,7 @@ if __name__ == "__main__":
             level="INFO",
             rotation="500 MB",
         )
-        if baseline_method == EKYA_STYLE_METHOD:
+        if baseline_method == EKYA_METHOD:
             config.baseline = runtime_config.baseline
             if getattr(config, "retrain", None) is not None:
                 config.retrain.flag = False
@@ -1310,7 +1318,7 @@ if __name__ == "__main__":
     if clear_retrain_cache:
         clear_folder(config.retrain.cache_path, preserve=preserve_cache_entries)
 
-    if args.mode == "baseline" and baseline_method == EKYA_STYLE_METHOD:
+    if args.mode == "baseline" and baseline_method == EKYA_METHOD:
         run_dir = None
         experiment_log_sink = None
         try:

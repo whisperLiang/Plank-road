@@ -4,7 +4,7 @@ from queue import Full, Queue
 
 from loguru import logger
 
-from cloud.baselines.ekya_style_cloud_scheduling.protocol import DetectionResultPacket
+from cloud.baselines.Ekya.protocol import DetectionResultPacket
 
 
 class ResultReturner:

@@ -32,7 +32,7 @@ service MessageTransmission {
   rpc RequestCloudInference (BaselineInferenceRequest) returns (BaselineInferenceReply) {}
   rpc PollCommand (BaselineCommandRequest) returns (BaselineCommandReply) {}
   rpc DownloadInferenceResult (BaselineInferenceRequest) returns (BaselineInferenceReply) {}
-  // Ekya-style cloud scheduling: edge streams JPEG frames and receives
+  // Ekya cloud scheduling: edge streams JPEG frames and receives
   // cloud inference results in the same online stream.
   rpc EkyaFrameStream (stream EkyaClientMessage)
       returns (stream EkyaServerMessage) {}

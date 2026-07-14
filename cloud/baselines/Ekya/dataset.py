@@ -7,7 +7,7 @@ from typing import Any
 
 from loguru import logger
 
-from cloud.baselines.ekya_style_cloud_scheduling.frame_buffer import CompletedFrameWindow
+from cloud.baselines.Ekya.frame_buffer import CompletedFrameWindow
 from cloud.training.parameter_freeze import RawFrameTrainingSample
 
 
@@ -35,7 +35,7 @@ def window_to_samples(
         )
     if skipped_missing_frame or skipped_missing_label:
         logger.info(
-            "ekya_style_cloud_scheduling dataset skipped samples: window={} "
+            "Ekya dataset skipped samples: window={} "
             "missing_frame={} missing_teacher_label={}",
             window.window_id,
             skipped_missing_frame,

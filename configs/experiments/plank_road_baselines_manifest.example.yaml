@@ -3,9 +3,9 @@ log_timezone: Asia/Shanghai
 
 methods:
   - plank_road
-  - pure_edge_local_updating
-  - accuracy_trigger_cloud_retraining
-  - ekya_style_cloud_scheduling
+  - SURGEON
+  - CATR
+  - Ekya
 
 student_model: rfdetr_nano
 teacher_model: rtdetr_x

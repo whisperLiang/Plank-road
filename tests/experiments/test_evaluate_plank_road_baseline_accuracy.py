@@ -10,8 +10,8 @@ from tools.experiments.evaluate_plank_road_baseline_accuracy import evaluate_acc
 
 METHODS = [
     "plank_road",
-    "pure_edge_local_updating",
-    "accuracy_trigger_cloud_retraining",
+    "SURGEON",
+    "CATR",
 ]
 PLANK_RUN_ID = "road_n1_r01_plank_road"
 
@@ -53,7 +53,7 @@ def _write_coco_eval_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
     comparison_dir = tmp_path / "comparison"
     for method in METHODS:
         edge_path = _raw_dir(method, "edge_1")
-        if method != "pure_edge_local_updating":
+        if method != "SURGEON":
             (comparison_dir / _raw_dir(method, "cloud")).mkdir(parents=True, exist_ok=True)
         prediction_path = comparison_dir / edge_path / "latest_inference_results.jsonl"
         prediction_path.parent.mkdir(parents=True, exist_ok=True)
@@ -96,7 +96,7 @@ def test_evaluator_builds_real_precomputed_f1_file(tmp_path: Path) -> None:
     comparison_dir = tmp_path / "comparison"
     for method in METHODS:
         edge_path = _raw_dir(method, "edge_1")
-        if method != "pure_edge_local_updating":
+        if method != "SURGEON":
             (comparison_dir / _raw_dir(method, "cloud")).mkdir(parents=True, exist_ok=True)
         path = comparison_dir / edge_path / "latest_inference_results.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -179,7 +179,7 @@ def test_evaluator_reports_unlabelled_frames_without_synthesizing_values(
         encoding="utf-8",
     )
     for method in METHODS:
-        if method != "pure_edge_local_updating":
+        if method != "SURGEON":
             (comparison_dir / _raw_dir(method, "cloud")).mkdir(parents=True, exist_ok=True)
         (comparison_dir / _raw_dir(method, "edge_1")).mkdir(parents=True, exist_ok=True)
     manifest_path = _write_manifest(comparison_dir)

@@ -20,11 +20,11 @@ from tools.experiments.plot_plank_road_baseline_figures import (
 
 METHODS = (
     "plank_road",
-    "pure_edge_local_updating",
-    "accuracy_trigger_cloud_retraining",
-    "ekya_style_cloud_scheduling",
+    "SURGEON",
+    "CATR",
+    "Ekya",
 )
-METHOD_LABELS = ("Ours", "Pure Edge", "Accuracy-Trigger", "Ekya-style")
+METHOD_LABELS = ("Ours", "SURGEON", "CATR", "Ekya")
 SCENARIOS = ("Rainy", "Snowy")
 FIGURE_STEMS = (
     "fig1_dynamic_accuracy_recovery",
@@ -107,7 +107,7 @@ def _write_complete_normalized(normalized: Path, *, repeats: int = 3) -> None:
                     "model_apply_ms": 20,
                     "total_adaptation_ms": update_time_ms - trigger_time_ms,
                 }
-                if method == "pure_edge_local_updating":
+                if method == "SURGEON":
                     latency_kwargs.update(
                         upload_ms=None,
                         teacher_annotation_ms=None,
@@ -359,7 +359,7 @@ def test_fig3_omits_missing_components_without_inventing_values(tmp_path: Path) 
     _write_complete_normalized(normalized)
     latency_rows = read_csv(normalized / "latency_breakdown.csv")
     for row in latency_rows:
-        if row["method"] == "accuracy_trigger_cloud_retraining":
+        if row["method"] == "CATR":
             row["teacher_annotation_ms"] = ""
     write_csv(normalized / "latency_breakdown.csv", LATENCY_FIELDS, latency_rows)
 
@@ -367,7 +367,7 @@ def test_fig3_omits_missing_components_without_inventing_values(tmp_path: Path) 
 
     assert (figures / "fig3_retraining_time_breakdown.png").exists()
     assert any(
-        "Accuracy-Trigger omitted AccuracyTrigger-Label because it is not measured" in warning
+        "CATR omitted CATR-Label because it is not measured" in warning
         for warning in report["partial_data"]["fig3_retraining_time_breakdown"]
     )
 

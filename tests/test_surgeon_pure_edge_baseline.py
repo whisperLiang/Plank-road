@@ -20,7 +20,7 @@ def _config(tmp_path: Path) -> SimpleNamespace:
         lightweight="toy-detector",
         baseline=SimpleNamespace(
             results_root=str(tmp_path / "results"),
-            pure_edge_local_updating=SimpleNamespace(
+            SURGEON=SimpleNamespace(
                 label_source="pseudo_label",
                 local_metrics=True,
                 upload_metrics_to_cloud=False,
@@ -32,7 +32,7 @@ def _config(tmp_path: Path) -> SimpleNamespace:
                 consistency_weight=0.0,
                 entropy_margin_ratio=1.0,
             ),
-            accuracy_trigger_cloud_retraining=SimpleNamespace(
+            CATR=SimpleNamespace(
                 training_strategy="freeze",
                 trainable_param_ratio=0.3,
                 training_failure_backoff_sec=30.0,
@@ -151,7 +151,7 @@ class FakeTask:
 def _adapter(tmp_path: Path) -> BaselineEdgeAdapter:
     return BaselineEdgeAdapter(
         config=_config(tmp_path),
-        baseline_method="pure_edge_local_updating",
+        baseline_method="SURGEON",
         run_id="pure-surgeon-test",
         edge_id=1,
         transport=None,
@@ -340,10 +340,10 @@ def test_local_tta_can_trigger_on_larger_window_but_train_recent_subset(tmp_path
     edge = FakeEdge(model)
     config = _config(tmp_path)
     config.baseline.training.training_frame_count = 4
-    config.baseline.pure_edge_local_updating.train_sample_count = 2
+    config.baseline.SURGEON.train_sample_count = 2
     adapter = BaselineEdgeAdapter(
         config=config,
-        baseline_method="pure_edge_local_updating",
+        baseline_method="SURGEON",
         run_id="pure-surgeon-subset-test",
         edge_id=1,
         transport=None,

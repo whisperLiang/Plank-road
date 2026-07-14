@@ -5,7 +5,7 @@ from baselines.policies.base_policy import BaseBaselinePolicy, BaselineFrameDeci
 
 class PureEdgeLocalUpdatingPolicy(BaseBaselinePolicy):
     def __init__(self, config: object | None = None) -> None:
-        super().__init__("pure_edge_local_updating", config)
+        super().__init__("SURGEON", config)
         self.label_source = str(getattr(config, "label_source", "pseudo_label"))
         self.local_metrics = bool(getattr(config, "local_metrics", True))
         self.upload_metrics_to_cloud = bool(getattr(config, "upload_metrics_to_cloud", False))

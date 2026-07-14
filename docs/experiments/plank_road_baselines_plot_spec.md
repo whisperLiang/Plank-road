@@ -3,10 +3,10 @@
 The main paper baseline plotting command emits exactly three figure sets, each
 as SVG, PDF, TIFF, and PNG. The figures compare the same method order:
 
-1. `plank_road` -> Ours
-2. `pure_edge_local_updating` -> Pure Edge
-3. `accuracy_trigger_cloud_retraining` -> Accuracy-Trigger
-4. `ekya_style_cloud_scheduling` -> Ekya-style
+1. `plank_road` (Ours)
+2. `SURGEON`
+3. `CATR`
+4. `Ekya`
 
 The scenario order is Rainy, Snowy, mapped explicitly to:
 
@@ -21,7 +21,7 @@ omitted and reported in `plot_report.json`.
 |---|---|---|---|---|---|
 | Fig. 1 Dynamic Accuracy Recovery | `fig1_dynamic_accuracy_recovery` | One large scenario panel with four method curves, selecting the available formal scenario with the most frame rows | `frame_metrics.csv`, `adaptation_events.csv`, `normalization_report.json` | Mean Teacher-supervised F1 across repeated runs; shaded band is standard deviation; trigger and update markers show paired adaptation cycles | Skip if frame-level accuracy is absent; do not interpolate frame IDs; omit unpaired trigger/update events from the marker layer and report them; use fixed 50-frame bins only when repeats have no exact shared frame IDs, and report the bin size |
 | Fig. 2 Accuracy vs Average Training Time | `fig2_accuracy_retraining_time_tradeoff` | Only formal scenario panels with valid points; each method is an ellipse or point | `summary.csv` | X is `mean_training_ms / 1000`; Y is `mean_f1` | Draw a point without ellipse if fewer than two valid repeats exist; omit runs missing either summary value |
-| Fig. 3 Average Time Cost for Retraining Breakdown | `fig3_retraining_time_breakdown` | Only formal scenario groups with latency rows, using one dual-axis panel with stacked retraining bars and overlaid inference-latency lollipop markers | `latency_breakdown.csv`, `summary.csv` | Left axis: component height is the mean positive component duration per run; right axis: `summary.mean_latency_ms` | Omit unmeasured components; omit missing inference-latency markers and report them in `plot_report.json`; only Pure Edge cloud upload/label/download noncomponents are structural omissions |
+| Fig. 3 Average Time Cost for Retraining Breakdown | `fig3_retraining_time_breakdown` | Only formal scenario groups with latency rows, using one dual-axis panel with stacked retraining bars and overlaid inference-latency lollipop markers | `latency_breakdown.csv`, `summary.csv` | Left axis: component height is the mean positive component duration per run; right axis: `summary.mean_latency_ms` | Omit unmeasured components; omit missing inference-latency markers and report them in `plot_report.json`; only SURGEON cloud upload/label/download noncomponents are structural omissions |
 
 ## Fig. 1 Details
 
@@ -70,13 +70,13 @@ The left axis uses seconds for average retraining cost. Component mapping is:
 - Ours: Ours-Transmit = `upload_ms`; Ours-Label = `teacher_annotation_ms`;
   Ours-Retrain = `feature_rebuild_ms + training_ms`; Ours-Update =
   `model_update_download_ms + model_apply_ms`.
-- Pure Edge: PureEdge-Retrain = `training_ms`; PureEdge-Apply =
+- SURGEON: SURGEON-Retrain = `training_ms`; SURGEON-Apply =
   `model_apply_ms`.
-- Accuracy-Trigger: AccuracyTrigger-Upload = `upload_ms`;
-  AccuracyTrigger-Label = `teacher_annotation_ms`;
-  AccuracyTrigger-Retrain = `training_ms`; AccuracyTrigger-Update =
+- CATR: CATR-Upload = `upload_ms`;
+  CATR-Label = `teacher_annotation_ms`;
+  CATR-Retrain = `training_ms`; CATR-Update =
   `model_update_download_ms + model_apply_ms`.
-- Ekya-style: Ekya-Upload = `upload_ms`; Ekya-Profile = `microprofile_ms`;
+- Ekya: Ekya-Upload = `upload_ms`; Ekya-Profile = `microprofile_ms`;
   Ekya-Retrain = `training_ms`; Ekya-Update =
   `model_update_download_ms + model_apply_ms`.
 

@@ -5,11 +5,11 @@ from typing import Any
 
 from loguru import logger
 
-from cloud.baselines.ekya_style_cloud_scheduling.frame_buffer import (
+from cloud.baselines.Ekya.frame_buffer import (
     CloudFrameBuffer,
     UploadedFrameRecord,
 )
-from cloud.baselines.ekya_style_cloud_scheduling.protocol import FrameUploadPacket, now_s
+from cloud.baselines.Ekya.protocol import FrameUploadPacket, now_s
 
 
 class CloudFrameReceiver:
@@ -51,12 +51,12 @@ class CloudFrameReceiver:
             self.dropped_frames += 1
             queue.put_nowait(record)
             logger.warning(
-                "ekya_style_cloud_scheduling inference queue full; dropped stale frame."
+                "Ekya inference queue full; dropped stale frame."
             )
         except Exception:
             self.dropped_frames += 1
             logger.warning(
-                "ekya_style_cloud_scheduling inference queue full; current frame dropped."
+                "Ekya inference queue full; current frame dropped."
             )
 
 

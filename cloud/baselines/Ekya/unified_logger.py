@@ -8,15 +8,15 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from cloud.baselines.ekya_style_cloud_scheduling.frame_buffer import stable_window_id
-from cloud.baselines.ekya_style_cloud_scheduling.protocol import (
+from cloud.baselines.Ekya.frame_buffer import stable_window_id
+from cloud.baselines.Ekya.protocol import (
     DetectionResultPacket,
     DisplayEventPacket,
     FrameUploadPacket,
     latency_ms,
 )
 
-METHOD = "ekya_style_cloud_scheduling"
+METHOD = "Ekya"
 
 PER_FRAME_FIELDS = [
     "method",

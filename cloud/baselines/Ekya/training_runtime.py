@@ -6,7 +6,7 @@ from typing import Any
 
 import torch
 
-from cloud.baselines.ekya_style_cloud_scheduling.config import RetrainingConfig
+from cloud.baselines.Ekya.config import RetrainingConfig
 from cloud.training.parameter_freeze import (
     RawFrameTrainingSample,
     apply_parameter_ratio_freeze,

@@ -11,13 +11,13 @@ from typing import Any
 ArtifactContent = bytes | str | Path
 
 PLANK_ROAD_METHOD = "plank_road"
-PURE_EDGE_METHOD = "pure_edge_local_updating"
-ACCURACY_TRIGGER_METHOD = "accuracy_trigger_cloud_retraining"
-EKYA_METHOD = "ekya_style_cloud_scheduling"
+SURGEON_METHOD = "SURGEON"
+CATR_METHOD = "CATR"
+EKYA_METHOD = "Ekya"
 EXPERIMENT_METHODS: tuple[str, ...] = (
     PLANK_ROAD_METHOD,
-    PURE_EDGE_METHOD,
-    ACCURACY_TRIGGER_METHOD,
+    SURGEON_METHOD,
+    CATR_METHOD,
 )
 SUPPORTED_EXPERIMENT_METHODS: tuple[str, ...] = (
     *EXPERIMENT_METHODS,
@@ -215,7 +215,11 @@ def cloud_run_dir(
         method=method,
         run_id=run_id,
     )
-    return experiment_root(root_dir, identity.experiment_id) / identity.raw_logs_relative_dir() / "cloud"
+    return (
+        experiment_root(root_dir, identity.experiment_id)
+        / identity.raw_logs_relative_dir()
+        / "cloud"
+    )
 
 
 def edge_run_dir(

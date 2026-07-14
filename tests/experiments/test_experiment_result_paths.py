@@ -60,7 +60,7 @@ def test_manifest_expands_matrix_and_reports_generated_paths(tmp_path: Path) -> 
             {
                 "experiment_id": "suwon5a_weather",
                 "log_timezone": "Asia/Shanghai",
-                "methods": ["plank_road", "pure_edge_local_updating"],
+                "methods": ["plank_road", "SURGEON"],
                 "scenarios": [
                     {
                         "scenario_name": "Rainy",
@@ -92,6 +92,49 @@ def test_manifest_expands_matrix_and_reports_generated_paths(tmp_path: Path) -> 
     assert run["raw_logs"]["edges"]["2"] == (
         "raw_logs/rainy_n2_r02_plank_road/edge_2"
     )
+
+
+def test_manifest_uses_baseline_identifiers_directly_in_paths(
+    tmp_path: Path,
+) -> None:
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text(
+        yaml.safe_dump(
+            {
+                "experiment_id": "paper_names",
+                "log_timezone": "Asia/Shanghai",
+                "methods": ["plank_road", "SURGEON", "CATR", "Ekya"],
+                "scenarios": [
+                    {
+                        "scenario_name": "Rainy",
+                        "scenario_slug": "rainy",
+                        "video_path": "video_data/rainy.mp4",
+                    }
+                ],
+                "edge_counts": [1],
+                "repeats": [1],
+                "edge_ids_by_count": {"1": [1]},
+                "metrics": {},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    manifest = load_manifest(manifest_path)
+
+    assert manifest["methods"] == [
+        "plank_road",
+        "SURGEON",
+        "CATR",
+        "Ekya",
+    ]
+    assert [run["run_id"] for run in manifest["runs"]] == [
+        "rainy_n1_r01_plank_road",
+        "rainy_n1_r01_SURGEON",
+        "rainy_n1_r01_CATR",
+        "rainy_n1_r01_Ekya",
+    ]
 
 
 def test_manifest_rejects_edge_ids_above_declared_edge_count(tmp_path: Path) -> None:

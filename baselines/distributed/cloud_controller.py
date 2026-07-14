@@ -25,7 +25,7 @@ from cloud.baselines.detection_agreement import normalize_detection_prediction
 from config.baseline import validate_baseline_method
 from grpc_server import message_transmission_pb2
 
-_ACCURACY_TRIGGER_METHOD = "accuracy_trigger_cloud_retraining"
+_CATR_METHOD = "CATR"
 
 
 @dataclass(slots=True)
@@ -75,7 +75,7 @@ class DistributedBaselineController:
         self._states: dict[tuple[str, str, int], EdgeBaselineState] = {}
         self._frames: dict[tuple[str, str, int, int], BaselineFramePayload] = {}
 
-        self._accuracy_trigger_enabled = self.baseline_method == _ACCURACY_TRIGGER_METHOD
+        self._accuracy_trigger_enabled = self.baseline_method == _CATR_METHOD
         self._accuracy_trigger_controller = (
             AccuracyTriggerController(
                 baseline_method_config,
@@ -140,10 +140,10 @@ class DistributedBaselineController:
 
     def upload_frame(self, payload: BaselineFramePayload) -> dict[str, Any]:
         key = self._state_key(payload.run_id, payload.baseline_method, payload.edge_id)
-        is_accuracy_trigger = payload.baseline_method == _ACCURACY_TRIGGER_METHOD
+        is_accuracy_trigger = payload.baseline_method == _CATR_METHOD
         if is_accuracy_trigger:
             raise RuntimeError(
-                "Accuracy-Trigger frames must be uploaded via UploadAccuracyTriggerWindow"
+                "CATR frames must be uploaded via UploadAccuracyTriggerWindow"
             )
         teacher_prediction = dict(payload.teacher_prediction)
         stored_payload = replace(
@@ -197,7 +197,7 @@ class DistributedBaselineController:
         payload: BaselineWindowPayload,
     ) -> dict[str, Any]:
         if self._accuracy_trigger_controller is None:
-            raise RuntimeError("Accuracy-Trigger controller is not configured")
+            raise RuntimeError("CATR controller is not configured")
         self._validate_accuracy_window_payload(payload)
         key = self._state_key(payload.run_id, payload.baseline_method, payload.edge_id)
         selected_samples = tuple(payload.selected_samples)
@@ -395,7 +395,7 @@ class DistributedBaselineController:
         sample_dicts = [sample.to_training_sample() for sample in submission.training_samples]
         payload_zip = build_baseline_training_bundle(
             run_id=submission.run_id,
-            baseline_method=_ACCURACY_TRIGGER_METHOD,
+            baseline_method=_CATR_METHOD,
             edge_id=submission.edge_id,
             model_name=submission.model_name,
             model_version=submission.model_version,
@@ -484,8 +484,8 @@ class DistributedBaselineController:
         self,
         payload: BaselineWindowPayload,
     ) -> None:
-        if payload.baseline_method != _ACCURACY_TRIGGER_METHOD:
-            raise RuntimeError("window upload is only supported for Accuracy-Trigger")
+        if payload.baseline_method != _CATR_METHOD:
+            raise RuntimeError("window upload is only supported for CATR")
         if not str(payload.window_id or ""):
             raise RuntimeError("window_id is required")
         if int(payload.source_frame_count) < 0:

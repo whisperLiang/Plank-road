@@ -14,7 +14,11 @@ from baselines.method_factory import create_policy, registered_methods
 from baselines.runtime import BaselineEdgeAdapter, stable_window_id
 from common.experiment_results import ExperimentIdentity, collect_edge_artifacts
 from common.video_identity import VideoIdentity
-from config.baseline import PLANK_ROAD_BASELINE_ERROR
+from config.baseline import (
+    PLANK_ROAD_BASELINE_ERROR,
+    baseline_method_label,
+    validate_baseline_method,
+)
 from config.runtime import RuntimeConfig, load_runtime_config
 from edge_client import (
     _configure_baseline_client_runtime,
@@ -43,14 +47,14 @@ def _config(tmp_path: Path) -> SimpleNamespace:
         tinynext_input_size=None,
         baseline=SimpleNamespace(
             results_root=str(tmp_path / "results"),
-            pure_edge_local_updating=SimpleNamespace(
+            SURGEON=SimpleNamespace(
                 label_source="pseudo_label",
                 local_metrics=True,
                 upload_metrics_to_cloud=False,
                 upload_frames_to_cloud=False,
                 use_cloud_teacher=False,
             ),
-            accuracy_trigger_cloud_retraining=SimpleNamespace(
+            CATR=SimpleNamespace(
                 reuse_plank_road_frame_filter=True,
                 upload_keyframes_only=True,
                 trigger_on_cloud_comparison=True,
@@ -226,44 +230,66 @@ def test_legacy_baseline_files_are_removed() -> None:
 
 def test_native_baseline_methods_are_registered() -> None:
     assert registered_methods() == (
-        "pure_edge_local_updating",
-        "accuracy_trigger_cloud_retraining",
-        "ekya_style_cloud_scheduling",
+        "SURGEON",
+        "CATR",
+        "Ekya",
     )
     with pytest.raises(ValueError, match="does not use the edge policy factory"):
-        create_policy("ekya_style_cloud_scheduling")
+        create_policy("Ekya")
     with pytest.raises(ValueError, match="not a baseline method"):
         create_policy("plank_road" + "_multi_device")
     assert str(PLANK_ROAD_BASELINE_ERROR).startswith("plank_road" + "_multi_device")
 
 
+def test_baseline_method_identifiers_are_used_directly() -> None:
+    assert validate_baseline_method("SURGEON") == "SURGEON"
+    assert validate_baseline_method("CATR") == "CATR"
+    assert validate_baseline_method("Ekya") == "Ekya"
+    assert baseline_method_label("SURGEON") == "SURGEON"
+    assert baseline_method_label("CATR") == "CATR"
+    assert baseline_method_label("Ekya") == "Ekya"
+
+
+@pytest.mark.parametrize(
+    "legacy_method",
+    (
+        "pure_edge_" + "local_updating",
+        "accuracy_trigger_" + "cloud_retraining",
+        "ekya_style_" + "cloud_scheduling",
+    ),
+)
+def test_legacy_baseline_method_identifiers_are_rejected(legacy_method: str) -> None:
+    with pytest.raises(ValueError, match="Unknown baseline method"):
+        validate_baseline_method(legacy_method)
+
+
 def test_baseline_defaults_to_freeze_and_disabled_edge_split_runtime() -> None:
     config = RuntimeConfig()
 
-    assert config.baseline.accuracy_trigger_cloud_retraining.training_strategy == "freeze"
+    assert config.baseline.CATR.training_strategy == "freeze"
     assert (
-        config.baseline.accuracy_trigger_cloud_retraining.trainable_param_ratio
+        config.baseline.CATR.trainable_param_ratio
         == pytest.approx(0.3)
     )
-    assert config.baseline.accuracy_trigger_cloud_retraining.training_failure_backoff_sec == 30.0
-    assert config.baseline.accuracy_trigger_cloud_retraining.trigger_window_size == 64
-    assert config.baseline.accuracy_trigger_cloud_retraining.min_history_windows == 2
-    assert config.baseline.accuracy_trigger_cloud_retraining.accuracy_drop_sigma == pytest.approx(
+    assert config.baseline.CATR.training_failure_backoff_sec == 30.0
+    assert config.baseline.CATR.trigger_window_size == 64
+    assert config.baseline.CATR.min_history_windows == 2
+    assert config.baseline.CATR.accuracy_drop_sigma == pytest.approx(
         1.0
     )
-    assert config.baseline.accuracy_trigger_cloud_retraining.history_decay == pytest.approx(0.9)
-    assert config.baseline.accuracy_trigger_cloud_retraining.metric == "teacher_f1"
-    assert config.baseline.accuracy_trigger_cloud_retraining.agreement_iou_threshold == (
+    assert config.baseline.CATR.history_decay == pytest.approx(0.9)
+    assert config.baseline.CATR.metric == "teacher_f1"
+    assert config.baseline.CATR.agreement_iou_threshold == (
         pytest.approx(0.5)
     )
-    assert config.baseline.accuracy_trigger_cloud_retraining.agreement_score_threshold == (
+    assert config.baseline.CATR.agreement_score_threshold == (
         pytest.approx(0.0)
     )
     assert (
-        config.baseline.accuracy_trigger_cloud_retraining.agreement_empty_empty_policy
+        config.baseline.CATR.agreement_empty_empty_policy
         == "exclude"
     )
-    assert config.baseline.accuracy_trigger_cloud_retraining.absolute_accuracy_floor == (
+    assert config.baseline.CATR.absolute_accuracy_floor == (
         pytest.approx(0.6)
     )
     assert config.baseline.edge.split_runtime_policy == "disabled"
@@ -289,7 +315,7 @@ def test_accuracy_trigger_agreement_policy_is_validated(tmp_path) -> None:
     path.write_text(
         """
 baseline:
-  accuracy_trigger_cloud_retraining:
+  CATR:
     agreement_empty_empty_policy: background_bonus
 """,
         encoding="utf-8",
@@ -324,7 +350,7 @@ def test_baseline_edge_rejects_replay_only_runtime_policy(tmp_path) -> None:
 def test_pure_edge_adapter_uses_shared_artifacts_without_cloud(tmp_path) -> None:
     adapter = BaselineEdgeAdapter(
         config=_config(tmp_path),
-        baseline_method="pure_edge_local_updating",
+        baseline_method="SURGEON",
         run_id="pure-run",
         edge_id=1,
         transport=None,
@@ -351,7 +377,7 @@ def test_baseline_edge_adapter_requires_generated_run_id(tmp_path) -> None:
     with pytest.raises(ValueError, match="run_id must be generated"):
         BaselineEdgeAdapter(
             config=_config(tmp_path),
-            baseline_method="pure_edge_local_updating",
+            baseline_method="SURGEON",
             run_id=None,
             edge_id=1,
             transport=None,
@@ -370,7 +396,7 @@ def test_pure_edge_startup_validation_can_skip_cloud_address(tmp_path) -> None:
 
 
 def test_prepare_experiment_run_dir_overwrites_existing_enabled_run(tmp_path) -> None:
-    run_dir = tmp_path / "comparison" / "accuracy_trigger_cloud_retraining" / "edge_1" / "run-a"
+    run_dir = tmp_path / "comparison" / "CATR" / "edge_1" / "run-a"
     run_dir.mkdir(parents=True)
     (run_dir / "metrics.jsonl").write_text("old\n", encoding="utf-8")
     nested = run_dir / "nested"
@@ -423,8 +449,8 @@ def test_write_edge_summary_keeps_experiment_and_video_identity_separate(tmp_pat
         scenario_slug="snowy",
         edge_count=1,
         repeat=1,
-        method="ekya_style_cloud_scheduling",
-        run_id="snowy_n1_r01_ekya_style_cloud_scheduling",
+        method="Ekya",
+        run_id="snowy_n1_r01_Ekya",
     )
     video_identity = VideoIdentity(
         video_source="snowy.mp4",
@@ -445,7 +471,7 @@ def test_write_edge_summary_keeps_experiment_and_video_identity_separate(tmp_pat
         tmp_path / "edge_summary.json",
         config=config,
         identity=experiment_identity,
-        method="ekya_style_cloud_scheduling",
+        method="Ekya",
         run_id=experiment_identity.run_id,
         sampled_frame_count=12,
         video_identity=video_identity,
@@ -504,7 +530,7 @@ def test_pure_edge_shutdown_upload_enabled_and_local_artifacts_collected(tmp_pat
     inference_path.write_text('{"frame_index": 1}\n', encoding="utf-8")
     metrics_path.write_text('{"event": "surgeon_tta_done"}\n', encoding="utf-8")
     (run_dir / "edge_summary.json").write_text(
-        '{"method": "pure_edge_local_updating"}\n',
+        '{"method": "SURGEON"}\n',
         encoding="utf-8",
     )
     experiment_results = SimpleNamespace(
@@ -514,7 +540,7 @@ def test_pure_edge_shutdown_upload_enabled_and_local_artifacts_collected(tmp_pat
     )
 
     artifacts = collect_edge_artifacts(
-        method="pure_edge_local_updating",
+        method="SURGEON",
         run_id="pure-run",
         edge_id=1,
         experiment_id="comparison",
@@ -532,7 +558,7 @@ def test_pure_edge_shutdown_upload_enabled_and_local_artifacts_collected(tmp_pat
     assert "edge_summary.json" in artifacts
     assert _experiment_result_upload_enabled(
         mode="baseline",
-        baseline_method="pure_edge_local_updating",
+        baseline_method="SURGEON",
         experiment_results=experiment_results,
     )
 
@@ -541,9 +567,9 @@ def test_pure_edge_shutdown_upload_enabled_and_local_artifacts_collected(tmp_pat
     ("mode", "baseline_method", "enabled", "expected"),
     [
         ("main", None, True, True),
-        ("baseline", "accuracy_trigger_cloud_retraining", True, True),
+        ("baseline", "CATR", True, True),
         ("main", None, False, False),
-        ("baseline", "pure_edge_local_updating", True, True),
+        ("baseline", "SURGEON", True, True),
     ],
 )
 def test_shutdown_experiment_upload_enablement_respects_config(
@@ -578,18 +604,18 @@ def test_shutdown_upload_helper_calls_uploader_for_pure_edge() -> None:
     uploaded = _upload_experiment_run_artifacts_if_enabled(
         server_ip="127.0.0.1:1",
         mode="baseline",
-        baseline_method="pure_edge_local_updating",
+        baseline_method="SURGEON",
         experiment_results=SimpleNamespace(enabled=True, upload_enabled=True),
         identity=ExperimentIdentity.create(
             experiment_id="comparison",
             scenario_slug="road",
             edge_count=1,
             repeat=1,
-            method="pure_edge_local_updating",
+            method="SURGEON",
             run_id="pure-run",
         ),
         run_id="pure-run",
-        method="pure_edge_local_updating",
+        method="SURGEON",
         edge_id=1,
         artifacts={"metrics.jsonl": "{}\n"},
         uploader_cls=FakeUploader,
@@ -598,7 +624,7 @@ def test_shutdown_upload_helper_calls_uploader_for_pure_edge() -> None:
     assert uploaded is True
     assert calls[0] == {"event": "init", "server_ip": "127.0.0.1:1", "enabled": True}
     assert calls[1]["event"] == "upload"
-    assert calls[1]["method"] == "pure_edge_local_updating"
+    assert calls[1]["method"] == "SURGEON"
 
 
 def test_shutdown_upload_helper_still_calls_uploader_for_accuracy_trigger() -> None:
@@ -615,18 +641,18 @@ def test_shutdown_upload_helper_still_calls_uploader_for_accuracy_trigger() -> N
     uploaded = _upload_experiment_run_artifacts_if_enabled(
         server_ip="127.0.0.1:1",
         mode="baseline",
-        baseline_method="accuracy_trigger_cloud_retraining",
+        baseline_method="CATR",
         experiment_results=SimpleNamespace(enabled=True, upload_enabled=True),
         identity=ExperimentIdentity.create(
             experiment_id="comparison",
             scenario_slug="road",
             edge_count=1,
             repeat=1,
-            method="accuracy_trigger_cloud_retraining",
+            method="CATR",
             run_id="acc-run",
         ),
         run_id="acc-run",
-        method="accuracy_trigger_cloud_retraining",
+        method="CATR",
         edge_id=1,
         artifacts={"metrics.jsonl": "{}\n"},
         uploader_cls=FakeUploader,
@@ -635,13 +661,13 @@ def test_shutdown_upload_helper_still_calls_uploader_for_accuracy_trigger() -> N
     assert uploaded is True
     assert calls[0] == {"event": "init", "server_ip": "127.0.0.1:1", "enabled": True}
     assert calls[1]["event"] == "upload"
-    assert calls[1]["method"] == "accuracy_trigger_cloud_retraining"
+    assert calls[1]["method"] == "CATR"
 
 
 def test_shutdown_upload_can_be_disabled_while_local_archival_remains_enabled() -> None:
     assert not _experiment_result_upload_enabled(
         mode="baseline",
-        baseline_method="pure_edge_local_updating",
+        baseline_method="SURGEON",
         experiment_results=SimpleNamespace(enabled=True, upload_enabled=False),
     )
 
@@ -650,7 +676,7 @@ def test_accuracy_adapter_uploads_keyframes_without_local_training_submit(tmp_pa
     transport = RecordingTransport()
     adapter = BaselineEdgeAdapter(
         config=_config(tmp_path),
-        baseline_method="accuracy_trigger_cloud_retraining",
+        baseline_method="CATR",
         run_id="acc-run",
         edge_id=2,
         server_ip="127.0.0.1:1",
@@ -707,11 +733,11 @@ def test_accuracy_adapter_uploads_keyframes_without_local_training_submit(tmp_pa
 
 def test_accuracy_adapter_uses_fixed_source_windows_across_filtered_frames(tmp_path) -> None:
     config = _config(tmp_path)
-    config.baseline.accuracy_trigger_cloud_retraining.trigger_window_size = 2
+    config.baseline.CATR.trigger_window_size = 2
     transport = RecordingTransport()
     adapter = BaselineEdgeAdapter(
         config=config,
-        baseline_method="accuracy_trigger_cloud_retraining",
+        baseline_method="CATR",
         run_id="acc-run",
         edge_id=2,
         server_ip="127.0.0.1:1",
@@ -785,11 +811,11 @@ def test_accuracy_adapter_uses_fixed_source_windows_across_filtered_frames(tmp_p
 
 def test_accuracy_adapter_splits_source_window_on_model_version_change(tmp_path) -> None:
     config = _config(tmp_path)
-    config.baseline.accuracy_trigger_cloud_retraining.trigger_window_size = 4
+    config.baseline.CATR.trigger_window_size = 4
     transport = RecordingTransport()
     adapter = BaselineEdgeAdapter(
         config=config,
-        baseline_method="accuracy_trigger_cloud_retraining",
+        baseline_method="CATR",
         run_id="acc-run",
         edge_id=2,
         server_ip="127.0.0.1:1",
@@ -833,11 +859,11 @@ def test_accuracy_adapter_splits_source_window_on_model_version_change(tmp_path)
 
 def test_accuracy_adapter_close_drains_queued_windows_before_partial_flush(tmp_path) -> None:
     config = _config(tmp_path)
-    config.baseline.accuracy_trigger_cloud_retraining.trigger_window_size = 2
+    config.baseline.CATR.trigger_window_size = 2
     transport = RecordingTransport()
     adapter = BaselineEdgeAdapter(
         config=config,
-        baseline_method="accuracy_trigger_cloud_retraining",
+        baseline_method="CATR",
         run_id="acc-run",
         edge_id=2,
         server_ip="127.0.0.1:1",
@@ -870,12 +896,12 @@ def test_accuracy_adapter_close_drains_queued_windows_before_partial_flush(tmp_p
 def test_accuracy_adapter_never_enters_local_training_backoff(tmp_path) -> None:
     config = _config(tmp_path)
     config.baseline.training.training_window_size = 1
-    config.baseline.accuracy_trigger_cloud_retraining.trigger_window_size = 1
-    config.baseline.accuracy_trigger_cloud_retraining.training_failure_backoff_sec = 30.0
+    config.baseline.CATR.trigger_window_size = 1
+    config.baseline.CATR.training_failure_backoff_sec = 30.0
     transport = FailingTrainingTransport()
     adapter = BaselineEdgeAdapter(
         config=config,
-        baseline_method="accuracy_trigger_cloud_retraining",
+        baseline_method="CATR",
         run_id="acc-run",
         edge_id=2,
         server_ip="127.0.0.1:1",
@@ -931,7 +957,7 @@ def test_accuracy_adapter_validates_cloud_command_and_acks_after_update(tmp_path
     edge = RecordingEdge()
     adapter = BaselineEdgeAdapter(
         config=_config(tmp_path),
-        baseline_method="accuracy_trigger_cloud_retraining",
+        baseline_method="CATR",
         run_id="acc-run",
         edge_id=2,
         server_ip="127.0.0.1:1",
@@ -944,7 +970,7 @@ def test_accuracy_adapter_validates_cloud_command_and_acks_after_update(tmp_path
                 "type": "baseline_training_job_available",
                 "command_id": "bad-cmd",
                 "run_id": "wrong-run",
-                "baseline_method": "accuracy_trigger_cloud_retraining",
+                "baseline_method": "CATR",
                 "edge_id": 2,
                 "job_id": "job-bad",
                 "window_id": "window-bad",
@@ -960,7 +986,7 @@ def test_accuracy_adapter_validates_cloud_command_and_acks_after_update(tmp_path
                 "type": "baseline_training_job_available",
                 "command_id": "cmd-1",
                 "run_id": "acc-run",
-                "baseline_method": "accuracy_trigger_cloud_retraining",
+                "baseline_method": "CATR",
                 "edge_id": 2,
                 "job_id": "job-1",
                 "window_id": "window-1",
@@ -993,7 +1019,7 @@ def test_accuracy_adapter_validates_cloud_command_and_acks_after_update(tmp_path
 def test_stable_window_id_includes_strategy_ratio_and_sorts_frames() -> None:
     first = stable_window_id(
         run_id="run-a",
-        baseline_method="accuracy_trigger_cloud_retraining",
+        baseline_method="CATR",
         training_strategy="freeze",
         trainable_param_ratio=0.3,
         edge_id=1,
@@ -1002,7 +1028,7 @@ def test_stable_window_id_includes_strategy_ratio_and_sorts_frames() -> None:
     )
     reordered = stable_window_id(
         run_id="run-a",
-        baseline_method="accuracy_trigger_cloud_retraining",
+        baseline_method="CATR",
         training_strategy="freeze",
         trainable_param_ratio=0.3,
         edge_id=1,
@@ -1011,7 +1037,7 @@ def test_stable_window_id_includes_strategy_ratio_and_sorts_frames() -> None:
     )
     different_strategy = stable_window_id(
         run_id="run-a",
-        baseline_method="accuracy_trigger_cloud_retraining",
+        baseline_method="CATR",
         training_strategy="diagnostic",
         trainable_param_ratio=0.3,
         edge_id=1,
@@ -1020,7 +1046,7 @@ def test_stable_window_id_includes_strategy_ratio_and_sorts_frames() -> None:
     )
     different_ratio = stable_window_id(
         run_id="run-a",
-        baseline_method="accuracy_trigger_cloud_retraining",
+        baseline_method="CATR",
         training_strategy="freeze",
         trainable_param_ratio=0.5,
         edge_id=1,
@@ -1034,7 +1060,7 @@ def test_stable_window_id_includes_strategy_ratio_and_sorts_frames() -> None:
 
 def test_cloud_controller_no_longer_exposes_training_state_machine() -> None:
     controller = DistributedBaselineController(
-        baseline_method="accuracy_trigger_cloud_retraining",
+        baseline_method="CATR",
         run_id="run-a",
         results_root="unused",
         strict_run_id=False,

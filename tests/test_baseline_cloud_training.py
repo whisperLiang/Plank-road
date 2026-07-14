@@ -538,7 +538,7 @@ def _bundle(
     ]
     return build_baseline_training_bundle(
         run_id="run-a",
-        baseline_method="accuracy_trigger_cloud_retraining",
+        baseline_method="CATR",
         edge_id=edge_id,
         model_name=model_name,
         model_version="0",

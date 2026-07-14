@@ -13,10 +13,10 @@ from tools.experiments.experiment_common import ACCURACY_FIELDS
 
 METHOD_RUNS = (
     ("plank_road", "road-night-rain_n1_r01_plank_road"),
-    ("pure_edge_local_updating", "road-night-rain_n1_r01_pure_edge_local_updating"),
+    ("SURGEON", "road-night-rain_n1_r01_SURGEON"),
     (
-        "accuracy_trigger_cloud_retraining",
-        "road-night-rain_n1_r01_accuracy_trigger_cloud_retraining",
+        "CATR",
+        "road-night-rain_n1_r01_CATR",
     ),
 )
 
@@ -85,7 +85,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path]:
 
     for method, run_id in METHOD_RUNS:
         edge_rel = _raw_dir(method, "edge_1")
-        if method != "pure_edge_local_updating":
+        if method != "SURGEON":
             (comparison_dir / _raw_dir(method, "cloud")).mkdir(parents=True, exist_ok=True)
         prediction_path = comparison_dir / edge_rel / "latest_inference_results.jsonl"
         prediction_path.parent.mkdir(parents=True, exist_ok=True)
