@@ -251,7 +251,12 @@ class PureEdgeBaselineConfig(ConfigSection):
     trainable_scope: str = "norm_affine"
     training_frame_count: int | None = None
     train_sample_count: int | None = None
-    consistency_weight: float = 0.01
+    num_epoch: int | None = 3
+    require_drift: bool = True
+    min_detection_confidence: float | None = 0.6
+    min_selected_logit_count: int = 16
+    min_loss_improvement: float = 1.0e-4
+    consistency_weight: float = 0.0
     entropy_margin_ratio: float = 0.4
 
 
@@ -1241,6 +1246,30 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
                 "baseline.SURGEON.train_sample_count must be <= "
                 "the effective pure-edge training_frame_count"
             )
+    if pure_edge.num_epoch is not None:
+        _validate_positive(
+            "baseline.SURGEON.num_epoch",
+            int(pure_edge.num_epoch),
+        )
+    if pure_edge.min_detection_confidence is not None:
+        _validate_positive(
+            "baseline.SURGEON.min_detection_confidence",
+            float(pure_edge.min_detection_confidence),
+            allow_zero=True,
+        )
+        if float(pure_edge.min_detection_confidence) > 1.0:
+            raise ValueError(
+                "baseline.SURGEON.min_detection_confidence must be <= 1"
+            )
+    _validate_positive(
+        "baseline.SURGEON.min_selected_logit_count",
+        int(pure_edge.min_selected_logit_count),
+    )
+    _validate_positive(
+        "baseline.SURGEON.min_loss_improvement",
+        float(pure_edge.min_loss_improvement),
+        allow_zero=True,
+    )
     legacy_tta_steps = (getattr(pure_edge, "_extras", {}) or {}).get("tta_steps")
     if legacy_tta_steps is not None:
         _validate_positive(

@@ -925,6 +925,52 @@ def test_baseline_freeze_epoch_logs_stay_enabled_by_default() -> None:
     assert "[BaselineTraining] freeze epoch 1/1 avg_loss=" in logs
 
 
+def test_detection_wrappers_keep_wrapper_and_core_runtime_modes_in_sync() -> None:
+    import torch
+
+    from model_management.detectors.legacy_model_zoo import (
+        DETRDetectionModel,
+        RFDETRDetectionModel,
+        RTDETRDetectionModel,
+        YOLODetectionModel,
+    )
+
+    wrappers_and_cores = []
+
+    yolo = YOLODetectionModel.__new__(YOLODetectionModel)
+    torch.nn.Module.__init__(yolo)
+    yolo_core = torch.nn.Linear(1, 1)
+    yolo.yolo = SimpleNamespace(model=yolo_core)
+    wrappers_and_cores.append((yolo, yolo_core))
+
+    detr = DETRDetectionModel.__new__(DETRDetectionModel)
+    torch.nn.Module.__init__(detr)
+    detr_core = torch.nn.Linear(1, 1)
+    detr.detr = detr_core
+    wrappers_and_cores.append((detr, detr_core))
+
+    rfdetr = RFDETRDetectionModel.__new__(RFDETRDetectionModel)
+    torch.nn.Module.__init__(rfdetr)
+    rfdetr_core = torch.nn.Linear(1, 1)
+    rfdetr.rfdetr = SimpleNamespace(model=SimpleNamespace(model=rfdetr_core))
+    wrappers_and_cores.append((rfdetr, rfdetr_core))
+
+    rtdetr = RTDETRDetectionModel.__new__(RTDETRDetectionModel)
+    torch.nn.Module.__init__(rtdetr)
+    rtdetr_core = torch.nn.Linear(1, 1)
+    rtdetr.rtdetr = SimpleNamespace(model=rtdetr_core)
+    wrappers_and_cores.append((rtdetr, rtdetr_core))
+
+    for wrapper, core in wrappers_and_cores:
+        assert wrapper.eval() is wrapper
+        assert wrapper.training is False
+        assert core.training is False
+
+        assert wrapper.train() is wrapper
+        assert wrapper.training is True
+        assert core.training is True
+
+
 def test_microprofile_runs_training_loop_and_not_static_formula(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -155,12 +155,22 @@ class BaselineEdgeAdapter:
         if self.baseline_method == "SURGEON":
             self._surgeon_tta = SurgeonLocalTTAUpdater(self.config, self.metrics)
             self._surgeon_tta.attach_edge(edge)
-        logger.info(
-            "[BaselineAdapter] enabled method={} training_strategy={} trainable_param_ratio={}",
-            self.baseline_method,
-            self.training_strategy,
-            self.trainable_param_ratio,
-        )
+        if self.baseline_method == "SURGEON":
+            method_cfg = getattr(getattr(self.config, "baseline", None), "SURGEON", None)
+            logger.info(
+                "[BaselineAdapter] enabled method={} training_strategy={} trainable_scope={}",
+                self.baseline_method,
+                self.training_strategy,
+                str(getattr(method_cfg, "trainable_scope", "norm_affine")),
+            )
+        else:
+            logger.info(
+                "[BaselineAdapter] enabled method={} training_strategy={} "
+                "trainable_param_ratio={}",
+                self.baseline_method,
+                self.training_strategy,
+                self.trainable_param_ratio,
+            )
         logger.info("[EdgeVideo] using shared Plank-Road inference/display loop")
 
     def on_sampled_inference_result(

@@ -29,6 +29,7 @@ def _config(tmp_path: Path) -> SimpleNamespace:
                 training_strategy="surgeon_tta",
                 quality_mode="output_only_when_no_boundary",
                 trainable_scope="norm_affine",
+                min_selected_logit_count=1,
                 consistency_weight=0.0,
                 entropy_margin_ratio=1.0,
             ),
@@ -217,6 +218,9 @@ class RFDETRCapabilityCore(torch.nn.Module):
         self.pool = torch.nn.AdaptiveAvgPool2d((1, 1))
         self.head = torch.nn.Linear(3, 5)
         self.box_head = torch.nn.Linear(3, 4)
+        with torch.no_grad():
+            self.head.weight.fill_(0.2)
+            self.head.bias.copy_(torch.tensor([2.0, 1.0, 0.5, 0.0, 8.0]))
 
     def forward(self, batch):
         features = self.pool(self.bn(batch.float())).flatten(1)
@@ -330,6 +334,55 @@ def test_low_quality_samples_trigger_local_tta_and_update_model_version(tmp_path
         assert edge.apply_model_update_calls == 0
         assert _states_differ(before, _clone_state(model))
         assert model.training is False
+    finally:
+        adapter.close()
+
+
+def test_surgeon_requires_persistent_drift_before_triggering(tmp_path) -> None:
+    config = _config(tmp_path)
+    config.window_drift.persistence_windows = 10
+    adapter = BaselineEdgeAdapter(
+        config=config,
+        baseline_method="SURGEON",
+        run_id="pure-surgeon-drift-gate-test",
+        edge_id=1,
+        transport=None,
+    )
+    try:
+        adapter.before_video_start(FakeEdge(ToyTTAModel()))
+        _sample(adapter, 1)
+        _sample(adapter, 2)
+
+        assert adapter._surgeon_tta is not None
+        assert adapter._surgeon_tta._running_thread is None
+        assert adapter._surgeon_tta._pending_local_update is None
+        assert not any(
+            row["event"] == "surgeon_tta_triggered" for row in _metrics(adapter)
+        )
+    finally:
+        adapter.close()
+
+
+def test_successful_apply_requires_a_fresh_post_update_window(tmp_path) -> None:
+    adapter = _adapter(tmp_path)
+    try:
+        adapter.before_video_start(FakeEdge(ToyTTAModel()))
+        _sample(adapter, 1)
+        _sample(adapter, 2)
+        _finish_pending_tta(adapter)
+
+        _sample(adapter, 3)
+        assert adapter._surgeon_tta is not None
+        assert adapter._surgeon_tta._running_thread is None
+        assert adapter._surgeon_tta._pending_local_update is None
+
+        _sample(adapter, 4)
+        assert adapter._surgeon_tta.wait_for_idle(timeout=5.0)
+        assert adapter._surgeon_tta._pending_local_update is not None
+        triggers = [
+            row for row in _metrics(adapter) if row["event"] == "surgeon_tta_triggered"
+        ]
+        assert [row["frame_id"] for row in triggers] == [2, 4]
     finally:
         adapter.close()
 
@@ -565,6 +618,112 @@ def test_rfdetr_tta_entropy_skips_empty_foreground_batches() -> None:
 
     with pytest.raises(RuntimeError, match="no_foreground_logits"):
         adapter.entropy_loss(outputs)
+
+
+def test_tta_entropy_does_not_fallback_to_a_single_unreliable_logit() -> None:
+    detector = FakeDetector(ToyTTAModel())
+    adapter = TTADetectionAdapter(detector, entropy_margin_ratio=0.4)
+    outputs = {
+        "cls_logits": torch.zeros((2, 3), requires_grad=True),
+    }
+
+    with pytest.raises(RuntimeError, match="no_reliable_logits"):
+        adapter.entropy_loss(outputs)
+
+
+def test_tta_reliable_logit_gate_enforces_configured_absolute_minimum(tmp_path) -> None:
+    config = _config(tmp_path)
+    config.baseline.SURGEON.min_selected_logit_count = 16
+    updater = SurgeonLocalTTAUpdater(
+        config,
+        SimpleNamespace(record=lambda *_args, **_kwargs: None),
+    )
+
+    with pytest.raises(RuntimeError, match="insufficient_reliable_logits"):
+        updater._require_reliable_logits(
+            {"selected_logit_count": 2, "logit_count": 2}
+        )
+
+    updater._require_reliable_logits(
+        {"selected_logit_count": 16, "logit_count": 32}
+    )
+
+
+def test_flip_consistency_realigns_outputs_with_explicit_spatial_metadata() -> None:
+    detector = FakeDetector(ToyTTAModel())
+    adapter = TTADetectionAdapter(detector, entropy_margin_ratio=1.0)
+    logits_a = torch.tensor(
+        [
+            [
+                [[2.0, 0.0], [3.0, 0.0], [4.0, 0.0]],
+                [[5.0, 0.0], [6.0, 0.0], [7.0, 0.0]],
+            ]
+        ],
+        requires_grad=True,
+    )
+    logits_b = torch.flip(logits_a.detach(), dims=(2,)).clone().requires_grad_(True)
+
+    loss = adapter.consistency_loss(
+        {"cls_logits": logits_a},
+        {"cls_logits": logits_b, "_tta_horizontal_flip_dim": 2},
+    )
+
+    assert loss is not None
+    assert float(loss.detach().item()) == pytest.approx(0.0)
+
+
+def test_tta_rejects_update_when_objective_does_not_improve(tmp_path) -> None:
+    config = _config(tmp_path)
+    config.baseline.training.learning_rate = 0.0
+    adapter = BaselineEdgeAdapter(
+        config=config,
+        baseline_method="SURGEON",
+        run_id="pure-surgeon-reject-test",
+        edge_id=1,
+        transport=None,
+    )
+    try:
+        edge = FakeEdge(ToyTTAModel())
+        adapter.before_video_start(edge)
+        _sample(adapter, 1)
+        _sample(adapter, 2)
+        assert adapter._surgeon_tta is not None
+        assert adapter._surgeon_tta.wait_for_idle(timeout=5.0)
+
+        rows = _metrics(adapter)
+        assert adapter._surgeon_tta._pending_local_update is None
+        assert edge.model_version == "0"
+        assert any(row["event"] == "surgeon_tta_rejected" for row in rows)
+        assert any(
+            row["event"] == "surgeon_tta_skipped"
+            and row["reason"] == "objective_not_improved"
+            for row in rows
+        )
+    finally:
+        adapter.close()
+
+
+def test_tta_does_not_persist_batch_norm_running_statistics(tmp_path) -> None:
+    model = ToyTTAModel()
+    before = _clone_state(model)
+    adapter = _adapter(tmp_path)
+    try:
+        adapter.before_video_start(FakeEdge(model))
+        _sample(adapter, 1)
+        _sample(adapter, 2)
+        assert adapter._surgeon_tta is not None
+        assert adapter._surgeon_tta.wait_for_idle(timeout=5.0)
+        pending = adapter._surgeon_tta._pending_local_update
+
+        assert pending is not None
+        assert torch.equal(pending.trained_state_dict["bn.running_mean"], before["bn.running_mean"])
+        assert torch.equal(pending.trained_state_dict["bn.running_var"], before["bn.running_var"])
+        assert torch.equal(
+            pending.trained_state_dict["bn.num_batches_tracked"],
+            before["bn.num_batches_tracked"],
+        )
+    finally:
+        adapter.close()
 
 
 def test_logits_unavailable_skips_without_cloud_update_and_restores_mode(tmp_path) -> None:

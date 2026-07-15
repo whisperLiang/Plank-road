@@ -261,7 +261,7 @@ class EkyaStyleCloudSchedulingController:
                 manage_registration=manage_registration,
             )
         except Exception as exc:
-            logger.warning(
+            logger.opt(exception=exc).warning(
                 "Ekya window pipeline failed: window={} error={}",
                 window.window_id,
                 exc,

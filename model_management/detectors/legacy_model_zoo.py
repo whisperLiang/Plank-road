@@ -323,7 +323,9 @@ class YOLODetectionModel(nn.Module):
         return detections
 
     def train(self, mode: bool = True):
-        """YOLO training is done via ultralytics CLI / API — not via this wrapper."""
+        """Keep the wrapper and its Ultralytics core in the same runtime mode."""
+        self.yolo.model.train(mode)
+        self.training = bool(mode)
         return self
 
     def eval(self):
@@ -436,6 +438,7 @@ class DETRDetectionModel(nn.Module):
 
     def train(self, mode: bool = True):
         self.detr.train(mode)
+        self.training = bool(mode)
         return self
 
     def eval(self):
@@ -563,6 +566,7 @@ class RFDETRDetectionModel(nn.Module):
 
     def train(self, mode: bool = True):
         self.rfdetr.model.model.train(mode)
+        self.training = bool(mode)
         return self
 
     def eval(self):
@@ -688,6 +692,8 @@ class RTDETRDetectionModel(nn.Module):
         return detections
 
     def train(self, mode: bool = True):
+        self.rtdetr.model.train(mode)
+        self.training = bool(mode)
         return self
 
     def eval(self):

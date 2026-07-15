@@ -42,7 +42,10 @@ class PendingLocalTTAUpdate:
     snapshot_lock_ms: float
     batch_size: int
     num_epoch: int
+    initial_loss: float
     loss: float
+    initial_selected_logit_count: int
+    selected_logit_count: int
     trainable_param_count: int
     low_quality_sample_count: int
     started_perf: float
@@ -138,8 +141,8 @@ class TTADetectionAdapter:
             mask = entropy <= self.entropy_margin_ratio
             if bool(mask.any()):
                 selected = entropy[mask]
-            elif entropy.numel() > 0:
-                selected = entropy.topk(k=1, largest=False).values
+            else:
+                raise _TTASkip("no_reliable_logits")
         loss = selected.mean()
         return loss, {
             "logit_count": int(rows.shape[0]),
@@ -158,13 +161,23 @@ class TTADetectionAdapter:
             or mode_a != mode_b
         ):
             return None
+        aligned_b = _align_horizontally_flipped_logits(logits_b, outputs_b)
+        if aligned_b is None:
+            # Flattened dense-detector anchors and DETR queries cannot be
+            # aligned safely without their spatial layout or a matcher.
+            return None
+        rows_a = _logit_rows(logits_a)
+        rows_b = _logit_rows(aligned_b)
+        if rows_a is None or rows_b is None or tuple(rows_a.shape) != tuple(rows_b.shape):
+            return None
+        if _background_is_last(mode_a) and rows_a.shape[-1] > 1:
+            rows_a = rows_a[:, :-1]
+            rows_b = rows_b[:, :-1]
+        if rows_a.shape[-1] <= 1:
+            return None
         if str(mode_a).startswith("sigmoid"):
-            work_a = _drop_last_background_logits(logits_a.detach(), mode_a)
-            work_b = _drop_last_background_logits(logits_b, mode_b)
-            if tuple(work_a.shape) != tuple(work_b.shape) or work_a.shape[-1] <= 1:
-                return None
-            probs_a = torch.sigmoid(work_a)
-            probs_b = torch.sigmoid(work_b)
+            probs_a = torch.sigmoid(rows_a.detach())
+            probs_b = torch.sigmoid(rows_b)
             foreground_mask = (
                 probs_a.detach().max(dim=-1).values >= _SIGMOID_FOREGROUND_PROBABILITY_FLOOR
             )
@@ -173,12 +186,8 @@ class TTADetectionAdapter:
             probs_a = probs_a[foreground_mask]
             probs_b = probs_b[foreground_mask]
         else:
-            work_a = _drop_last_background_logits(logits_a, mode_a)
-            work_b = _drop_last_background_logits(logits_b, mode_b)
-            if tuple(work_a.shape) != tuple(work_b.shape) or work_a.shape[-1] <= 1:
-                return None
-            probs_a = torch.softmax(work_a.detach(), dim=-1)
-            probs_b = torch.softmax(work_b, dim=-1)
+            probs_a = torch.softmax(rows_a.detach(), dim=-1)
+            probs_b = torch.softmax(rows_b, dim=-1)
         return F.mse_loss(probs_b, probs_a)
 
     def _forward_ultralytics(self, model: object, images: list[torch.Tensor]) -> Any:
@@ -321,17 +330,22 @@ class SurgeonLocalTTAUpdater:
             0,
             int(getattr(getattr(quality_cfg, "output_entropy", None), "warmup_samples", 20)),
         )
+        configured_min_confidence = getattr(
+            self.method_cfg,
+            "min_detection_confidence",
+            None,
+        )
+        if configured_min_confidence is None:
+            configured_min_confidence = getattr(
+                getattr(quality_cfg, "output_entropy", None),
+                "min_detection_confidence",
+                0.85,
+            )
         self._output_min_confidence = max(
             0.0,
             min(
                 1.0,
-                float(
-                    getattr(
-                        getattr(quality_cfg, "output_entropy", None),
-                        "min_detection_confidence",
-                        0.85,
-                    )
-                ),
+                float(configured_min_confidence),
             ),
         )
         self.drift_detector = WindowDriftDetector(
@@ -364,11 +378,22 @@ class SurgeonLocalTTAUpdater:
             1,
             min(int(configured_train_sample_count), int(self.training_frame_count)),
         )
-        configured_num_epoch = getattr(self.training_cfg, "num_epoch", 1)
+        configured_num_epoch = getattr(self.method_cfg, "num_epoch", None)
+        if configured_num_epoch is None:
+            configured_num_epoch = getattr(self.training_cfg, "num_epoch", 1)
         self.num_epoch = max(1, int(configured_num_epoch))
+        self.require_drift = bool(getattr(self.method_cfg, "require_drift", True))
+        self.min_selected_logit_count = max(
+            1,
+            int(getattr(self.method_cfg, "min_selected_logit_count", 16)),
+        )
+        self.min_loss_improvement = max(
+            0.0,
+            float(getattr(self.method_cfg, "min_loss_improvement", 1.0e-4)),
+        )
         self.consistency_weight = max(
             0.0,
-            float(getattr(self.method_cfg, "consistency_weight", 0.01)),
+            float(getattr(self.method_cfg, "consistency_weight", 0.0)),
         )
         self.entropy_margin_ratio = max(
             0.0,
@@ -395,12 +420,15 @@ class SurgeonLocalTTAUpdater:
         self._edge = edge
         logger.info(
             "[SURGEON] attached training_frame_count={} "
-            "train_sample_count={} num_epoch={} batch_size={} quality_mode={}",
+            "train_sample_count={} num_epoch={} batch_size={} quality_mode={} "
+            "require_drift={} min_selected_logits={}",
             self.training_frame_count,
             self.train_sample_count,
             self.num_epoch,
             self.batch_size,
             self.quality_mode,
+            self.require_drift,
+            self.min_selected_logit_count,
         )
 
     def observe_sample(
@@ -440,16 +468,23 @@ class SurgeonLocalTTAUpdater:
             self._buffer.append(sample)
             if len(self._buffer) < self.training_frame_count:
                 return
+            if self.require_drift and not drift.drift_detected:
+                return
             if self._running_thread is not None and self._running_thread.is_alive():
                 return
             if self._pending_local_update is not None:
                 return
             selected = list(self._buffer)[-int(self.train_sample_count) :]
+            buffered_count = len(self._buffer)
+            # Consume this trigger window. Samples observed while the shadow
+            # model trains may form a later window, but a successful apply
+            # discards them because they came from the old live model.
+            self._buffer.clear()
             logger.info(
                 "[SURGEON] local TTA triggered: low_quality={} "
                 "training_frame_count={} train_sample_count={} "
                 "mini_batch_size={} trigger_frame={}",
-                len(self._buffer),
+                buffered_count,
                 self.training_frame_count,
                 len(selected),
                 self.batch_size,
@@ -458,10 +493,12 @@ class SurgeonLocalTTAUpdater:
             self.metrics.record(
                 "surgeon_tta_triggered",
                 frame_id=int(frame_index),
-                low_quality_sample_count=len(self._buffer),
+                low_quality_sample_count=buffered_count,
                 batch_size=int(self.batch_size),
                 training_frame_count=int(self.training_frame_count),
                 train_sample_count=len(selected),
+                drift_detected=bool(drift.drift_detected),
+                drift_score=float(drift.drift_score),
             )
             self._running_thread = threading.Thread(
                 target=self._run_tta_task,
@@ -621,7 +658,12 @@ class SurgeonLocalTTAUpdater:
                     frame_id=int(trigger_frame_id),
                     batch_size=int(update.batch_size),
                     num_epoch=int(update.num_epoch),
+                    initial_loss=float(update.initial_loss),
                     loss=float(update.loss),
+                    initial_selected_logit_count=int(
+                        update.initial_selected_logit_count
+                    ),
+                    selected_logit_count=int(update.selected_logit_count),
                     model_version_before=str(update.model_version_before),
                 )
             else:
@@ -688,7 +730,12 @@ class SurgeonLocalTTAUpdater:
             snapshot_lock_ms=float(snapshot["snapshot_lock_ms"]),
             batch_size=int(train_result["batch_size"]),
             num_epoch=int(self.num_epoch),
+            initial_loss=float(train_result["initial_loss"]),
             loss=float(train_result["loss"]),
+            initial_selected_logit_count=int(
+                train_result["initial_selected_logit_count"]
+            ),
+            selected_logit_count=int(train_result["selected_logit_count"]),
             trainable_param_count=int(train_result["trainable_param_count"]),
             low_quality_sample_count=len(samples),
             started_perf=float(started_perf),
@@ -758,6 +805,9 @@ class SurgeonLocalTTAUpdater:
             batch_size=int(update.batch_size),
             num_epoch=int(update.num_epoch),
             loss=float(update.loss),
+            initial_loss=float(update.initial_loss),
+            initial_selected_logit_count=int(update.initial_selected_logit_count),
+            selected_logit_count=int(update.selected_logit_count),
             duration_ms=float(duration_ms),
             shadow_train_ms=float(update.shadow_train_ms),
             trainable_param_count=int(update.trainable_param_count),
@@ -778,6 +828,9 @@ class SurgeonLocalTTAUpdater:
         with self._lock:
             if self._pending_local_update is update:
                 self._pending_local_update = None
+            self._buffer.clear()
+        self.drift_detector.reset()
+        self._output_entropy_window.clear()
         return True
 
     def _discard_pending_update_failed(
@@ -904,6 +957,7 @@ class SurgeonLocalTTAUpdater:
         previous_mode = bool(getattr(trainable_model, "training", False))
         module_training_state = _module_training_state(trainable_model)
         grad_state = _parameter_grad_state(trainable_model)
+        batch_norm_tracking_state = _batch_norm_tracking_state(trainable_model)
         train_started = time.perf_counter()
         self.metrics.record(
             "surgeon_tta_shadow_train_started",
@@ -929,8 +983,15 @@ class SurgeonLocalTTAUpdater:
             if not trainable_params:
                 raise _TTASkip("no_trainable_parameters")
             optimizer = self._make_optimizer(trainable_params)
+            _set_batch_norm_tracking(trainable_model, enabled=False)
             if hasattr(trainable_model, "train"):
                 trainable_model.train(True)
+            optimizer.zero_grad(set_to_none=True)
+            initial_objective = self._evaluate_shadow_objective(
+                adapter=adapter,
+                mini_batches=mini_batches,
+                training_device=training_device,
+            )
             losses: list[float] = []
             for epoch_index in range(self.num_epoch):
                 epoch_started = time.perf_counter()
@@ -940,12 +1001,15 @@ class SurgeonLocalTTAUpdater:
                 epoch_consistency_values: list[float] = []
                 epoch_weighted_consistency_values: list[float] = []
                 epoch_logit_count = 0
+                epoch_foreground_logit_count = 0
                 epoch_selected_logit_count = 0
+                epoch_consistency_batch_count = 0
                 for mini_batch in mini_batches:
                     device_batch = _move_batch_to_device(mini_batch, training_device)
                     optimizer.zero_grad(set_to_none=True)
                     outputs = adapter.forward_tta_outputs(device_batch)
                     entropy_loss, loss_stats = adapter.entropy_loss(outputs)
+                    self._require_reliable_logits(loss_stats)
                     loss = entropy_loss
                     consistency_loss_value = 0.0
                     weighted_consistency_loss_value = 0.0
@@ -953,6 +1017,7 @@ class SurgeonLocalTTAUpdater:
                         augmented = adapter.forward_tta_outputs(device_batch, augment=True)
                         consistency = adapter.consistency_loss(outputs, augmented)
                         if consistency is not None:
+                            epoch_consistency_batch_count += 1
                             consistency_loss_value = float(consistency.detach().item())
                             weighted_consistency = self.consistency_weight * consistency
                             weighted_consistency_loss_value = float(
@@ -968,6 +1033,9 @@ class SurgeonLocalTTAUpdater:
                         weighted_consistency_loss_value
                     )
                     epoch_logit_count += int(loss_stats.get("logit_count", 0))
+                    epoch_foreground_logit_count += int(
+                        loss_stats.get("foreground_logit_count", 0)
+                    )
                     epoch_selected_logit_count += int(
                         loss_stats.get("selected_logit_count", 0)
                     )
@@ -990,7 +1058,7 @@ class SurgeonLocalTTAUpdater:
                 logger.info(
                     "[SURGEON][Train] epoch={}/{} loss={:.6f} "
                     "entropy_loss={:.6f} consistency_loss={:.6f} samples={} "
-                    "mini_batch_size={} selected_logits={}/{} model_version={} "
+                    "mini_batch_size={} selected_logits={}/{}/{} model_version={} "
                     "epoch_ms={:.3f}",
                     epoch,
                     self.num_epoch,
@@ -1000,6 +1068,7 @@ class SurgeonLocalTTAUpdater:
                     total_sample_count,
                     mini_batch_size,
                     epoch_selected_logit_count,
+                    epoch_foreground_logit_count,
                     epoch_logit_count,
                     model_version_before,
                     epoch_ms,
@@ -1016,38 +1085,132 @@ class SurgeonLocalTTAUpdater:
                     batch_size=int(total_sample_count),
                     mini_batch_size=int(mini_batch_size),
                     logit_count=int(epoch_logit_count),
+                    foreground_logit_count=int(epoch_foreground_logit_count),
                     selected_logit_count=int(epoch_selected_logit_count),
+                    consistency_batch_count=int(epoch_consistency_batch_count),
                     model_version=str(model_version_before),
                     epoch_ms=float(epoch_ms),
                 )
+            optimizer.zero_grad(set_to_none=True)
+            final_objective = self._evaluate_shadow_objective(
+                adapter=adapter,
+                mini_batches=mini_batches,
+                training_device=training_device,
+            )
+            initial_loss = float(initial_objective["loss"])
+            final_loss = float(final_objective["loss"])
+            accepted = math.isfinite(final_loss) and (
+                final_loss < initial_loss - self.min_loss_improvement
+            )
+            if not accepted:
+                self.metrics.record(
+                    "surgeon_tta_rejected",
+                    frame_id=int(trigger_frame_id),
+                    reason="objective_not_improved",
+                    initial_loss=initial_loss,
+                    final_loss=final_loss,
+                    required_improvement=float(self.min_loss_improvement),
+                    initial_selected_logit_count=int(
+                        initial_objective["selected_logit_count"]
+                    ),
+                    selected_logit_count=int(final_objective["selected_logit_count"]),
+                    model_version_before=str(model_version_before),
+                )
+                raise _TTASkip("objective_not_improved")
             shadow_train_ms = (time.perf_counter() - train_started) * 1000.0
-            final_loss = losses[-1] if losses else 0.0
             self.metrics.record(
                 "surgeon_tta_shadow_train_done",
                 frame_id=int(trigger_frame_id),
                 batch_size=int(total_sample_count),
                 mini_batch_size=int(mini_batch_size),
                 num_epoch=int(self.num_epoch),
+                initial_loss=initial_loss,
                 loss=float(final_loss),
+                training_loss=float(losses[-1] if losses else initial_loss),
+                initial_selected_logit_count=int(
+                    initial_objective["selected_logit_count"]
+                ),
+                selected_logit_count=int(final_objective["selected_logit_count"]),
+                foreground_logit_count=int(final_objective["foreground_logit_count"]),
+                logit_count=int(final_objective["logit_count"]),
                 shadow_train_ms=float(shadow_train_ms),
                 model_version_before=str(model_version_before),
                 trainable_param_count=int(trainable_param_count),
             )
             return {
                 "batch_size": total_sample_count,
+                "initial_loss": initial_loss,
                 "loss": final_loss,
+                "initial_selected_logit_count": int(
+                    initial_objective["selected_logit_count"]
+                ),
+                "selected_logit_count": int(final_objective["selected_logit_count"]),
                 "trainable_param_count": trainable_param_count,
                 "shadow_train_ms": shadow_train_ms,
                 "trained_state_dict": _clone_state_dict_to_cpu(trainable_model.state_dict()),
             }
         finally:
             _clear_gradients(trainable_model)
+            _restore_batch_norm_tracking(trainable_model, batch_norm_tracking_state)
             _restore_parameter_grad_state(trainable_model, grad_state)
             _restore_module_training_state(
                 trainable_model,
                 module_training_state,
                 previous_mode,
             )
+
+    def _evaluate_shadow_objective(
+        self,
+        *,
+        adapter: TTADetectionAdapter,
+        mini_batches: list[list[torch.Tensor]],
+        training_device: torch.device,
+    ) -> dict[str, float | int]:
+        loss_values: list[float] = []
+        entropy_values: list[float] = []
+        consistency_values: list[float] = []
+        logit_count = 0
+        foreground_logit_count = 0
+        selected_logit_count = 0
+        consistency_batch_count = 0
+        for mini_batch in mini_batches:
+            device_batch = _move_batch_to_device(mini_batch, training_device)
+            outputs = adapter.forward_tta_outputs(device_batch)
+            entropy_loss, loss_stats = adapter.entropy_loss(outputs)
+            self._require_reliable_logits(loss_stats)
+            loss = entropy_loss
+            consistency_value = 0.0
+            if self.consistency_weight > 0.0:
+                augmented = adapter.forward_tta_outputs(device_batch, augment=True)
+                consistency = adapter.consistency_loss(outputs, augmented)
+                if consistency is not None:
+                    consistency_batch_count += 1
+                    consistency_value = float(consistency.detach().item())
+                    loss = loss + self.consistency_weight * consistency
+            loss_values.append(float(loss.detach().item()))
+            entropy_values.append(float(entropy_loss.detach().item()))
+            consistency_values.append(consistency_value)
+            logit_count += int(loss_stats.get("logit_count", 0))
+            foreground_logit_count += int(loss_stats.get("foreground_logit_count", 0))
+            selected_logit_count += int(loss_stats.get("selected_logit_count", 0))
+        return {
+            "loss": float(np.mean(loss_values)) if loss_values else float("inf"),
+            "entropy_loss": (
+                float(np.mean(entropy_values)) if entropy_values else float("inf")
+            ),
+            "consistency_loss": (
+                float(np.mean(consistency_values)) if consistency_values else 0.0
+            ),
+            "logit_count": int(logit_count),
+            "foreground_logit_count": int(foreground_logit_count),
+            "selected_logit_count": int(selected_logit_count),
+            "consistency_batch_count": int(consistency_batch_count),
+        }
+
+    def _require_reliable_logits(self, loss_stats: dict[str, Any]) -> None:
+        selected_count = int(loss_stats.get("selected_logit_count", 0))
+        if selected_count < self.min_selected_logit_count:
+            raise _TTASkip("insufficient_reliable_logits")
 
     def _apply_shadow_update_locked(
         self,
@@ -1302,10 +1465,27 @@ def _background_is_last(mode: object) -> bool:
     return str(mode or "").strip().lower().endswith("_bg_last")
 
 
-def _drop_last_background_logits(logits: torch.Tensor, mode: object) -> torch.Tensor:
-    if _background_is_last(mode) and logits.shape[-1] > 1:
-        return logits[..., :-1]
-    return logits
+def _align_horizontally_flipped_logits(
+    logits: torch.Tensor,
+    outputs: Any,
+) -> torch.Tensor | None:
+    if not isinstance(logits, torch.Tensor):
+        return None
+    if logits.ndim == 2:
+        # Image-level logits have no spatial axis to realign.
+        return logits
+    if not isinstance(outputs, dict):
+        return None
+    flip_dim = outputs.get("_tta_horizontal_flip_dim")
+    try:
+        parsed_dim = int(flip_dim)
+    except (TypeError, ValueError):
+        return None
+    if parsed_dim < 0:
+        parsed_dim += logits.ndim
+    if parsed_dim <= 0 or parsed_dim >= logits.ndim:
+        return None
+    return torch.flip(logits, dims=(parsed_dim,))
 
 
 def _logit_rows(logits: torch.Tensor) -> torch.Tensor | None:
@@ -1332,6 +1512,35 @@ def _logit_rows(logits: torch.Tensor) -> torch.Tensor | None:
 
 def _parameter_grad_state(model: torch.nn.Module) -> dict[str, bool]:
     return {name: bool(param.requires_grad) for name, param in model.named_parameters()}
+
+
+def _batch_norm_tracking_state(model: torch.nn.Module) -> dict[str, bool]:
+    return {
+        name: bool(module.track_running_stats)
+        for name, module in model.named_modules()
+        if isinstance(
+            module,
+            (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d),
+        )
+    }
+
+
+def _set_batch_norm_tracking(model: torch.nn.Module, *, enabled: bool) -> None:
+    for module in model.modules():
+        if isinstance(
+            module,
+            (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d),
+        ):
+            module.track_running_stats = bool(enabled)
+
+
+def _restore_batch_norm_tracking(model: torch.nn.Module, state: dict[str, bool]) -> None:
+    for name, module in model.named_modules():
+        if isinstance(
+            module,
+            (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d),
+        ):
+            module.track_running_stats = bool(state.get(name, module.track_running_stats))
 
 
 def _module_training_state(model: torch.nn.Module) -> dict[str, bool]:

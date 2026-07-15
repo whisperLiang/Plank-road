@@ -29,7 +29,16 @@ baseline:
   quality_mode: output_only_when_no_boundary
   trainable_scope: norm_affine
   train_sample_count: 16
-  consistency_weight: 0.01
+  # Keep local TTA conservative: require a persistent drift window, adapt for
+  # only a few steps, and reject updates supported by too few confident logits.
+  num_epoch: 3
+  require_drift: true
+  min_detection_confidence: 0.6
+  min_selected_logit_count: 16
+  min_loss_improvement: 0.0001
+  # YOLO exposes flattened multi-scale logits without a safe horizontal-flip
+  # correspondence map, so the consistency term stays disabled by default.
+  consistency_weight: 0.0
   entropy_margin_ratio: 0.4
  CATR:
   # Engineering variant for this refactor: this reuses the existing
