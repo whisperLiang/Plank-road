@@ -66,6 +66,12 @@ METHOD_MARKERS = {
     "CATR": "s",
     "Ekya": "^",
 }
+METHOD_LINESTYLES = {
+    "plank_road": "-",
+    "SURGEON": (0, (4.0, 2.0)),
+    "CATR": (0, (1.5, 1.25)),
+    "Ekya": (0, (5.0, 1.5, 1.0, 1.5)),
+}
 COMPONENT_COLORS = {
     "transmit": "#7EA7C8",
     "upload": "#7EA7C8",
@@ -129,6 +135,10 @@ def _method_color(method: str) -> str:
 
 def _method_marker(method: str) -> str:
     return METHOD_MARKERS.get(_method_id(method), "o")
+
+
+def _method_linestyle(method: str) -> str | tuple[int, tuple[float, ...]]:
+    return METHOD_LINESTYLES.get(_method_id(method), "-")
 
 
 def _fig3_method_tick_label(method: str) -> str:
@@ -372,18 +382,18 @@ def _paired_trigger_index(
     return max(candidates, key=lambda item: _event_sort_time(item[1]))[0]
 
 
-def _event_frames_by_name(
+def _paired_event_frames(
     event_rows: Sequence[Mapping[str, Any]],
     timestamped: Mapping[FrameKey, Sequence[tuple[int, float]]],
     *,
     scenario: str,
     method: str,
-) -> tuple[dict[str, list[float]], dict[str, int]]:
+) -> tuple[list[tuple[float, float]], dict[str, int]]:
     event_groups: dict[str, dict[str, list[Mapping[str, Any]]]] = defaultdict(
         lambda: defaultdict(list)
     )
     omitted = {"trigger_decision": 0, "model_update_applied": 0}
-    positions: dict[str, list[float]] = defaultdict(list)
+    pairs: list[tuple[float, float]] = []
     for row in event_rows:
         if row.get("scenario_name") != scenario or _method_id(row.get("method")) != method:
             continue
@@ -416,10 +426,10 @@ def _event_frames_by_name(
                 if update_frame is None:
                     omitted["model_update_applied"] += 1
                 continue
-            positions["trigger_decision"].append(float(trigger_frame))
-            positions["model_update_applied"].append(float(update_frame))
+            pairs.append((float(trigger_frame), float(update_frame)))
         omitted["trigger_decision"] += len(unused_triggers)
-    return {event_name: sorted(values) for event_name, values in positions.items()}, omitted
+    return sorted(pairs), omitted
+
 
 def _run_series_for(
     series_by_run: Mapping[FrameKey, Mapping[int, float]],
@@ -434,40 +444,35 @@ def _run_series_for(
     }
 
 
-def _aggregate_runs_at_coordinates(
+def _aggregate_runs_in_frame_bins(
     run_series: Mapping[str, Mapping[int, float]],
-) -> tuple[list[float], list[float], list[float], bool]:
+) -> tuple[list[float], list[float], list[float]]:
     if not run_series:
-        return [], [], [], False
-    frame_sets = [set(series) for series in run_series.values() if series]
-    if not frame_sets:
-        return [], [], [], False
-    common = set.intersection(*frame_sets) if len(frame_sets) > 1 else set(frame_sets[0])
-    used_bins = False
-    if common:
-        x_values = sorted(common)
-        per_x = [[series[x] for series in run_series.values() if x in series] for x in x_values]
-    else:
-        used_bins = True
-        binned: dict[str, dict[int, float]] = {}
-        for run_id, series in run_series.items():
-            buckets: dict[int, list[float]] = defaultdict(list)
-            for frame_id, value in series.items():
-                bucket = (int(frame_id) // FRAME_BIN_SIZE) * FRAME_BIN_SIZE
-                buckets[bucket].append(float(value))
-            binned[run_id] = {
-                bucket: float(np.mean(values)) for bucket, values in buckets.items()
-            }
-        bucket_sets = [set(series) for series in binned.values() if series]
-        common_buckets = set.intersection(*bucket_sets) if len(bucket_sets) > 1 else set(
-            bucket_sets[0] if bucket_sets else []
-        )
-        x_values = sorted(common_buckets)
-        per_x = [[series[x] for series in binned.values() if x in series] for x in x_values]
-        x_values = [x + FRAME_BIN_SIZE / 2.0 for x in x_values]
+        return [], [], []
+    binned: dict[str, dict[int, float]] = {}
+    for run_id, series in run_series.items():
+        buckets: dict[int, list[float]] = defaultdict(list)
+        for frame_id, value in series.items():
+            frame_number = max(1, int(frame_id))
+            bucket_start = (
+                ((frame_number - 1) // FRAME_BIN_SIZE) * FRAME_BIN_SIZE + 1
+            )
+            buckets[bucket_start].append(float(value))
+        binned[run_id] = {
+            bucket: float(np.mean(values)) for bucket, values in buckets.items()
+        }
+    bucket_sets = [set(series) for series in binned.values() if series]
+    if not bucket_sets:
+        return [], [], []
+    common_buckets = (
+        set.intersection(*bucket_sets) if len(bucket_sets) > 1 else set(bucket_sets[0])
+    )
+    x_values = sorted(common_buckets)
+    per_x = [[series[x] for series in binned.values()] for x in x_values]
     means = [float(np.mean(values)) for values in per_x if values]
     stds = [float(np.std(values)) for values in per_x if values]
-    return [float(x) for x in x_values], means, stds, used_bins
+    bin_centers = [float(x + (FRAME_BIN_SIZE - 1) / 2.0) for x in x_values]
+    return bin_centers, means, stds
 
 
 def _legend_handles(methods: Iterable[str]) -> list[Line2D]:
@@ -479,6 +484,20 @@ def _legend_handles(methods: Iterable[str]) -> list[Line2D]:
             marker=_method_marker(method),
             linewidth=1.35,
             markersize=4,
+            label=_method_label(method),
+        )
+        for method in _method_order(methods)
+    ]
+
+
+def _fig1_legend_handles(methods: Iterable[str]) -> list[Line2D]:
+    return [
+        Line2D(
+            [0],
+            [0],
+            color=_method_color(method),
+            linestyle=_method_linestyle(method),
+            linewidth=1.6,
             label=_method_label(method),
         )
         for method in _method_order(methods)
@@ -503,126 +522,228 @@ def _plot_fig1(
     selected_scenario = _single_figure_scenario(frame_rows)
     if selected_scenario is None:
         return [], "formal Suwon scenario data missing", partial, {}
-    scenarios = [selected_scenario]
+    scenario_methods = _method_order(
+        row.get("method", "")
+        for row in frame_rows
+        if row.get("scenario_name") == selected_scenario
+    )
+    if not scenario_methods:
+        return [], "accuracy data missing for formal Suwon scenarios", partial, {}
     series_by_run = _frame_series_by_run(frame_rows, metric)
     timestamped = _timestamped_frames(frame_rows)
-    fig, axes = plt.subplots(
-        1,
-        len(scenarios),
-        figsize=(7.1, 3.65),
-        squeeze=False,
-        sharey=True,
-        constrained_layout=True,
-    )
-    axes_list = list(axes[0])
-    plotted_methods: set[str] = set()
-    plotted_values: list[float] = []
-    used_bin = False
-    marker_count = 0
+    event_pairs: dict[str, list[tuple[float, float]]] = {}
     event_counts: dict[str, dict[str, int]] = {}
     unpaired_event_counts: dict[str, dict[str, int]] = {}
-    for axis, scenario in zip(axes_list, scenarios):
-        scenario_methods = _method_order(
-            row.get("method", "") for row in frame_rows if row.get("scenario_name") == scenario
+    marker_count = 0
+    for method in scenario_methods:
+        pairs, omitted_events = _paired_event_frames(
+            event_rows,
+            timestamped,
+            scenario=selected_scenario,
+            method=method,
         )
-        if not scenario_methods:
-            partial.append(f"{scenario}: scenario data missing for Fig.1")
-        for method in scenario_methods:
-            run_series = _run_series_for(series_by_run, scenario=scenario, method=method)
-            if len(run_series) < 2:
-                partial.append(
-                    f"{scenario}/{_method_label(method)} has fewer than 2 repeats for Fig.1"
-                )
-            x_values, y_mean, y_std, binned = _aggregate_runs_at_coordinates(run_series)
-            if not x_values:
-                partial.append(
-                    f"{scenario}/{_method_label(method)} has no shared frame coordinates for Fig.1"
-                )
-                continue
-            used_bin = used_bin or binned
-            plotted_methods.add(method)
-            plotted_values.extend(y_mean)
-            color = _method_color(method)
-            axis.plot(
+        event_pairs[method] = pairs
+        marker_count += 2 * len(pairs)
+        method_key = f"{selected_scenario}/{_method_label(method)}"
+        event_counts[method_key] = {
+            "trigger_decision": len(pairs),
+            "model_update_applied": len(pairs),
+        }
+        unpaired_event_counts[method_key] = omitted_events
+        if any(omitted_events.values()):
+            partial.append(
+                f"{method_key} omitted unpaired Fig.1 events: "
+                f"{omitted_events['trigger_decision']} trigger_decision, "
+                f"{omitted_events['model_update_applied']} model_update_applied"
+            )
+
+    has_event_strip = marker_count > 0
+    fig = plt.figure(figsize=(7.1, 3.35 if has_event_strip else 2.85))
+    if has_event_strip:
+        grid = fig.add_gridspec(
+            2,
+            1,
+            height_ratios=(4.6, 1.0),
+            hspace=0.08,
+        )
+        axis = fig.add_subplot(grid[0, 0])
+        event_axis: plt.Axes | None = fig.add_subplot(grid[1, 0], sharex=axis)
+        fig.subplots_adjust(left=0.09, right=0.985, top=0.86, bottom=0.15)
+    else:
+        axis = fig.add_subplot(1, 1, 1)
+        event_axis = None
+        fig.subplots_adjust(left=0.09, right=0.985, top=0.84, bottom=0.19)
+    plotted_methods: set[str] = set()
+    plotted_values: list[float] = []
+    for method in scenario_methods:
+        run_series = _run_series_for(
+            series_by_run,
+            scenario=selected_scenario,
+            method=method,
+        )
+        if len(run_series) < 2:
+            partial.append(
+                f"{selected_scenario}/{_method_label(method)} has fewer than 2 repeats for Fig.1"
+            )
+        x_values, y_mean, y_std = _aggregate_runs_in_frame_bins(run_series)
+        if not x_values:
+            partial.append(
+                f"{selected_scenario}/{_method_label(method)} has no shared 50-frame bins for Fig.1"
+            )
+            continue
+        plotted_methods.add(method)
+        plotted_values.extend(y_mean)
+        color = _method_color(method)
+        axis.plot(
+            x_values,
+            y_mean,
+            color=color,
+            linestyle=_method_linestyle(method),
+            linewidth=1.55,
+            solid_capstyle="round",
+        )
+        if any(value > 0 for value in y_std):
+            lower = np.array(y_mean) - np.array(y_std)
+            upper = np.array(y_mean) + np.array(y_std)
+            plotted_values.extend(lower.tolist())
+            plotted_values.extend(upper.tolist())
+            axis.fill_between(
                 x_values,
-                y_mean,
+                lower,
+                upper,
                 color=color,
-                linewidth=1.35,
-                marker=_method_marker(method),
-                markevery=[-1] if len(x_values) else None,
-                markersize=3.3,
-                markeredgecolor="white",
-                markeredgewidth=0.35,
+                alpha=0.12,
+                linewidth=0,
             )
-            if any(value > 0 for value in y_std):
-                lower = np.array(y_mean) - np.array(y_std)
-                upper = np.array(y_mean) + np.array(y_std)
-                axis.fill_between(
-                    x_values,
-                    lower,
-                    upper,
+
+    axis.text(
+        0.01,
+        0.97,
+        selected_scenario,
+        transform=axis.transAxes,
+        ha="left",
+        va="top",
+        fontsize=7.5,
+        fontweight="semibold",
+        color="#333333",
+    )
+    axis.set_ylabel(ylabel)
+    axis.xaxis.set_major_locator(MaxNLocator(nbins=6))
+    _style_axis(axis, grid_axis="y")
+    _set_tight_ylim(axis, plotted_values, floor=0.0)
+
+    if event_axis is not None:
+        row_positions = {
+            method: len(scenario_methods) - index - 1
+            for index, method in enumerate(scenario_methods)
+        }
+        for method, row_position in row_positions.items():
+            event_axis.axhline(
+                row_position,
+                color="#E3E3E3",
+                linewidth=0.45,
+                zorder=0,
+            )
+            color = _method_color(method)
+            for trigger_frame, update_frame in event_pairs[method]:
+                event_axis.plot(
+                    [trigger_frame, update_frame],
+                    [row_position, row_position],
                     color=color,
-                    alpha=0.16,
-                    linewidth=0,
+                    linewidth=1.05,
+                    alpha=0.7,
+                    solid_capstyle="round",
+                    zorder=2,
                 )
-        for method in scenario_methods:
-            positions, omitted_events = _event_frames_by_name(
-                event_rows,
-                timestamped,
-                scenario=scenario,
-                method=method,
-            )
-            method_key = f"{scenario}/{_method_label(method)}"
-            event_counts[method_key] = {
-                "trigger_decision": len(positions.get("trigger_decision", [])),
-                "model_update_applied": len(positions.get("model_update_applied", [])),
-            }
-            unpaired_event_counts[method_key] = omitted_events
-            if any(omitted_events.values()):
-                partial.append(
-                    f"{method_key} omitted unpaired Fig.1 events: "
-                    f"{omitted_events['trigger_decision']} trigger_decision, "
-                    f"{omitted_events['model_update_applied']} model_update_applied"
+                event_axis.scatter(
+                    [trigger_frame],
+                    [row_position],
+                    marker="^",
+                    s=16,
+                    color=color,
+                    edgecolor="white",
+                    linewidth=0.3,
+                    zorder=3,
                 )
-            for event_name, marker in (
-                ("trigger_decision", "^"),
-                ("model_update_applied", "*"),
-            ):
-                frames = positions.get(event_name, [])
-                for frame in frames:
-                    marker_count += 1
-                    axis.axvline(
-                        frame,
-                        color=_method_color(method),
-                        linewidth=0.7,
-                        alpha=0.2,
-                        linestyle="--" if event_name == "trigger_decision" else ":",
-                    )
-                    y = 0.05 if event_name == "trigger_decision" else 0.12
-                    axis.scatter(
-                        [frame],
-                        [y],
-                        transform=axis.get_xaxis_transform(),
-                        marker=marker,
-                        s=30 if marker == "^" else 48,
-                        color=_method_color(method),
-                        edgecolor="white",
-                        linewidth=0.4,
-                        zorder=5,
-                        clip_on=False,
-                    )
-        axis.set_title(scenario)
+                event_axis.scatter(
+                    [update_frame],
+                    [row_position],
+                    marker="*",
+                    s=26,
+                    color=color,
+                    edgecolor="white",
+                    linewidth=0.3,
+                    zorder=3,
+                )
+        event_axis.set_ylim(-0.65, len(scenario_methods) - 0.35)
+        event_axis.set_yticks(
+            [row_positions[method] for method in scenario_methods],
+            [_method_label(method) for method in scenario_methods],
+        )
+        event_axis.tick_params(axis="y", length=0, labelsize=5.5, pad=3)
+        event_axis.tick_params(axis="x", colors="#4D4D4D", length=2.5, width=0.7)
+        event_axis.set_xlabel("Frame ID")
+        event_axis.text(
+            0.0,
+            1.04,
+            "Adaptation cycles",
+            transform=event_axis.transAxes,
+            ha="left",
+            va="bottom",
+            fontsize=5.8,
+            fontweight="semibold",
+            color="#4D4D4D",
+        )
+        event_axis.legend(
+            handles=[
+                Line2D(
+                    [0],
+                    [0],
+                    color="none",
+                    marker="^",
+                    markerfacecolor="#555555",
+                    markeredgecolor="none",
+                    markersize=3.8,
+                    label="Trigger",
+                ),
+                Line2D(
+                    [0],
+                    [0],
+                    color="none",
+                    marker="*",
+                    markerfacecolor="#555555",
+                    markeredgecolor="none",
+                    markersize=5.0,
+                    label="Update",
+                ),
+            ],
+            loc="lower right",
+            bbox_to_anchor=(1.0, 1.01),
+            ncol=2,
+            handlelength=0.7,
+            handletextpad=0.25,
+            columnspacing=0.9,
+            borderaxespad=0.0,
+            fontsize=5.5,
+        )
+        for spine in ("left", "right", "top"):
+            event_axis.spines[spine].set_visible(False)
+        event_axis.spines["bottom"].set_color("#4D4D4D")
+        event_axis.spines["bottom"].set_linewidth(0.8)
+        axis.tick_params(axis="x", labelbottom=False, bottom=False)
+    else:
         axis.set_xlabel("Frame ID")
-        axis.xaxis.set_major_locator(MaxNLocator(nbins=5))
-        _style_axis(axis, grid_axis="both")
-    axes_list[0].set_ylabel(ylabel)
-    _set_tight_ylim(axes_list[0], plotted_values, floor=0.0)
+
     if plotted_methods:
-        fig.legend(
-            handles=_legend_handles(plotted_methods),
-            loc="lower center",
+        axis.legend(
+            handles=_fig1_legend_handles(plotted_methods),
+            loc="upper center",
             ncol=min(4, len(plotted_methods)),
-            bbox_to_anchor=(0.5, -0.04),
+            bbox_to_anchor=(0.5, 1.16),
+            columnspacing=1.4,
+            handlelength=2.6,
+            handletextpad=0.5,
+            borderaxespad=0.0,
         )
     if event_rows and marker_count == 0:
         partial.append(
@@ -633,9 +754,24 @@ def _plot_fig1(
         return [], "accuracy data missing for formal Suwon scenarios", partial, {}
     metadata = {
         "selected_scenario": selected_scenario,
-        "frame_bin_size": FRAME_BIN_SIZE if used_bin else None,
-        "variability": "standard deviation across repeated runs",
+        "frame_bin_size": FRAME_BIN_SIZE,
+        "curve_aggregation": (
+            "within-run mean per non-overlapping 50-frame bin, then mean across repeated runs"
+        ),
+        "variability": (
+            "standard deviation across run-level bin means; omitted when only one run is available"
+        ),
+        "layout": (
+            "accuracy_hero_with_method_aligned_adaptation_cycle_strip"
+            if has_event_strip
+            else "accuracy_hero_without_event_strip"
+        ),
         "event_markers": "paired trigger/update frames" if marker_count else "omitted",
+        "event_layer": (
+            "trigger-to-update intervals in a separate method-aligned strip"
+            if marker_count
+            else "omitted"
+        ),
         "event_marker_policy": (
             "only trigger_decision events paired to a later model_update_applied are shown"
         ),

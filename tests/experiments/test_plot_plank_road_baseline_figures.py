@@ -15,6 +15,7 @@ from tools.experiments.experiment_common import (
 from tools.experiments.plot_plank_road_baseline_figures import (
     EXPORT_SUFFIXES,
     SCENARIO_ORDER,
+    _aggregate_runs_in_frame_bins,
     plot_figures,
 )
 
@@ -41,6 +42,19 @@ OLD_FIGURE_STEMS = (
     "fig7_resource_timeline",
     "fig8_component_ablation_style_summary",
 )
+
+
+def test_fig1_aggregates_within_runs_before_combining_frame_bins() -> None:
+    x_values, means, stds = _aggregate_runs_in_frame_bins(
+        {
+            "run-1": {1: 0.2, 50: 0.4, 51: 0.6, 100: 0.8},
+            "run-2": {1: 0.4, 50: 0.6, 51: 0.8, 100: 1.0},
+        }
+    )
+
+    assert x_values == [25.5, 75.5]
+    assert means == [0.4, 0.8]
+    assert [round(value, 6) for value in stds] == [0.1, 0.1]
 
 
 def _write_complete_normalized(normalized: Path, *, repeats: int = 3) -> None:
@@ -229,7 +243,17 @@ def test_complete_normalized_data_generates_exactly_three_figure_sets(tmp_path: 
         "standard error of summary.mean_latency_ms across runs"
     )
     fig1_metadata = report["figure_metadata"]["fig1_dynamic_accuracy_recovery"]
+    assert fig1_metadata["frame_bin_size"] == 50
+    assert fig1_metadata["curve_aggregation"] == (
+        "within-run mean per non-overlapping 50-frame bin, then mean across repeated runs"
+    )
+    assert fig1_metadata["layout"] == (
+        "accuracy_hero_with_method_aligned_adaptation_cycle_strip"
+    )
     assert fig1_metadata["event_markers"] == "paired trigger/update frames"
+    assert fig1_metadata["event_layer"] == (
+        "trigger-to-update intervals in a separate method-aligned strip"
+    )
     assert fig1_metadata["event_marker_policy"] == (
         "only trigger_decision events paired to a later model_update_applied are shown"
     )

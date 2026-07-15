@@ -124,19 +124,8 @@ class EkyaStyleCloudSchedulingConfig:
     evaluation: EvaluationConfig
     scheduler: SchedulerConfig
     retraining: RetrainingConfig
-    allow_model_override: bool = False
 
     def validate(self) -> None:
-        if not self.allow_model_override and self.student_model != "rfdetr_nano":
-            raise ValueError(
-                "Ekya.student_model must be rfdetr_nano "
-                "unless allow_model_override=true"
-            )
-        if not self.allow_model_override and self.teacher_model != "rtdetr_x":
-            raise ValueError(
-                "Ekya.teacher_model must be rtdetr_x "
-                "unless allow_model_override=true"
-            )
         if self.window_size <= 0:
             raise ValueError("Ekya.window_size must be positive")
         if self.training_frame_count <= 0:
@@ -233,16 +222,14 @@ def parse_ekya_style_config(
     source = _get(client, "source", None)
     student_model = str(
         _required_value(
-            _configured_value(
-                _get(section, "student_model", None), _get(server, "edge_model_name", None)
-            ),
-            "Ekya.student_model",
+            _get(server, "edge_model_name", None),
+            "server.edge_model_name",
         )
     )
     teacher_model = str(
         _required_value(
-            _configured_value(_get(section, "teacher_model", None), _get(server, "golden", None)),
-            "Ekya.teacher_model",
+            _get(server, "golden", None),
+            "server.golden",
         )
     )
     resolved_video_path = str(
@@ -320,7 +307,6 @@ def parse_ekya_style_config(
         retraining=_retraining_config(
             _get(section, "retraining", None), server=server, baseline=baseline
         ),
-        allow_model_override=bool(_get(section, "allow_model_override", False)),
     )
     config.validate()
     return config

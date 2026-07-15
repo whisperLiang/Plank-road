@@ -444,13 +444,10 @@ class EkyaRetrainingConfig(ConfigSection):
 
 @dataclass
 class EkyaStyleCloudSchedulingServerConfig(ConfigSection):
-    student_model: str | None = None
-    teacher_model: str | None = None
     video_path: str | None = None
     num_frames: int | None = None
     window_size: int | None = None
     seed: int = 42
-    allow_model_override: bool = False
     edge_streaming: EkyaEdgeStreamingConfig = field(default_factory=EkyaEdgeStreamingConfig)
     cloud_inference: EkyaCloudInferenceConfig = field(default_factory=EkyaCloudInferenceConfig)
     teacher_labeling: EkyaTeacherLabelingConfig = field(default_factory=EkyaTeacherLabelingConfig)
@@ -746,7 +743,14 @@ def _reject_removed_ekya_config_fields(
     removed_by_section = {
         "server.baselines.Ekya": (
             ekya_cfg,
-            {"enabled", "offline_cloud_video_debug", "logging"},
+            {
+                "allow_model_override",
+                "enabled",
+                "offline_cloud_video_debug",
+                "logging",
+                "student_model",
+                "teacher_model",
+            },
         ),
         "server.baselines.Ekya.edge_streaming": (
             ekya_cfg.edge_streaming,
@@ -1018,26 +1022,6 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     _reject_removed_ekya_config_fields(ekya_cfg)
     accuracy_cfg = config.baseline.CATR
     continual_learning = config.server.continual_learning
-    resolved_student_model = str(
-        _configured_value(ekya_cfg.student_model, config.server.edge_model_name)
-    )
-    resolved_teacher_model = str(
-        _configured_value(ekya_cfg.teacher_model, config.server.golden)
-    )
-    ekya_baseline_active = bool(config.baseline.enabled) and str(config.baseline.method) == (
-        "Ekya"
-    )
-    if ekya_baseline_active and not bool(ekya_cfg.allow_model_override):
-        if resolved_student_model != "rfdetr_nano":
-            raise ValueError(
-                "server.baselines.Ekya.student_model "
-                "must be rfdetr_nano unless allow_model_override=true"
-            )
-        if resolved_teacher_model != "rtdetr_x":
-            raise ValueError(
-                "server.baselines.Ekya.teacher_model "
-                "must be rtdetr_x unless allow_model_override=true"
-            )
     cloud_score_threshold = _configured_value(
         ekya_cfg.cloud_inference.score_threshold,
         config.client.final_detection_threshold,

@@ -109,10 +109,12 @@ The main plotting command emits exactly:
 ## Figure Semantics
 
 Fig. 1, Dynamic Accuracy Recovery, shows Teacher-supervised F1 over frame ID
-for Rainy and Snowy. Each method curve is the mean across repeats, with
-a standard-deviation band. The plotter does not interpolate missing frame IDs.
-Trigger and update markers show paired adaptation cycles; unpaired trigger or
-update events are omitted from the marker layer and reported.
+for Rainy and Snowy. Each run is first averaged in non-overlapping 50-frame
+bins; each method curve is then the mean across repeats, with a
+standard-deviation band across run-level bin means. The plotter does not
+interpolate missing frame IDs. A compact method-aligned strip below the curves
+shows paired trigger-to-update adaptation intervals; unpaired trigger or update
+events are omitted from the marker layer and reported.
 
 Fig. 2, Accuracy vs Average Training Time, shows one repeated-run ellipse per
 scenario and method. The X center is mean training time in seconds from

@@ -12,6 +12,46 @@ def test_default_config_loads_for_main_runtime() -> None:
     assert config.server.edge_model_name == "yolo26n"
 
 
+def test_ekya_uses_common_server_models_without_method_override(tmp_path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+baseline:
+  enabled: true
+  method: Ekya
+server:
+  edge_model_name: yolo26n
+  golden: rtdetr_x
+""",
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(path)
+
+    assert config.server.edge_model_name == "yolo26n"
+    assert config.server.golden == "rtdetr_x"
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["student_model", "teacher_model", "allow_model_override"],
+)
+def test_removed_ekya_model_override_fields_are_rejected(tmp_path, field: str) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        f"""
+server:
+  baselines:
+    Ekya:
+      {field}: legacy_value
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=field):
+        load_runtime_config(path)
+
+
 @pytest.mark.parametrize(
     ("env_name", "attribute_path", "expected"),
     [

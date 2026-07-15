@@ -804,11 +804,18 @@ class SurgeonLocalTTAUpdater:
         )
         if not hasattr(trainable_model, "state_dict"):
             raise _TTASkip("model_state_unavailable")
+        try:
+            num_classes = int(getattr(live_model, "num_classes"))
+        except (AttributeError, TypeError, ValueError):
+            num_classes = None
+        if num_classes is not None and num_classes <= 0:
+            num_classes = None
         state_dict = _clone_state_dict_to_cpu(trainable_model.state_dict())
         snapshot_lock_ms = (time.perf_counter() - started) * 1000.0
         return {
             "live_model_ref": live_model,
             "model_name": str(getattr(detector, "model_name", "") or ""),
+            "num_classes": num_classes,
             "model_class": type(live_model).__name__,
             "trainable_model_class": type(trainable_model).__name__,
             "device": _model_device(trainable_model),
@@ -857,6 +864,9 @@ class SurgeonLocalTTAUpdater:
             ) from deepcopy_exc
         detector_config = getattr(detector, "config", None)
         build_kwargs: dict[str, Any] = {}
+        num_classes = snapshot.get("num_classes")
+        if num_classes is not None:
+            build_kwargs["num_classes"] = int(num_classes)
         try:
             if get_model_family(model_name) == "tinynext":
                 configured_input_size = getattr(detector_config, "tinynext_input_size", None)

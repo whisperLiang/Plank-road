@@ -49,8 +49,6 @@ def _capture_info_logs(action):
 
 def _runtime(tmp_path: Path):
     ekya = SimpleNamespace(
-        student_model="rfdetr_nano",
-        teacher_model="rtdetr_x",
         video_path="./video_data/road.mp4",
         num_frames=4,
         window_size=2,
@@ -510,12 +508,17 @@ def test_controller_training_window_rejects_unlabeled_previous_window(
         controller._training_window_and_labels_for(current, _teacher_labels(3, 4))
 
 
-def test_ekya_config_validation_rejects_wrong_default_student(tmp_path: Path) -> None:
+def test_ekya_config_reuses_common_server_models(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
-    runtime.server.baselines.Ekya.student_model = "tinynext_s"
+    runtime.server.edge_model_name = "yolo26n"
+    runtime.server.golden = "rtdetr_x"
+    runtime.server.baselines.Ekya.student_model = "legacy_student"
+    runtime.server.baselines.Ekya.teacher_model = "legacy_teacher"
 
-    with pytest.raises(ValueError, match="student_model"):
-        parse_ekya_style_config(runtime, run_id="run")
+    cfg = parse_ekya_style_config(runtime, run_id="run")
+
+    assert cfg.student_model == "yolo26n"
+    assert cfg.teacher_model == "rtdetr_x"
 
 
 def test_ekya_training_admission_config_defaults_and_validation(tmp_path: Path) -> None:

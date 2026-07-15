@@ -10,8 +10,8 @@ import numpy as np
 import pytest
 import torch
 
-from baselines.runtime import BaselineEdgeAdapter
-from baselines.runtime.surgeon_tta import TTADetectionAdapter
+from baselines.runtime import BaselineEdgeAdapter, surgeon_tta
+from baselines.runtime.surgeon_tta import SurgeonLocalTTAUpdater, TTADetectionAdapter
 
 
 def _config(tmp_path: Path) -> SimpleNamespace:
@@ -407,6 +407,43 @@ def test_shadow_training_does_not_hold_live_model_lock(tmp_path) -> None:
         BlockingToyTTAModel.entered_event = None
         BlockingToyTTAModel.release_event = None
         adapter.close()
+
+
+def test_shadow_model_zoo_fallback_preserves_live_num_classes(
+    tmp_path, monkeypatch
+) -> None:
+    live_model = ToyTTAModel()
+    live_model.num_classes = 8
+    live_model.confidence = 0.2
+    detector = FakeDetector(live_model)
+    detector.model_name = "yolo26n"
+    detector.config = SimpleNamespace()
+    updater = SurgeonLocalTTAUpdater(
+        _config(tmp_path),
+        SimpleNamespace(record=lambda *args, **kwargs: None),
+    )
+    updater._edge = SimpleNamespace(model_version="0")
+    snapshot = updater._snapshot_live_model_locked(detector, live_model)
+    captured: dict[str, object] = {}
+
+    def fake_build_detection_model(model_name, **kwargs):
+        captured["model_name"] = model_name
+        captured.update(kwargs)
+        return ToyTTAModel()
+
+    def fail_deepcopy(_model):
+        raise RuntimeError("forced deepcopy failure")
+
+    monkeypatch.setattr(surgeon_tta, "build_detection_model", fake_build_detection_model)
+    monkeypatch.setattr(surgeon_tta.copy, "deepcopy", fail_deepcopy)
+
+    shadow_model = updater._build_shadow_training_model(detector, snapshot)
+
+    assert isinstance(shadow_model, ToyTTAModel)
+    assert captured["model_name"] == "yolo26n"
+    assert captured["num_classes"] == 8
+    assert captured["pretrained"] is False
+    assert _states_equal(_clone_state(live_model), _clone_state(shadow_model))
 
 
 def test_pending_local_update_defers_when_model_lock_is_busy(tmp_path) -> None:

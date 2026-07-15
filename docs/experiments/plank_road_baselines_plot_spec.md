@@ -19,7 +19,7 @@ omitted and reported in `plot_report.json`.
 
 | Figure | Output stem | Layout | Inputs | Metric definition | Missing-data behavior |
 |---|---|---|---|---|---|
-| Fig. 1 Dynamic Accuracy Recovery | `fig1_dynamic_accuracy_recovery` | One large scenario panel with four method curves, selecting the available formal scenario with the most frame rows | `frame_metrics.csv`, `adaptation_events.csv`, `normalization_report.json` | Mean Teacher-supervised F1 across repeated runs; shaded band is standard deviation; trigger and update markers show paired adaptation cycles | Skip if frame-level accuracy is absent; do not interpolate frame IDs; omit unpaired trigger/update events from the marker layer and report them; use fixed 50-frame bins only when repeats have no exact shared frame IDs, and report the bin size |
+| Fig. 1 Dynamic Accuracy Recovery | `fig1_dynamic_accuracy_recovery` | One accuracy hero panel plus a compact, method-aligned adaptation-cycle strip, selecting the available formal scenario with the most frame rows | `frame_metrics.csv`, `adaptation_events.csv`, `normalization_report.json` | Within-run mean Teacher-supervised F1 in non-overlapping 50-frame bins, then mean across repeated runs; shaded band is the standard deviation across run-level bin means; paired trigger-to-update intervals appear in the lower strip | Skip if frame-level accuracy is absent; do not interpolate frame IDs; retain only bins shared by repeated runs; omit unpaired trigger/update events from the marker layer and report them |
 | Fig. 2 Accuracy vs Average Training Time | `fig2_accuracy_retraining_time_tradeoff` | Only formal scenario panels with valid points; each method is an ellipse or point | `summary.csv` | X is `mean_training_ms / 1000`; Y is `mean_f1` | Draw a point without ellipse if fewer than two valid repeats exist; omit runs missing either summary value |
 | Fig. 3 Average Time Cost for Retraining Breakdown | `fig3_retraining_time_breakdown` | Only formal scenario groups with latency rows, using one dual-axis panel with stacked retraining bars and overlaid inference-latency lollipop markers | `latency_breakdown.csv`, `summary.csv` | Left axis: component height is the mean positive component duration per run; right axis: `summary.mean_latency_ms` | Omit unmeasured components; omit missing inference-latency markers and report them in `plot_report.json`; only SURGEON cloud upload/label/download noncomponents are structural omissions |
 
@@ -31,17 +31,21 @@ schema stores the value in `f1` and `normalization_report.json` declares
 shortened to Accuracy (F1) while preserving the full metric definition in the
 report and documentation.
 
-For each scenario and method, repeated runs are aggregated at shared frame
-coordinates. When exact coordinates do not overlap, values are aggregated in
-fixed 50-frame bins without interpolation.
+For each scenario and method, frame-level values are averaged within each
+non-overlapping 50-frame bin for every run. Repeated runs are then aggregated
+only at shared bins, and the shaded band shows the standard deviation across
+those run-level bin means. This reduces high-frequency visual noise without
+interpolating frame IDs or inventing observations.
 
 For single-scenario experiment outputs, Fig. 1 is rendered as one large panel.
-Trigger and model-update overlays mark paired adaptation cycles: the plotter
-pairs each `model_update_applied` event to a preceding `trigger_decision`, then
-draws the paired trigger with a triangle marker and the paired update with a
-star marker. Unpaired trigger or update events are omitted from the marker layer
-and reported as partial data. For Plank-road, repeated `trigger_decision=True`
-rows are not shown unless they are paired to a later model update.
+Trigger and model-update events are shown in a separate method-aligned strip so
+they do not obscure the accuracy curves. The plotter pairs each
+`model_update_applied` event to a preceding `trigger_decision`, connects the
+pair as one adaptation interval, then draws the trigger with a triangle marker
+and the update with a star marker. Unpaired trigger or update events are omitted
+from the marker layer and reported as partial data. For Plank-road, repeated
+`trigger_decision=True` rows are not shown unless they are paired to a later
+model update.
 
 ## Fig. 2 Details
 
