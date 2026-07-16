@@ -29,16 +29,23 @@ baseline:
   quality_mode: output_only_when_no_boundary
   trainable_scope: norm_affine
   train_sample_count: 16
-  # Keep local TTA conservative: require a persistent drift window, adapt for
-  # only a few steps, and reject updates supported by too few confident logits.
+  # Train the full local schedule, then apply only the best epoch that passes
+  # the detector-independent collapse guards.
   num_epoch: 30
   require_drift: true
   min_detection_confidence: 0.6
   min_selected_logit_count: 16
+  max_selected_logit_count: 256
   min_loss_improvement: 0.0001
-  # YOLO exposes flattened multi-scale logits without a safe horizontal-flip
-  # correspondence map, so the consistency term stays disabled by default.
+  # Raw detector rows do not share a guaranteed horizontal-flip correspondence;
+  # use the model-independent frozen-reference KL anchor instead.
   consistency_weight: 0.0
+  reference_consistency_weight: 0.05
+  guard_sample_count: 8
+  max_foreground_growth_ratio: 2.0
+  max_foreground_fraction_increase: 0.02
+  max_reference_kl: 0.10
+  max_relative_param_delta: 0.02
   entropy_margin_ratio: 0.4
   adaptive_entropy_gate: true
   max_entropy_margin_ratio: 0.7

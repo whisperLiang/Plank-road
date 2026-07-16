@@ -30,7 +30,14 @@ def _config(tmp_path: Path) -> SimpleNamespace:
                 quality_mode="output_only_when_no_boundary",
                 trainable_scope="norm_affine",
                 min_selected_logit_count=1,
+                max_selected_logit_count=256,
                 consistency_weight=0.0,
+                reference_consistency_weight=0.05,
+                guard_sample_count=0,
+                max_foreground_growth_ratio=2.0,
+                max_foreground_fraction_increase=0.02,
+                max_reference_kl=0.10,
+                max_relative_param_delta=0.02,
                 entropy_margin_ratio=1.0,
                 adaptive_entropy_gate=False,
                 max_entropy_margin_ratio=1.0,
@@ -85,6 +92,8 @@ class ToyTTAModel(torch.nn.Module):
         self.bn = torch.nn.BatchNorm2d(3)
         self.pool = torch.nn.AdaptiveAvgPool2d((1, 1))
         self.head = torch.nn.Linear(3, 3)
+        with torch.no_grad():
+            self.head.bias.copy_(torch.tensor([2.0, 0.0, -2.0]))
         self.skip_logits = False
         self.fail_forward = False
 
@@ -325,6 +334,8 @@ def test_low_quality_samples_trigger_local_tta_and_update_model_version(tmp_path
             assert epoch["model_version"] == "0"
             assert epoch["epoch_ms"] >= 0
         assert done["num_epoch"] == 3
+        assert done["trained_epochs"] == 3
+        assert 1 <= done["applied_epoch"] <= 3
         assert done["model_version_before"] == "0"
         assert done["model_version_after"] == "surgeon_1"
         assert done["shadow_training"] is True
@@ -396,6 +407,7 @@ def test_local_tta_can_trigger_on_larger_window_but_train_recent_subset(tmp_path
     config = _config(tmp_path)
     config.baseline.training.training_frame_count = 4
     config.baseline.SURGEON.train_sample_count = 2
+    config.baseline.SURGEON.guard_sample_count = 2
     adapter = BaselineEdgeAdapter(
         config=config,
         baseline_method="SURGEON",
@@ -423,9 +435,12 @@ def test_local_tta_can_trigger_on_larger_window_but_train_recent_subset(tmp_path
         assert triggered["low_quality_sample_count"] == 4
         assert triggered["training_frame_count"] == 4
         assert triggered["train_sample_count"] == 2
+        assert triggered["guard_sample_count"] == 2
         assert started["low_quality_sample_count"] == 2
         assert started["batch_size"] == 2
+        assert started["guard_sample_count"] == 2
         assert train_started["batch_size"] == 2
+        assert train_started["guard_sample_count"] == 2
     finally:
         adapter.close()
 
@@ -703,6 +718,228 @@ def test_tta_adaptive_gate_skips_when_maximum_margin_pool_is_too_small() -> None
     assert exc_info.value.details["strict_selected_logit_count"] == 1
 
 
+def test_tta_softmax_background_semantics_preserve_background_for_kl() -> None:
+    detector = FakeDetector(ToyTTAModel())
+    adapter = TTADetectionAdapter(detector, entropy_margin_ratio=1.0)
+    logits = torch.tensor(
+        [[3.0, 1.0, -2.0], [-2.0, -1.0, 4.0]],
+        requires_grad=True,
+    )
+
+    view = adapter.logit_view(
+        {"pred_logits": logits, "_tta_logit_mode": "softmax_bg_last"}
+    )
+    reference = adapter.capture_reference(
+        {"pred_logits": logits, "_tta_logit_mode": "softmax_bg_last"}
+    )
+
+    assert view.mode == "softmax_bg_last"
+    assert tuple(view.probabilities.shape) == (2, 3)
+    assert torch.allclose(view.probabilities.sum(dim=-1), torch.ones(2))
+    assert view.foreground_mask.tolist() == [True, False]
+    assert reference.selected_indices.tolist() == [0]
+
+    no_background = adapter.logit_view(
+        {
+            "logits": torch.tensor(
+                [[0.0, 0.0, 0.0], [3.0, 0.0, -1.0]],
+                requires_grad=True,
+            ),
+            "_tta_logit_mode": "softmax",
+        }
+    )
+    assert no_background.foreground_mask.tolist() == [False, True]
+
+    detr_outputs = SimpleNamespace(
+        logits=torch.tensor(
+            [[[-2.0, -1.0, 4.0], [3.0, 1.0, -2.0]]],
+            requires_grad=True,
+        )
+    )
+    detr_view = adapter.logit_view(detr_outputs)
+    assert detr_view.mode == "softmax_bg_last"
+    assert detr_view.foreground_mask.tolist() == [False, True]
+
+
+def test_tta_initial_selection_is_capped_and_frozen() -> None:
+    detector = FakeDetector(ToyTTAModel())
+    adapter = TTADetectionAdapter(
+        detector,
+        entropy_margin_ratio=1.0,
+        min_selected_logit_count=16,
+        max_selected_logit_count=256,
+    )
+    initial_logits = _sigmoid_logits_for_probabilities([0.99] * 400)
+    reference = adapter.capture_reference({"cls_logits": initial_logits})
+    changed_logits = _sigmoid_logits_for_probabilities([0.999] * 400)
+
+    loss, reference_kl, stats = adapter.anchored_loss(
+        {"cls_logits": changed_logits},
+        reference,
+    )
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(reference_kl)
+    assert reference.initial_stats["strict_selected_logit_count"] == 400
+    assert reference.initial_stats["selected_logit_count"] == 256
+    assert stats["strict_selected_logit_count"] == 400
+    assert stats["selected_logit_count"] == 256
+    assert stats["frozen_selection"] is True
+
+
+def test_tta_selection_limit_is_global_across_output_batches() -> None:
+    adapter = TTADetectionAdapter(
+        FakeDetector(ToyTTAModel()),
+        entropy_margin_ratio=1.0,
+        min_selected_logit_count=16,
+        max_selected_logit_count=256,
+    )
+    outputs_batches = [
+        {"cls_logits": _sigmoid_logits_for_probabilities([0.99] * 200)},
+        {"cls_logits": _sigmoid_logits_for_probabilities([0.98] * 200)},
+    ]
+
+    references = adapter.capture_references(outputs_batches)
+
+    assert sum(
+        int(reference.initial_stats["selected_logit_count"])
+        for reference in references
+    ) == 256
+    assert len(references[0].selected_indices) == 200
+    assert len(references[1].selected_indices) == 56
+
+
+def test_tta_minimum_selection_is_global_across_output_batches() -> None:
+    adapter = TTADetectionAdapter(
+        FakeDetector(ToyTTAModel()),
+        entropy_margin_ratio=0.4,
+        adaptive_entropy_gate=True,
+        max_entropy_margin_ratio=0.7,
+        min_selected_logit_count=16,
+        max_selected_logit_count=256,
+    )
+    outputs_batches = [
+        {"cls_logits": _sigmoid_logits_for_probabilities([0.85] * 8)},
+        {"cls_logits": _sigmoid_logits_for_probabilities([0.85] * 8)},
+    ]
+
+    references = adapter.capture_references(outputs_batches)
+
+    assert sum(
+        int(reference.initial_stats["selected_logit_count"])
+        for reference in references
+    ) == 16
+    assert all(
+        reference.initial_stats["adaptive_entropy_gate_used"]
+        for reference in references
+    )
+
+
+def test_tta_sigmoid_semantics_support_single_foreground_class() -> None:
+    adapter = TTADetectionAdapter(
+        FakeDetector(ToyTTAModel()),
+        entropy_margin_ratio=1.0,
+        min_selected_logit_count=1,
+    )
+    logits = torch.tensor([[3.0], [-3.0]], requires_grad=True)
+
+    view = adapter.logit_view(
+        {"cls_logits": logits, "_tta_logit_mode": "sigmoid"}
+    )
+    loss, stats = adapter.entropy_loss(
+        {"cls_logits": logits, "_tta_logit_mode": "sigmoid"}
+    )
+
+    assert tuple(view.probabilities.shape) == (2, 1)
+    assert view.foreground_mask.tolist() == [True, False]
+    assert stats["selected_logit_count"] == 1
+    assert torch.isfinite(loss)
+
+
+def test_rfdetr_all_query_collapse_cannot_expand_frozen_selection() -> None:
+    detector = FakeDetector(ToyTTAModel())
+    adapter = TTADetectionAdapter(
+        detector,
+        entropy_margin_ratio=0.4,
+        adaptive_entropy_gate=True,
+        max_entropy_margin_ratio=0.7,
+        min_selected_logit_count=16,
+        max_selected_logit_count=256,
+    )
+    initial = torch.full((1, 62_400, 3), -8.0)
+    initial[:, :16, 0] = 4.0
+    initial[:, :, -1] = 8.0
+    initial.requires_grad_(True)
+    initial_outputs = {
+        "pred_logits": initial,
+        "_tta_logit_mode": "sigmoid_bg_last",
+    }
+    reference = adapter.capture_reference(initial_outputs)
+
+    collapsed = torch.full((1, 62_400, 3), -8.0)
+    collapsed[:, :, 0] = 8.0
+    collapsed[:, :, -1] = 8.0
+    collapsed.requires_grad_(True)
+    collapsed_outputs = {
+        "pred_logits": collapsed,
+        "_tta_logit_mode": "sigmoid_bg_last",
+    }
+    _loss, _reference_kl, loss_stats = adapter.anchored_loss(
+        collapsed_outputs,
+        reference,
+    )
+    guard_stats = adapter.guard_stats(collapsed_outputs, reference)
+
+    assert reference.initial_stats["selected_logit_count"] == 16
+    assert loss_stats["selected_logit_count"] == 16
+    assert loss_stats["strict_selected_logit_count"] == 62_400
+    assert guard_stats["foreground_logit_count"] == 62_400
+    assert guard_stats["foreground_growth_ratio"] == pytest.approx(3_900.0)
+
+
+def test_normalized_reference_kl_supports_sigmoid_and_softmax() -> None:
+    sigmoid_reference = torch.tensor([[0.8, 0.2]])
+    sigmoid_current = torch.tensor([[0.7, 0.3]], requires_grad=True)
+    softmax_reference = torch.tensor([[0.7, 0.2, 0.1]])
+    softmax_current = torch.tensor([[0.5, 0.3, 0.2]], requires_grad=True)
+
+    sigmoid_kl = surgeon_tta._normalized_reference_kl(
+        sigmoid_reference,
+        sigmoid_current,
+        mode="sigmoid",
+    )
+    softmax_kl = surgeon_tta._normalized_reference_kl(
+        softmax_reference,
+        softmax_current,
+        mode="softmax",
+    )
+    (sigmoid_kl + softmax_kl).backward()
+
+    assert float(sigmoid_kl.detach().item()) > 0.0
+    assert float(softmax_kl.detach().item()) > 0.0
+    assert torch.isfinite(sigmoid_current.grad).all()
+    assert torch.isfinite(softmax_current.grad).all()
+
+
+def test_relative_parameter_projection_enforces_configured_radius() -> None:
+    parameter = torch.nn.Parameter(torch.tensor([2.0, 2.0]))
+    named_parameters = [("weight", parameter)]
+    reference = {"weight": torch.tensor([1.0, 1.0])}
+
+    stats = surgeon_tta._project_named_parameters(
+        named_parameters,
+        reference,
+        0.02,
+    )
+
+    assert stats["projected"] is True
+    assert stats["finite"] is True
+    assert surgeon_tta._relative_named_parameter_delta(
+        named_parameters,
+        reference,
+    ) == pytest.approx(0.02)
+
+
 def test_tta_disabled_adaptive_gate_preserves_strict_only_selection() -> None:
     detector = FakeDetector(ToyTTAModel())
     adapter = TTADetectionAdapter(
@@ -825,9 +1062,131 @@ def test_tta_rejects_update_when_objective_does_not_improve(tmp_path) -> None:
         assert any(row["event"] == "surgeon_tta_rejected" for row in rows)
         assert any(
             row["event"] == "surgeon_tta_skipped"
-            and row["reason"] == "objective_not_improved"
+            and row["reason"] == "no_safe_tta_candidate"
             for row in rows
         )
+    finally:
+        adapter.close()
+
+
+def test_all_unsafe_epochs_leave_live_model_unchanged(tmp_path, monkeypatch) -> None:
+    config = _config(tmp_path)
+    config.baseline.SURGEON.num_epoch = 30
+    adapter = BaselineEdgeAdapter(
+        config=config,
+        baseline_method="SURGEON",
+        run_id="pure-surgeon-all-unsafe-test",
+        edge_id=1,
+        transport=None,
+    )
+    model = ToyTTAModel()
+    model.eval()
+    edge = FakeEdge(model)
+    before = _clone_state(model)
+    monkeypatch.setattr(
+        SurgeonLocalTTAUpdater,
+        "_candidate_rejection_reasons",
+        lambda *_args, **_kwargs: ["foreground_growth_exceeded"],
+    )
+    try:
+        adapter.before_video_start(edge)
+        _sample(adapter, 1)
+        _sample(adapter, 2)
+        assert adapter._surgeon_tta is not None
+        assert adapter._surgeon_tta.wait_for_idle(timeout=5.0)
+
+        rows = _metrics(adapter)
+        epochs = [row for row in rows if row["event"] == "surgeon_tta_epoch"]
+        skipped = next(row for row in rows if row["event"] == "surgeon_tta_skipped")
+        assert len(epochs) == 30
+        assert skipped["reason"] == "no_safe_tta_candidate"
+        assert skipped["trained_epochs"] == 30
+        assert adapter._surgeon_tta._pending_local_update is None
+        assert edge.model_version == "0"
+        assert _states_equal(before, _clone_state(model))
+    finally:
+        adapter.close()
+
+
+def test_training_applies_best_safe_intermediate_epoch(tmp_path, monkeypatch) -> None:
+    adapter = _adapter(tmp_path)
+    edge = FakeEdge(ToyTTAModel())
+    calls = {"count": 0}
+
+    def scripted_guard(*_args, **_kwargs):
+        calls["count"] += 1
+        return (
+            []
+            if calls["count"] in {1, 4}
+            else ["foreground_growth_exceeded"]
+        )
+
+    monkeypatch.setattr(
+        SurgeonLocalTTAUpdater,
+        "_candidate_rejection_reasons",
+        scripted_guard,
+    )
+    try:
+        adapter.before_video_start(edge)
+        _sample(adapter, 1)
+        _sample(adapter, 2)
+        assert adapter._surgeon_tta is not None
+        assert adapter._surgeon_tta.wait_for_idle(timeout=5.0)
+        pending = adapter._surgeon_tta._pending_local_update
+        assert pending is not None
+        assert pending.num_epoch == 3
+        assert pending.applied_epoch == 1
+        assert adapter._surgeon_tta.try_apply_pending_update()
+
+        rows = _metrics(adapter)
+        epochs = [row for row in rows if row["event"] == "surgeon_tta_epoch"]
+        done = next(row for row in rows if row["event"] == "surgeon_tta_done")
+        assert len(epochs) == 3
+        assert done["trained_epochs"] == 3
+        assert done["applied_epoch"] == 1
+        assert edge.model_version == "surgeon_1"
+    finally:
+        adapter.close()
+
+
+def test_restored_candidate_is_rejected_when_final_guard_fails(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    adapter = _adapter(tmp_path)
+    model = ToyTTAModel()
+    model.eval()
+    edge = FakeEdge(model)
+    before = _clone_state(model)
+    calls = {"count": 0}
+
+    def fail_only_final_guard(*_args, **_kwargs):
+        calls["count"] += 1
+        return (
+            ["foreground_growth_exceeded"]
+            if calls["count"] == 4
+            else []
+        )
+
+    monkeypatch.setattr(
+        SurgeonLocalTTAUpdater,
+        "_candidate_rejection_reasons",
+        fail_only_final_guard,
+    )
+    try:
+        adapter.before_video_start(edge)
+        _sample(adapter, 1)
+        _sample(adapter, 2)
+        assert adapter._surgeon_tta is not None
+        assert adapter._surgeon_tta.wait_for_idle(timeout=5.0)
+
+        rows = _metrics(adapter)
+        skipped = next(row for row in rows if row["event"] == "surgeon_tta_skipped")
+        assert skipped["reason"] == "no_safe_tta_candidate"
+        assert skipped["rejection_reasons"] == ["foreground_growth_exceeded"]
+        assert adapter._surgeon_tta._pending_local_update is None
+        assert edge.model_version == "0"
+        assert _states_equal(before, _clone_state(model))
     finally:
         adapter.close()
 
@@ -851,6 +1210,12 @@ def test_tta_does_not_persist_batch_norm_running_statistics(tmp_path) -> None:
             pending.trained_state_dict["bn.num_batches_tracked"],
             before["bn.num_batches_tracked"],
         )
+        assert torch.equal(pending.trained_state_dict["head.weight"], before["head.weight"])
+        assert torch.equal(pending.trained_state_dict["head.bias"], before["head.bias"])
+        assert any(
+            not torch.equal(pending.trained_state_dict[key], before[key])
+            for key in ("bn.weight", "bn.bias")
+        )
     finally:
         adapter.close()
 
@@ -872,7 +1237,7 @@ def test_logits_unavailable_skips_without_cloud_update_and_restores_mode(tmp_pat
         _sample(adapter, 3)
         rows = _metrics(adapter)
         skipped = next(row for row in rows if row["event"] == "surgeon_tta_skipped")
-        assert skipped["reason"] == "logits_unavailable"
+        assert skipped["reason"] == "unsupported_tta_output_semantics"
         assert not any(row["event"] == "surgeon_tta_epoch" for row in rows)
         assert edge.model_version == "0"
         assert edge.apply_model_update_calls == 0

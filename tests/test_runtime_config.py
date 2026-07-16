@@ -255,6 +255,82 @@ baseline:
     assert config.baseline.SURGEON.max_entropy_margin_ratio == pytest.approx(0.7)
 
 
+def test_pure_edge_universal_tta_defaults_load(tmp_path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text("baseline: {}\n", encoding="utf-8")
+
+    config = load_runtime_config(path)
+    surgeon = config.baseline.SURGEON
+
+    assert surgeon.train_sample_count == 16
+    assert surgeon.guard_sample_count == 8
+    assert surgeon.num_epoch == 30
+    assert surgeon.max_selected_logit_count == 256
+    assert surgeon.reference_consistency_weight == pytest.approx(0.05)
+    assert surgeon.max_foreground_growth_ratio == pytest.approx(2.0)
+    assert surgeon.max_foreground_fraction_increase == pytest.approx(0.02)
+    assert surgeon.max_reference_kl == pytest.approx(0.10)
+    assert surgeon.max_relative_param_delta == pytest.approx(0.02)
+
+
+def test_pure_edge_train_and_guard_samples_must_fit_window(tmp_path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+baseline:
+  training:
+    training_frame_count: 100
+  SURGEON:
+    train_sample_count: 96
+    guard_sample_count: 8
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"train_sample_count \+ guard_sample_count"):
+        load_runtime_config(path)
+
+
+def test_pure_edge_max_selected_logits_must_cover_minimum(tmp_path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+baseline:
+  SURGEON:
+    min_selected_logit_count: 16
+    max_selected_logit_count: 8
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="max_selected_logit_count must be >="):
+        load_runtime_config(path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_foreground_growth_ratio", 0.9),
+        ("max_foreground_fraction_increase", 1.1),
+        ("max_reference_kl", -0.1),
+        ("max_relative_param_delta", 1.1),
+    ],
+)
+def test_pure_edge_guard_limits_are_validated(tmp_path, field: str, value: float) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        f"""
+baseline:
+  SURGEON:
+    {field}: {value}
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=field):
+        load_runtime_config(path)
+
+
 def test_pure_edge_adaptive_entropy_gate_requires_boolean(tmp_path) -> None:
     path = tmp_path / "config.yaml"
     path.write_text(

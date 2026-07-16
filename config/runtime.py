@@ -250,13 +250,20 @@ class PureEdgeBaselineConfig(ConfigSection):
     quality_mode: str = "output_only_when_no_boundary"
     trainable_scope: str = "norm_affine"
     training_frame_count: int | None = None
-    train_sample_count: int | None = None
-    num_epoch: int | None = 3
+    train_sample_count: int | None = 16
+    num_epoch: int | None = 30
     require_drift: bool = True
     min_detection_confidence: float | None = 0.6
     min_selected_logit_count: int = 16
+    max_selected_logit_count: int = 256
     min_loss_improvement: float = 1.0e-4
     consistency_weight: float = 0.0
+    reference_consistency_weight: float = 0.05
+    guard_sample_count: int = 8
+    max_foreground_growth_ratio: float = 2.0
+    max_foreground_fraction_increase: float = 0.02
+    max_reference_kl: float = 0.10
+    max_relative_param_delta: float = 0.02
     entropy_margin_ratio: float = 0.4
     adaptive_entropy_gate: bool = False
     max_entropy_margin_ratio: float = 0.7
@@ -1248,6 +1255,23 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
                 "baseline.SURGEON.train_sample_count must be <= "
                 "the effective pure-edge training_frame_count"
             )
+    _validate_positive(
+        "baseline.SURGEON.guard_sample_count",
+        int(pure_edge.guard_sample_count),
+        allow_zero=True,
+    )
+    effective_train_sample_count = (
+        int(pure_edge.train_sample_count)
+        if pure_edge.train_sample_count is not None
+        else int(effective_pure_edge_training_frame_count)
+    )
+    if effective_train_sample_count + int(pure_edge.guard_sample_count) > int(
+        effective_pure_edge_training_frame_count
+    ):
+        raise ValueError(
+            "baseline.SURGEON.train_sample_count + guard_sample_count must be <= "
+            "the effective pure-edge training_frame_count"
+        )
     if pure_edge.num_epoch is not None:
         _validate_positive(
             "baseline.SURGEON.num_epoch",
@@ -1268,6 +1292,17 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         int(pure_edge.min_selected_logit_count),
     )
     _validate_positive(
+        "baseline.SURGEON.max_selected_logit_count",
+        int(pure_edge.max_selected_logit_count),
+    )
+    if int(pure_edge.max_selected_logit_count) < int(
+        pure_edge.min_selected_logit_count
+    ):
+        raise ValueError(
+            "baseline.SURGEON.max_selected_logit_count must be >= "
+            "baseline.SURGEON.min_selected_logit_count"
+        )
+    _validate_positive(
         "baseline.SURGEON.min_loss_improvement",
         float(pure_edge.min_loss_improvement),
         allow_zero=True,
@@ -1283,6 +1318,32 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         float(pure_edge.consistency_weight),
         allow_zero=True,
     )
+    _validate_positive(
+        "baseline.SURGEON.reference_consistency_weight",
+        float(pure_edge.reference_consistency_weight),
+        allow_zero=True,
+    )
+    _validate_positive(
+        "baseline.SURGEON.max_foreground_growth_ratio",
+        float(pure_edge.max_foreground_growth_ratio),
+    )
+    if float(pure_edge.max_foreground_growth_ratio) < 1.0:
+        raise ValueError(
+            "baseline.SURGEON.max_foreground_growth_ratio must be >= 1"
+        )
+    for name in (
+        "max_foreground_fraction_increase",
+        "max_reference_kl",
+        "max_relative_param_delta",
+    ):
+        value = float(getattr(pure_edge, name))
+        _validate_positive(
+            f"baseline.SURGEON.{name}",
+            value,
+            allow_zero=True,
+        )
+        if value > 1.0:
+            raise ValueError(f"baseline.SURGEON.{name} must be <= 1")
     if not isinstance(pure_edge.adaptive_entropy_gate, bool):
         raise ValueError(
             "baseline.SURGEON.adaptive_entropy_gate must be a boolean"

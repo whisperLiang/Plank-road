@@ -24,6 +24,7 @@ from edge.window_drift_detector import WindowDriftDetector
 from model_management.model_zoo import build_detection_model, get_model_family
 
 _SIGMOID_FOREGROUND_PROBABILITY_FLOOR = 0.5
+_PROBABILITY_EPS = 1.0e-6
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,27 @@ class _BufferedSample:
     frame: np.ndarray
     artifacts: dict[str, Any]
     latency_ms: float | None
+
+
+@dataclass(frozen=True)
+class TTALogitView:
+    """Model-independent, row-major view of differentiable detector logits."""
+
+    rows: torch.Tensor
+    probabilities: torch.Tensor
+    entropy: torch.Tensor
+    foreground_mask: torch.Tensor
+    mode: str
+
+
+@dataclass(frozen=True)
+class FrozenTTAReference:
+    """Frozen row selection and probabilities captured before local adaptation."""
+
+    probabilities: torch.Tensor
+    selected_indices: torch.Tensor
+    mode: str
+    initial_stats: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -52,6 +74,8 @@ class PendingLocalTTAUpdate:
     low_quality_sample_count: int
     started_perf: float
     shadow_train_ms: float
+    applied_epoch: int
+    guard_stats: dict[str, Any]
     live_training_mode: bool
     live_module_training_state: dict[str, bool]
 
@@ -75,6 +99,7 @@ class TTADetectionAdapter:
         adaptive_entropy_gate: bool = False,
         max_entropy_margin_ratio: float = 0.7,
         min_selected_logit_count: int = 16,
+        max_selected_logit_count: int = 256,
     ) -> None:
         self.detector = detector
         self.model = (
@@ -91,6 +116,10 @@ class TTADetectionAdapter:
             min(1.0, max(0.0, float(max_entropy_margin_ratio))),
         )
         self.min_selected_logit_count = max(1, int(min_selected_logit_count))
+        self.max_selected_logit_count = max(
+            self.min_selected_logit_count,
+            int(max_selected_logit_count),
+        )
 
     def build_batch(self, frames: list[np.ndarray]) -> list[torch.Tensor]:
         if not frames:
@@ -116,49 +145,98 @@ class TTADetectionAdapter:
         if rfdetr_outputs is not None:
             return rfdetr_outputs
 
-        model_type = type(model).__name__
-        if model_type in {"YOLODetectionModel", "RTDETRDetectionModel"}:
+        engine = getattr(model, "yolo", None) or getattr(model, "rtdetr", None)
+        if getattr(engine, "model", None) is not None:
             return self._forward_ultralytics(model, images)
 
-        raise _TTASkip("logits_unavailable")
+        raise _TTASkip("unsupported_tta_output_semantics")
 
-    def entropy_loss(self, outputs: Any) -> tuple[torch.Tensor, dict[str, Any]]:
+    def logit_view(self, outputs: Any) -> TTALogitView:
         logits, mode = _extract_differentiable_logits(self.model, outputs)
-        if logits is None or not isinstance(logits, torch.Tensor) or not logits.requires_grad:
-            raise _TTASkip("logits_unavailable")
+        mode = _valid_tta_logit_mode(mode)
+        if logits is None or not isinstance(logits, torch.Tensor) or mode is None:
+            raise _TTASkip("unsupported_tta_output_semantics")
         rows = _logit_rows(logits)
-        if rows is None or rows.numel() == 0 or rows.shape[-1] <= 1:
-            raise _TTASkip("logits_unavailable")
-        if _background_is_last(mode) and rows.shape[-1] > 1:
-            rows = rows[:, :-1]
-        if rows.shape[-1] <= 1:
-            raise _TTASkip("logits_unavailable")
-
-        if str(mode).startswith("sigmoid"):
-            probs = torch.sigmoid(rows)
-            p = probs.max(dim=-1).values.clamp(1.0e-8, 1.0 - 1.0e-8)
+        if rows is None or rows.numel() == 0:
+            raise _TTASkip("unsupported_tta_output_semantics")
+        if mode.startswith("sigmoid"):
+            if _background_is_last(mode) and rows.shape[-1] > 1:
+                rows = rows[:, :-1]
+            if rows.shape[-1] < 1:
+                raise _TTASkip("unsupported_tta_output_semantics")
+            probs = torch.sigmoid(rows).clamp(_PROBABILITY_EPS, 1.0 - _PROBABILITY_EPS)
+            p = probs.max(dim=-1).values
             foreground_mask = p.detach() >= _SIGMOID_FOREGROUND_PROBABILITY_FLOOR
-            if not bool(foreground_mask.any()):
-                raise _TTASkip("no_foreground_logits")
             entropy = -((p * torch.log(p)) + ((1.0 - p) * torch.log(1.0 - p)))
             entropy = entropy / math.log(2.0)
-            entropy = entropy[foreground_mask]
         else:
-            probs = torch.softmax(rows, dim=-1)
-            entropy = -(probs * torch.log(probs.clamp_min(1.0e-8))).sum(dim=-1)
+            if rows.shape[-1] <= 1:
+                raise _TTASkip("unsupported_tta_output_semantics")
+            probs = torch.softmax(rows, dim=-1).clamp_min(_PROBABILITY_EPS)
+            entropy = -(probs * torch.log(probs)).sum(dim=-1)
             entropy = entropy / max(math.log(max(2, int(rows.shape[-1]))), 1.0e-8)
+            if _background_is_last(mode):
+                foreground_mask = probs.detach().argmax(dim=-1) != int(rows.shape[-1] - 1)
+            else:
+                foreground_mask = (
+                    probs.detach().max(dim=-1).values
+                    >= _SIGMOID_FOREGROUND_PROBABILITY_FLOOR
+                )
 
-        selected = entropy
-        strict_selected_count = int(entropy.numel())
-        max_entropy_candidate_count = int(entropy.numel())
+        return TTALogitView(
+            rows=rows,
+            probabilities=probs,
+            entropy=entropy,
+            foreground_mask=foreground_mask,
+            mode=mode,
+        )
+
+    def capture_reference(
+        self,
+        outputs: Any,
+        *,
+        require_selection: bool = True,
+    ) -> FrozenTTAReference:
+        return self.capture_references(
+            [outputs],
+            require_selection=require_selection,
+        )[0]
+
+    def capture_references(
+        self,
+        outputs_batches: list[Any],
+        *,
+        require_selection: bool = True,
+    ) -> list[FrozenTTAReference]:
+        if not outputs_batches:
+            raise _TTASkip("empty_batch")
+        views = [self.logit_view(outputs) for outputs in outputs_batches]
+        foreground_indices_by_view = [
+            torch.nonzero(view.foreground_mask, as_tuple=False).flatten()
+            for view in views
+        ]
+        foreground_entropy_by_view = [
+            view.entropy.index_select(0, foreground_indices)
+            for view, foreground_indices in zip(views, foreground_indices_by_view)
+        ]
+        foreground_entropy = torch.cat(foreground_entropy_by_view, dim=0)
+        if require_selection and foreground_entropy.numel() == 0:
+            raise _TTASkip("no_foreground_logits")
+
+        strict_mask = foreground_entropy <= self.entropy_margin_ratio
+        max_entropy_mask = foreground_entropy <= self.max_entropy_margin_ratio
+        strict_selected_count = int(strict_mask.sum().item())
+        max_entropy_candidate_count = int(max_entropy_mask.sum().item())
         adaptive_entropy_gate_used = False
-        if self.entropy_margin_ratio > 0.0:
-            strict_mask = entropy <= self.entropy_margin_ratio
-            strict_selected_count = int(strict_mask.sum().item())
-            max_entropy_mask = entropy <= self.max_entropy_margin_ratio
-            max_entropy_candidate_count = int(max_entropy_mask.sum().item())
-            if strict_selected_count >= self.min_selected_logit_count:
-                selected = entropy[strict_mask]
+        selected_positions = foreground_entropy.new_empty((0,), dtype=torch.long)
+        if require_selection:
+            if self.entropy_margin_ratio <= 0.0:
+                candidate_local_indices = torch.arange(
+                    foreground_entropy.numel(),
+                    device=foreground_entropy.device,
+                )
+            elif strict_selected_count >= self.min_selected_logit_count:
+                candidate_local_indices = torch.nonzero(strict_mask, as_tuple=False).flatten()
             elif self.adaptive_entropy_gate:
                 if max_entropy_candidate_count < self.min_selected_logit_count:
                     raise _TTASkip(
@@ -171,16 +249,13 @@ class TTADetectionAdapter:
                         max_entropy_margin_ratio=self.max_entropy_margin_ratio,
                         adaptive_entropy_gate=True,
                     )
-                eligible = entropy[max_entropy_mask]
-                selected = torch.topk(
-                    eligible,
-                    k=self.min_selected_logit_count,
-                    largest=False,
-                    sorted=True,
-                ).values
+                candidate_local_indices = torch.nonzero(
+                    max_entropy_mask,
+                    as_tuple=False,
+                ).flatten()
                 adaptive_entropy_gate_used = True
             elif strict_selected_count > 0:
-                selected = entropy[strict_mask]
+                candidate_local_indices = torch.nonzero(strict_mask, as_tuple=False).flatten()
             else:
                 raise _TTASkip(
                     "no_reliable_logits",
@@ -192,20 +267,198 @@ class TTADetectionAdapter:
                     max_entropy_margin_ratio=self.max_entropy_margin_ratio,
                     adaptive_entropy_gate=False,
                 )
-        loss = selected.mean()
-        return loss, {
-            "logit_count": int(rows.shape[0]),
-            "foreground_logit_count": int(entropy.numel()),
+            selection_count = min(
+                int(candidate_local_indices.numel()),
+                self.max_selected_logit_count,
+            )
+            if adaptive_entropy_gate_used:
+                selection_count = min(selection_count, self.min_selected_logit_count)
+            candidate_entropy = foreground_entropy.index_select(
+                0,
+                candidate_local_indices,
+            )
+            lowest = torch.topk(
+                candidate_entropy,
+                k=selection_count,
+                largest=False,
+                sorted=True,
+            ).indices
+            selected_positions = candidate_local_indices.index_select(0, lowest)
+
+        references: list[FrozenTTAReference] = []
+        foreground_offset = 0
+        for view, foreground_indices, view_foreground_entropy in zip(
+            views,
+            foreground_indices_by_view,
+            foreground_entropy_by_view,
+        ):
+            view_foreground_count = int(view_foreground_entropy.numel())
+            in_view = (
+                (selected_positions >= foreground_offset)
+                & (selected_positions < foreground_offset + view_foreground_count)
+            )
+            selected_local_positions = (
+                selected_positions[in_view] - foreground_offset
+            )
+            selected_indices = foreground_indices.index_select(
+                0,
+                selected_local_positions,
+            )
+            selected_entropy = view.entropy.index_select(0, selected_indices)
+            initial_stats = {
+                "logit_count": int(view.rows.shape[0]),
+                "foreground_logit_count": view_foreground_count,
+                "strict_selected_logit_count": int(
+                    (view_foreground_entropy <= self.entropy_margin_ratio).sum().item()
+                ),
+                "max_entropy_candidate_count": int(
+                    (view_foreground_entropy <= self.max_entropy_margin_ratio)
+                    .sum()
+                    .item()
+                ),
+                "selected_logit_count": int(selected_indices.numel()),
+                "entropy": float(
+                    view_foreground_entropy.detach().mean().item()
+                    if view_foreground_entropy.numel()
+                    else 0.0
+                ),
+                "effective_entropy_threshold": float(
+                    selected_entropy.detach().max().item()
+                    if selected_entropy.numel()
+                    else 0.0
+                ),
+                "entropy_margin_ratio": self.entropy_margin_ratio,
+                "max_entropy_margin_ratio": self.max_entropy_margin_ratio,
+                "adaptive_entropy_gate": self.adaptive_entropy_gate,
+                "adaptive_entropy_gate_used": adaptive_entropy_gate_used,
+                "required_selected_logit_count": self.min_selected_logit_count,
+                "max_selected_logit_count": self.max_selected_logit_count,
+            }
+            references.append(
+                FrozenTTAReference(
+                    probabilities=view.probabilities.detach().clone(),
+                    selected_indices=selected_indices.detach().clone(),
+                    mode=view.mode,
+                    initial_stats=initial_stats,
+                )
+            )
+            foreground_offset += view_foreground_count
+        return references
+
+    def anchored_loss(
+        self,
+        outputs: Any,
+        reference: FrozenTTAReference,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        view = self._validated_reference_view(outputs, reference)
+        selected_entropy = view.entropy.index_select(0, reference.selected_indices)
+        entropy_loss = (
+            selected_entropy.mean()
+            if selected_entropy.numel()
+            else view.entropy.sum() * 0.0
+        )
+        reference_kl = _normalized_reference_kl(
+            reference.probabilities,
+            view.probabilities,
+            mode=view.mode,
+        )
+        stats = self._stats_for_view(view, reference.selected_indices)
+        stats["reference_kl"] = float(reference_kl.detach().item())
+        stats["frozen_selection"] = True
+        stats["adaptive_entropy_gate_used"] = bool(
+            reference.initial_stats.get("adaptive_entropy_gate_used", False)
+        )
+        return entropy_loss, reference_kl, stats
+
+    def guard_stats(
+        self,
+        outputs: Any,
+        reference: FrozenTTAReference,
+    ) -> dict[str, Any]:
+        view = self._validated_reference_view(outputs, reference)
+        reference_kl = _normalized_reference_kl(
+            reference.probabilities,
+            view.probabilities,
+            mode=view.mode,
+        )
+        current_foreground_count = int(view.foreground_mask.sum().item())
+        reference_foreground_count = int(
+            reference.initial_stats.get("foreground_logit_count", 0)
+        )
+        logit_count = max(1, int(view.rows.shape[0]))
+        return {
+            "logit_count": int(view.rows.shape[0]),
+            "reference_foreground_logit_count": reference_foreground_count,
+            "foreground_logit_count": current_foreground_count,
+            "foreground_growth_ratio": float(
+                current_foreground_count / max(1, reference_foreground_count)
+            ),
+            "foreground_fraction_increase": float(
+                (current_foreground_count - reference_foreground_count) / logit_count
+            ),
+            "reference_kl": float(reference_kl.detach().item()),
+            "logit_mode": view.mode,
+        }
+
+    def entropy_loss(self, outputs: Any) -> tuple[torch.Tensor, dict[str, Any]]:
+        reference = self.capture_reference(outputs)
+        entropy_loss, _reference_kl, stats = self.anchored_loss(outputs, reference)
+        return entropy_loss, stats
+
+    def _validated_reference_view(
+        self,
+        outputs: Any,
+        reference: FrozenTTAReference,
+    ) -> TTALogitView:
+        view = self.logit_view(outputs)
+        if (
+            view.mode != reference.mode
+            or tuple(view.probabilities.shape) != tuple(reference.probabilities.shape)
+        ):
+            raise _TTASkip(
+                "unsupported_tta_output_semantics",
+                reference_mode=reference.mode,
+                current_mode=view.mode,
+                reference_shape=list(reference.probabilities.shape),
+                current_shape=list(view.probabilities.shape),
+            )
+        return view
+
+    def _stats_for_view(
+        self,
+        view: TTALogitView,
+        selected_indices: torch.Tensor,
+    ) -> dict[str, Any]:
+        foreground_entropy = view.entropy[view.foreground_mask]
+        strict_selected_count = int(
+            (foreground_entropy <= self.entropy_margin_ratio).sum().item()
+        )
+        max_entropy_candidate_count = int(
+            (foreground_entropy <= self.max_entropy_margin_ratio).sum().item()
+        )
+        selected_entropy = view.entropy.index_select(0, selected_indices)
+        return {
+            "logit_count": int(view.rows.shape[0]),
+            "foreground_logit_count": int(foreground_entropy.numel()),
             "strict_selected_logit_count": strict_selected_count,
             "max_entropy_candidate_count": max_entropy_candidate_count,
-            "selected_logit_count": int(selected.numel()),
-            "entropy": float(entropy.detach().mean().item()),
-            "effective_entropy_threshold": float(selected.detach().max().item()),
+            "selected_logit_count": int(selected_indices.numel()),
+            "entropy": float(
+                foreground_entropy.detach().mean().item()
+                if foreground_entropy.numel()
+                else 0.0
+            ),
+            "effective_entropy_threshold": float(
+                selected_entropy.detach().max().item()
+                if selected_entropy.numel()
+                else 0.0
+            ),
             "entropy_margin_ratio": self.entropy_margin_ratio,
             "max_entropy_margin_ratio": self.max_entropy_margin_ratio,
             "adaptive_entropy_gate": self.adaptive_entropy_gate,
-            "adaptive_entropy_gate_used": adaptive_entropy_gate_used,
+            "adaptive_entropy_gate_used": False,
             "required_selected_logit_count": self.min_selected_logit_count,
+            "max_selected_logit_count": self.max_selected_logit_count,
         }
 
     def consistency_loss(self, outputs_a: Any, outputs_b: Any) -> torch.Tensor | None:
@@ -430,7 +683,7 @@ class SurgeonLocalTTAUpdater:
             None,
         )
         if configured_train_sample_count is None:
-            configured_train_sample_count = self.training_frame_count
+            configured_train_sample_count = min(16, self.training_frame_count)
         self.train_sample_count = max(
             1,
             min(int(configured_train_sample_count), int(self.training_frame_count)),
@@ -444,6 +697,10 @@ class SurgeonLocalTTAUpdater:
             1,
             int(getattr(self.method_cfg, "min_selected_logit_count", 16)),
         )
+        self.max_selected_logit_count = max(
+            self.min_selected_logit_count,
+            int(getattr(self.method_cfg, "max_selected_logit_count", 256)),
+        )
         self.min_loss_improvement = max(
             0.0,
             float(getattr(self.method_cfg, "min_loss_improvement", 1.0e-4)),
@@ -451,6 +708,33 @@ class SurgeonLocalTTAUpdater:
         self.consistency_weight = max(
             0.0,
             float(getattr(self.method_cfg, "consistency_weight", 0.0)),
+        )
+        self.reference_consistency_weight = max(
+            0.0,
+            float(getattr(self.method_cfg, "reference_consistency_weight", 0.05)),
+        )
+        self.guard_sample_count = max(
+            0,
+            min(
+                int(getattr(self.method_cfg, "guard_sample_count", 8)),
+                max(0, self.training_frame_count - self.train_sample_count),
+            ),
+        )
+        self.max_foreground_growth_ratio = max(
+            1.0,
+            float(getattr(self.method_cfg, "max_foreground_growth_ratio", 2.0)),
+        )
+        self.max_foreground_fraction_increase = max(
+            0.0,
+            float(getattr(self.method_cfg, "max_foreground_fraction_increase", 0.02)),
+        )
+        self.max_reference_kl = max(
+            0.0,
+            float(getattr(self.method_cfg, "max_reference_kl", 0.10)),
+        )
+        self.max_relative_param_delta = max(
+            0.0,
+            float(getattr(self.method_cfg, "max_relative_param_delta", 0.02)),
         )
         self.entropy_margin_ratio = max(
             0.0,
@@ -498,11 +782,13 @@ class SurgeonLocalTTAUpdater:
         self._edge = edge
         logger.info(
             "[SURGEON] attached training_frame_count={} "
-            "train_sample_count={} num_epoch={} batch_size={} quality_mode={} "
+            "train_sample_count={} guard_sample_count={} num_epoch={} "
+            "batch_size={} quality_mode={} "
             "require_drift={} min_selected_logits={} entropy_margin={} "
-            "adaptive_entropy_gate={} max_entropy_margin={}",
+            "adaptive_entropy_gate={} max_entropy_margin={} max_selected_logits={}",
             self.training_frame_count,
             self.train_sample_count,
+            self.guard_sample_count,
             self.num_epoch,
             self.batch_size,
             self.quality_mode,
@@ -511,20 +797,30 @@ class SurgeonLocalTTAUpdater:
             self.entropy_margin_ratio,
             self.adaptive_entropy_gate,
             self.max_entropy_margin_ratio,
+            self.max_selected_logit_count,
         )
         self.metrics.record(
             "surgeon_tta_config",
             training_frame_count=int(self.training_frame_count),
             train_sample_count=int(self.train_sample_count),
+            guard_sample_count=int(self.guard_sample_count),
             num_epoch=int(self.num_epoch),
             mini_batch_size=int(self.batch_size),
             trainable_scope=str(self.trainable_scope),
             consistency_weight=float(self.consistency_weight),
+            reference_consistency_weight=float(self.reference_consistency_weight),
             min_loss_improvement=float(self.min_loss_improvement),
             min_selected_logit_count=int(self.min_selected_logit_count),
+            max_selected_logit_count=int(self.max_selected_logit_count),
             entropy_margin_ratio=float(self.entropy_margin_ratio),
             adaptive_entropy_gate=bool(self.adaptive_entropy_gate),
             max_entropy_margin_ratio=float(self.max_entropy_margin_ratio),
+            max_foreground_growth_ratio=float(self.max_foreground_growth_ratio),
+            max_foreground_fraction_increase=float(
+                self.max_foreground_fraction_increase
+            ),
+            max_reference_kl=float(self.max_reference_kl),
+            max_relative_param_delta=float(self.max_relative_param_delta),
         )
 
     def observe_sample(
@@ -570,7 +866,13 @@ class SurgeonLocalTTAUpdater:
                 return
             if self._pending_local_update is not None:
                 return
-            selected = list(self._buffer)[-int(self.train_sample_count) :]
+            buffered_samples = list(self._buffer)
+            selected = buffered_samples[-int(self.train_sample_count) :]
+            guard_pool = buffered_samples[: -int(self.train_sample_count)]
+            guard_samples = _evenly_spaced_samples(
+                guard_pool,
+                self.guard_sample_count,
+            )
             buffered_count = len(self._buffer)
             # Consume this trigger window. Samples observed while the shadow
             # model trains may form a later window, but a successful apply
@@ -578,11 +880,12 @@ class SurgeonLocalTTAUpdater:
             self._buffer.clear()
             logger.info(
                 "[SURGEON] local TTA triggered: low_quality={} "
-                "training_frame_count={} train_sample_count={} "
+                "training_frame_count={} train_sample_count={} guard_sample_count={} "
                 "mini_batch_size={} trigger_frame={}",
                 buffered_count,
                 self.training_frame_count,
                 len(selected),
+                len(guard_samples),
                 self.batch_size,
                 int(frame_index),
             )
@@ -593,12 +896,13 @@ class SurgeonLocalTTAUpdater:
                 batch_size=int(self.batch_size),
                 training_frame_count=int(self.training_frame_count),
                 train_sample_count=len(selected),
+                guard_sample_count=len(guard_samples),
                 drift_detected=bool(drift.drift_detected),
                 drift_score=float(drift.drift_score),
             )
             self._running_thread = threading.Thread(
                 target=self._run_tta_task,
-                args=(selected, int(frame_index)),
+                args=(selected, guard_samples, int(frame_index)),
                 name="pure-edge-surgeon-tta",
                 daemon=True,
             )
@@ -706,17 +1010,28 @@ class SurgeonLocalTTAUpdater:
             window_id=quality.window_id,
         )
 
-    def _run_tta_task(self, samples: list[_BufferedSample], trigger_frame_id: int) -> None:
+    def _run_tta_task(
+        self,
+        samples: list[_BufferedSample],
+        guard_samples: list[_BufferedSample],
+        trigger_frame_id: int,
+    ) -> None:
         started = time.perf_counter()
         self.metrics.record(
             "surgeon_tta_started",
             frame_id=int(trigger_frame_id),
             low_quality_sample_count=len(samples),
             batch_size=len(samples),
+            guard_sample_count=len(guard_samples),
             num_epoch=self.num_epoch,
         )
         try:
-            update = self._execute_tta(samples, trigger_frame_id, started)
+            update = self._execute_tta(
+                samples,
+                guard_samples,
+                trigger_frame_id,
+                started,
+            )
         except _TTASkip as exc:
             logger.info(
                 "[SURGEON][Train] skipped reason={} low_quality_sample_count={}",
@@ -755,6 +1070,8 @@ class SurgeonLocalTTAUpdater:
                     frame_id=int(trigger_frame_id),
                     batch_size=int(update.batch_size),
                     num_epoch=int(update.num_epoch),
+                    trained_epochs=int(update.num_epoch),
+                    applied_epoch=int(update.applied_epoch),
                     initial_loss=float(update.initial_loss),
                     loss=float(update.loss),
                     initial_selected_logit_count=int(
@@ -766,6 +1083,7 @@ class SurgeonLocalTTAUpdater:
                         prefix="initial_",
                     ),
                     **update.gate_stats,
+                    **_prefixed_gate_stats(update.guard_stats, prefix="guard_"),
                     model_version_before=str(update.model_version_before),
                 )
             else:
@@ -782,6 +1100,7 @@ class SurgeonLocalTTAUpdater:
     def _execute_tta(
         self,
         samples: list[_BufferedSample],
+        guard_samples: list[_BufferedSample],
         trigger_frame_id: int,
         started_perf: float,
     ) -> PendingLocalTTAUpdate:
@@ -820,11 +1139,16 @@ class SurgeonLocalTTAUpdater:
             adaptive_entropy_gate=self.adaptive_entropy_gate,
             max_entropy_margin_ratio=self.max_entropy_margin_ratio,
             min_selected_logit_count=self.min_selected_logit_count,
+            max_selected_logit_count=self.max_selected_logit_count,
         )
         batch = adapter.build_batch([sample.frame for sample in samples])
+        guard_batch = adapter.build_batch(
+            [sample.frame for sample in guard_samples]
+        ) if guard_samples else list(batch)
         train_result = self._train_shadow_model(
             adapter=adapter,
             batch=batch,
+            guard_batch=guard_batch,
             trigger_frame_id=trigger_frame_id,
             model_version_before=str(snapshot["model_version_before"]),
         )
@@ -847,6 +1171,8 @@ class SurgeonLocalTTAUpdater:
             low_quality_sample_count=len(samples),
             started_perf=float(started_perf),
             shadow_train_ms=float(train_result["shadow_train_ms"]),
+            applied_epoch=int(train_result["applied_epoch"]),
+            guard_stats=dict(train_result["guard_stats"]),
             live_training_mode=bool(snapshot["training"]),
             live_module_training_state=dict(snapshot["module_training_state"]),
         )
@@ -911,6 +1237,8 @@ class SurgeonLocalTTAUpdater:
             low_quality_sample_count=int(update.low_quality_sample_count),
             batch_size=int(update.batch_size),
             num_epoch=int(update.num_epoch),
+            trained_epochs=int(update.num_epoch),
+            applied_epoch=int(update.applied_epoch),
             loss=float(update.loss),
             initial_loss=float(update.initial_loss),
             initial_selected_logit_count=int(update.initial_selected_logit_count),
@@ -920,6 +1248,7 @@ class SurgeonLocalTTAUpdater:
                 prefix="initial_",
             ),
             **update.gate_stats,
+            **_prefixed_gate_stats(update.guard_stats, prefix="guard_"),
             duration_ms=float(duration_ms),
             shadow_train_ms=float(update.shadow_train_ms),
             trainable_param_count=int(update.trainable_param_count),
@@ -1054,18 +1383,26 @@ class SurgeonLocalTTAUpdater:
         *,
         adapter: TTADetectionAdapter,
         batch: list[torch.Tensor],
+        guard_batch: list[torch.Tensor],
         trigger_frame_id: int,
         model_version_before: str,
     ) -> dict[str, Any]:
         trainable_model = adapter.trainable_model
         training_device = _model_device(trainable_model)
         batch = list(batch)
+        guard_batch = list(guard_batch)
         total_sample_count = len(batch)
         mini_batch_size = max(1, int(self.batch_size))
         mini_batches = [
             batch[index : index + mini_batch_size]
             for index in range(0, total_sample_count, mini_batch_size)
         ]
+        guard_mini_batches = [
+            guard_batch[index : index + mini_batch_size]
+            for index in range(0, len(guard_batch), mini_batch_size)
+        ]
+        if not mini_batches or not guard_mini_batches:
+            raise _TTASkip("empty_batch")
         previous_mode = bool(getattr(trainable_model, "training", False))
         module_training_state = _module_training_state(trainable_model)
         grad_state = _parameter_grad_state(trainable_model)
@@ -1082,6 +1419,15 @@ class SurgeonLocalTTAUpdater:
             entropy_margin_ratio=float(self.entropy_margin_ratio),
             adaptive_entropy_gate=bool(self.adaptive_entropy_gate),
             max_entropy_margin_ratio=float(self.max_entropy_margin_ratio),
+            max_selected_logit_count=int(self.max_selected_logit_count),
+            reference_consistency_weight=float(self.reference_consistency_weight),
+            guard_sample_count=int(len(guard_batch)),
+            max_foreground_growth_ratio=float(self.max_foreground_growth_ratio),
+            max_foreground_fraction_increase=float(
+                self.max_foreground_fraction_increase
+            ),
+            max_reference_kl=float(self.max_reference_kl),
+            max_relative_param_delta=float(self.max_relative_param_delta),
         )
         logger.info(
             "[SURGEON] shadow training started: samples={} "
@@ -1092,123 +1438,190 @@ class SurgeonLocalTTAUpdater:
         )
         try:
             self._select_trainable_parameters(trainable_model)
-            trainable_params = [
-                param for param in trainable_model.parameters() if param.requires_grad
+            trainable_named_params = [
+                (name, param)
+                for name, param in trainable_model.named_parameters()
+                if param.requires_grad
             ]
+            trainable_params = [param for _, param in trainable_named_params]
             trainable_param_count = sum(int(param.numel()) for param in trainable_params)
             if not trainable_params:
                 raise _TTASkip("no_trainable_parameters")
+            parameter_reference = {
+                name: param.detach().clone()
+                for name, param in trainable_named_params
+            }
             optimizer = self._make_optimizer(trainable_params)
             _set_batch_norm_tracking(trainable_model, enabled=False)
             if hasattr(trainable_model, "train"):
                 trainable_model.train(True)
             optimizer.zero_grad(set_to_none=True)
-            initial_objective = self._evaluate_shadow_objective(
+            train_references = self._capture_references(
                 adapter=adapter,
                 mini_batches=mini_batches,
                 training_device=training_device,
+                require_selection=True,
             )
-            losses: list[float] = []
+            guard_references = self._capture_references(
+                adapter=adapter,
+                mini_batches=guard_mini_batches,
+                training_device=training_device,
+                require_selection=False,
+            )
+            initial_objective = self._evaluate_fixed_objective(
+                adapter=adapter,
+                mini_batches=mini_batches,
+                references=train_references,
+                training_device=training_device,
+            )
+            initial_guard_stats = self._evaluate_guard_set(
+                adapter=adapter,
+                mini_batches=guard_mini_batches,
+                references=guard_references,
+                training_device=training_device,
+            )
+            self.metrics.record(
+                "surgeon_tta_guard_reference",
+                frame_id=int(trigger_frame_id),
+                **initial_guard_stats,
+                model_version_before=str(model_version_before),
+            )
+            initial_loss = float(initial_objective["loss"])
+            total_fixed_selected_count = max(
+                1,
+                int(initial_objective["selected_logit_count"]),
+            )
+            total_reference_logit_count = max(
+                1,
+                int(initial_objective["logit_count"]),
+            )
+            best_epoch: int | None = None
+            best_loss = float("inf")
+            best_parameter_state: dict[str, torch.Tensor] | None = None
+            last_rejection_reasons: list[str] = []
+            last_training_loss = initial_loss
             for epoch_index in range(self.num_epoch):
                 epoch_started = time.perf_counter()
                 epoch = epoch_index + 1
                 epoch_loss_values: list[float] = []
-                epoch_entropy_values: list[float] = []
-                epoch_consistency_values: list[float] = []
-                epoch_weighted_consistency_values: list[float] = []
-                epoch_logit_count = 0
-                epoch_foreground_logit_count = 0
-                epoch_strict_selected_logit_count = 0
-                epoch_max_entropy_candidate_count = 0
-                epoch_selected_logit_count = 0
-                epoch_effective_entropy_thresholds: list[float] = []
-                epoch_adaptive_entropy_gate_batch_count = 0
+                epoch_legacy_consistency_values: list[float] = []
                 epoch_consistency_batch_count = 0
-                for mini_batch in mini_batches:
+                projection_applied = False
+                for mini_batch, reference in zip(mini_batches, train_references):
                     device_batch = _move_batch_to_device(mini_batch, training_device)
                     optimizer.zero_grad(set_to_none=True)
                     outputs = adapter.forward_tta_outputs(device_batch)
-                    entropy_loss, loss_stats = adapter.entropy_loss(outputs)
-                    self._require_reliable_logits(loss_stats)
-                    loss = entropy_loss
-                    consistency_loss_value = 0.0
-                    weighted_consistency_loss_value = 0.0
+                    entropy_loss, reference_kl, loss_stats = adapter.anchored_loss(
+                        outputs,
+                        reference,
+                    )
+                    entropy_weight = (
+                        int(loss_stats["selected_logit_count"])
+                        / total_fixed_selected_count
+                    )
+                    reference_weight = (
+                        int(loss_stats["logit_count"])
+                        / total_reference_logit_count
+                    )
+                    weighted_reference_kl = (
+                        self.reference_consistency_weight
+                        * reference_weight
+                        * reference_kl
+                    )
+                    loss = entropy_weight * entropy_loss + weighted_reference_kl
+                    legacy_consistency_value = 0.0
                     if self.consistency_weight > 0.0:
                         augmented = adapter.forward_tta_outputs(device_batch, augment=True)
                         consistency = adapter.consistency_loss(outputs, augmented)
                         if consistency is not None:
                             epoch_consistency_batch_count += 1
-                            consistency_loss_value = float(consistency.detach().item())
+                            legacy_consistency_value = float(consistency.detach().item())
                             weighted_consistency = self.consistency_weight * consistency
-                            weighted_consistency_loss_value = float(
-                                weighted_consistency.detach().item()
-                            )
                             loss = loss + weighted_consistency
+                    if not bool(torch.isfinite(loss).item()):
+                        raise _TTASkip(
+                            "no_safe_tta_candidate",
+                            trained_epochs=epoch - 1,
+                            rejection_reasons=["nonfinite_training_loss"],
+                        )
                     loss.backward()
                     optimizer.step()
+                    projection_stats = _project_named_parameters(
+                        trainable_named_params,
+                        parameter_reference,
+                        self.max_relative_param_delta,
+                    )
+                    if not bool(projection_stats["finite"]):
+                        raise _TTASkip(
+                            "no_safe_tta_candidate",
+                            trained_epochs=epoch,
+                            rejection_reasons=["nonfinite_parameter_update"],
+                        )
+                    projection_applied = projection_applied or bool(
+                        projection_stats["projected"]
+                    )
                     epoch_loss_values.append(float(loss.detach().item()))
-                    epoch_entropy_values.append(float(entropy_loss.detach().item()))
-                    epoch_consistency_values.append(consistency_loss_value)
-                    epoch_weighted_consistency_values.append(
-                        weighted_consistency_loss_value
-                    )
-                    epoch_logit_count += int(loss_stats.get("logit_count", 0))
-                    epoch_foreground_logit_count += int(
-                        loss_stats.get("foreground_logit_count", 0)
-                    )
-                    epoch_strict_selected_logit_count += int(
-                        loss_stats.get("strict_selected_logit_count", 0)
-                    )
-                    epoch_max_entropy_candidate_count += int(
-                        loss_stats.get("max_entropy_candidate_count", 0)
-                    )
-                    epoch_selected_logit_count += int(
-                        loss_stats.get("selected_logit_count", 0)
-                    )
-                    effective_threshold = _finite_float(
-                        loss_stats.get("effective_entropy_threshold")
-                    )
-                    if effective_threshold is not None:
-                        epoch_effective_entropy_thresholds.append(effective_threshold)
-                    if bool(loss_stats.get("adaptive_entropy_gate_used", False)):
-                        epoch_adaptive_entropy_gate_batch_count += 1
-                loss_value = float(np.mean(epoch_loss_values)) if epoch_loss_values else 0.0
-                entropy_loss_value = (
-                    float(np.mean(epoch_entropy_values)) if epoch_entropy_values else 0.0
+                    epoch_legacy_consistency_values.append(legacy_consistency_value)
+
+                candidate_objective = self._evaluate_fixed_objective(
+                    adapter=adapter,
+                    mini_batches=mini_batches,
+                    references=train_references,
+                    training_device=training_device,
                 )
-                consistency_loss_value = (
-                    float(np.mean(epoch_consistency_values))
-                    if epoch_consistency_values
-                    else 0.0
+                guard_stats = self._evaluate_guard_set(
+                    adapter=adapter,
+                    mini_batches=guard_mini_batches,
+                    references=guard_references,
+                    training_device=training_device,
                 )
-                weighted_consistency_loss_value = (
-                    float(np.mean(epoch_weighted_consistency_values))
-                    if epoch_weighted_consistency_values
-                    else 0.0
+                parameter_delta = _relative_named_parameter_delta(
+                    trainable_named_params,
+                    parameter_reference,
+                )
+                rejection_reasons = self._candidate_rejection_reasons(
+                    objective=candidate_objective,
+                    guard_stats=guard_stats,
+                    parameter_delta=parameter_delta,
+                )
+                candidate_safe = not rejection_reasons
+                candidate_loss = float(candidate_objective["loss"])
+                objective_improved = math.isfinite(candidate_loss) and (
+                    candidate_loss < initial_loss - self.min_loss_improvement
+                )
+                if not objective_improved:
+                    rejection_reasons = [*rejection_reasons, "objective_not_improved"]
+                if candidate_safe and objective_improved and candidate_loss < best_loss:
+                    best_epoch = epoch
+                    best_loss = candidate_loss
+                    best_parameter_state = {
+                        name: param.detach().clone()
+                        for name, param in trainable_named_params
+                    }
+                last_rejection_reasons = list(dict.fromkeys(rejection_reasons))
+                last_training_loss = (
+                    float(np.sum(epoch_loss_values))
+                    if epoch_loss_values
+                    else float("inf")
                 )
                 epoch_ms = (time.perf_counter() - epoch_started) * 1000.0
-                losses.append(loss_value)
                 logger.info(
-                    "[SURGEON][Train] epoch={}/{} loss={:.6f} "
-                    "entropy_loss={:.6f} consistency_loss={:.6f} samples={} "
-                    "mini_batch_size={} selected_logits={}/{}/{}/{}/{} "
-                    "effective_entropy_threshold={:.4f} adaptive_batches={} "
-                    "model_version={} "
-                    "epoch_ms={:.3f}",
+                    "[SURGEON][Train] epoch={}/{} loss={:.6f} entropy={:.6f} "
+                    "reference_kl={:.6f} fixed_logits={} guard_fg={}/{} "
+                    "guard_growth={:.4f} param_delta={:.6f} safe={} best_epoch={} "
+                    "model_version={} epoch_ms={:.3f}",
                     epoch,
                     self.num_epoch,
-                    loss_value,
-                    entropy_loss_value,
-                    consistency_loss_value,
-                    total_sample_count,
-                    mini_batch_size,
-                    epoch_selected_logit_count,
-                    epoch_strict_selected_logit_count,
-                    epoch_max_entropy_candidate_count,
-                    epoch_foreground_logit_count,
-                    epoch_logit_count,
-                    max(epoch_effective_entropy_thresholds, default=0.0),
-                    epoch_adaptive_entropy_gate_batch_count,
+                    candidate_loss,
+                    float(candidate_objective["entropy_loss"]),
+                    float(candidate_objective["reference_kl"]),
+                    int(candidate_objective["selected_logit_count"]),
+                    int(guard_stats["foreground_logit_count"]),
+                    int(guard_stats["reference_foreground_logit_count"]),
+                    float(guard_stats["foreground_growth_ratio"]),
+                    float(parameter_delta),
+                    candidate_safe,
+                    best_epoch,
                     model_version_before,
                     epoch_ms,
                 )
@@ -1217,30 +1630,45 @@ class SurgeonLocalTTAUpdater:
                     frame_id=int(trigger_frame_id),
                     epoch=int(epoch),
                     total_epochs=int(self.num_epoch),
-                    loss=loss_value,
-                    entropy_loss=entropy_loss_value,
-                    consistency_loss=consistency_loss_value,
-                    weighted_consistency_loss=weighted_consistency_loss_value,
+                    loss=candidate_loss,
+                    training_loss=float(last_training_loss),
+                    entropy_loss=float(candidate_objective["entropy_loss"]),
+                    reference_kl=float(candidate_objective["reference_kl"]),
+                    weighted_reference_kl=float(
+                        self.reference_consistency_weight
+                        * float(candidate_objective["reference_kl"])
+                    ),
+                    consistency_loss=float(
+                        np.mean(epoch_legacy_consistency_values)
+                        if epoch_legacy_consistency_values
+                        else 0.0
+                    ),
                     batch_size=int(total_sample_count),
                     mini_batch_size=int(mini_batch_size),
-                    logit_count=int(epoch_logit_count),
-                    foreground_logit_count=int(epoch_foreground_logit_count),
+                    logit_count=int(candidate_objective["logit_count"]),
+                    foreground_logit_count=int(
+                        candidate_objective["foreground_logit_count"]
+                    ),
                     strict_selected_logit_count=int(
-                        epoch_strict_selected_logit_count
+                        candidate_objective["strict_selected_logit_count"]
                     ),
                     max_entropy_candidate_count=int(
-                        epoch_max_entropy_candidate_count
+                        candidate_objective["max_entropy_candidate_count"]
                     ),
-                    selected_logit_count=int(epoch_selected_logit_count),
+                    selected_logit_count=int(
+                        candidate_objective["selected_logit_count"]
+                    ),
+                    frozen_selection=True,
+                    max_selected_logit_count=int(self.max_selected_logit_count),
                     effective_entropy_threshold=float(
-                        max(epoch_effective_entropy_thresholds, default=0.0)
+                        candidate_objective["effective_entropy_threshold"]
                     ),
                     adaptive_entropy_gate=bool(self.adaptive_entropy_gate),
                     adaptive_entropy_gate_used=bool(
-                        epoch_adaptive_entropy_gate_batch_count
+                        candidate_objective["adaptive_entropy_gate_used"]
                     ),
                     adaptive_entropy_gate_batch_count=int(
-                        epoch_adaptive_entropy_gate_batch_count
+                        candidate_objective["adaptive_entropy_gate_batch_count"]
                     ),
                     entropy_margin_ratio=float(self.entropy_margin_ratio),
                     max_entropy_margin_ratio=float(self.max_entropy_margin_ratio),
@@ -1248,40 +1676,80 @@ class SurgeonLocalTTAUpdater:
                         self.min_selected_logit_count
                     ),
                     consistency_batch_count=int(epoch_consistency_batch_count),
+                    parameter_delta_ratio=float(parameter_delta),
+                    parameter_projection_applied=bool(projection_applied),
+                    candidate_safe=bool(candidate_safe),
+                    objective_improved=bool(objective_improved),
+                    rejection_reasons=list(dict.fromkeys(rejection_reasons)),
+                    best_epoch=best_epoch,
+                    **_prefixed_gate_stats(guard_stats, prefix="guard_"),
                     model_version=str(model_version_before),
                     epoch_ms=float(epoch_ms),
                 )
             optimizer.zero_grad(set_to_none=True)
-            final_objective = self._evaluate_shadow_objective(
-                adapter=adapter,
-                mini_batches=mini_batches,
-                training_device=training_device,
-            )
-            initial_loss = float(initial_objective["loss"])
-            final_loss = float(final_objective["loss"])
-            accepted = math.isfinite(final_loss) and (
-                final_loss < initial_loss - self.min_loss_improvement
-            )
-            if not accepted:
+            if best_parameter_state is None or best_epoch is None:
                 self.metrics.record(
                     "surgeon_tta_rejected",
                     frame_id=int(trigger_frame_id),
-                    reason="objective_not_improved",
-                    initial_loss=initial_loss,
-                    final_loss=final_loss,
+                    reason="no_safe_tta_candidate",
+                    trained_epochs=int(self.num_epoch),
+                    initial_loss=float(initial_loss),
                     required_improvement=float(self.min_loss_improvement),
-                    initial_selected_logit_count=int(
-                        initial_objective["selected_logit_count"]
-                    ),
-                    selected_logit_count=int(final_objective["selected_logit_count"]),
-                    **_prefixed_gate_stats(
-                        _gate_stats_payload(initial_objective),
-                        prefix="initial_",
-                    ),
-                    **_gate_stats_payload(final_objective),
+                    rejection_reasons=last_rejection_reasons,
                     model_version_before=str(model_version_before),
                 )
-                raise _TTASkip("objective_not_improved")
+                raise _TTASkip(
+                    "no_safe_tta_candidate",
+                    trained_epochs=int(self.num_epoch),
+                    initial_loss=float(initial_loss),
+                    rejection_reasons=last_rejection_reasons,
+                )
+            _restore_named_parameters(trainable_named_params, best_parameter_state)
+            final_objective = self._evaluate_fixed_objective(
+                adapter=adapter,
+                mini_batches=mini_batches,
+                references=train_references,
+                training_device=training_device,
+            )
+            final_loss = float(final_objective["loss"])
+            final_guard_stats = self._evaluate_guard_set(
+                adapter=adapter,
+                mini_batches=guard_mini_batches,
+                references=guard_references,
+                training_device=training_device,
+            )
+            final_parameter_delta = _relative_named_parameter_delta(
+                trainable_named_params,
+                parameter_reference,
+            )
+            final_rejection_reasons = self._candidate_rejection_reasons(
+                objective=final_objective,
+                guard_stats=final_guard_stats,
+                parameter_delta=final_parameter_delta,
+            )
+            if final_loss >= initial_loss - self.min_loss_improvement:
+                final_rejection_reasons.append("objective_not_improved")
+            final_rejection_reasons = list(dict.fromkeys(final_rejection_reasons))
+            if final_rejection_reasons:
+                self.metrics.record(
+                    "surgeon_tta_rejected",
+                    frame_id=int(trigger_frame_id),
+                    reason="no_safe_tta_candidate",
+                    trained_epochs=int(self.num_epoch),
+                    applied_epoch=int(best_epoch),
+                    initial_loss=float(initial_loss),
+                    final_loss=float(final_loss),
+                    rejection_reasons=final_rejection_reasons,
+                    **_prefixed_gate_stats(final_guard_stats, prefix="guard_"),
+                    parameter_delta_ratio=float(final_parameter_delta),
+                    model_version_before=str(model_version_before),
+                )
+                raise _TTASkip(
+                    "no_safe_tta_candidate",
+                    trained_epochs=int(self.num_epoch),
+                    applied_epoch=int(best_epoch),
+                    rejection_reasons=final_rejection_reasons,
+                )
             shadow_train_ms = (time.perf_counter() - train_started) * 1000.0
             self.metrics.record(
                 "surgeon_tta_shadow_train_done",
@@ -1289,9 +1757,11 @@ class SurgeonLocalTTAUpdater:
                 batch_size=int(total_sample_count),
                 mini_batch_size=int(mini_batch_size),
                 num_epoch=int(self.num_epoch),
+                trained_epochs=int(self.num_epoch),
+                applied_epoch=int(best_epoch),
                 initial_loss=initial_loss,
                 loss=float(final_loss),
-                training_loss=float(losses[-1] if losses else initial_loss),
+                training_loss=float(last_training_loss),
                 initial_selected_logit_count=int(
                     initial_objective["selected_logit_count"]
                 ),
@@ -1303,6 +1773,7 @@ class SurgeonLocalTTAUpdater:
                     prefix="initial_",
                 ),
                 **_gate_stats_payload(final_objective),
+                **_prefixed_gate_stats(final_guard_stats, prefix="guard_"),
                 shadow_train_ms=float(shadow_train_ms),
                 model_version_before=str(model_version_before),
                 trainable_param_count=int(trainable_param_count),
@@ -1317,6 +1788,8 @@ class SurgeonLocalTTAUpdater:
                 "selected_logit_count": int(final_objective["selected_logit_count"]),
                 "initial_gate_stats": _gate_stats_payload(initial_objective),
                 "gate_stats": _gate_stats_payload(final_objective),
+                "guard_stats": dict(final_guard_stats),
+                "applied_epoch": int(best_epoch),
                 "trainable_param_count": trainable_param_count,
                 "shadow_train_ms": shadow_train_ms,
                 "trained_state_dict": _clone_state_dict_to_cpu(trainable_model.state_dict()),
@@ -1331,16 +1804,52 @@ class SurgeonLocalTTAUpdater:
                 previous_mode,
             )
 
-    def _evaluate_shadow_objective(
+    def _capture_references(
         self,
         *,
         adapter: TTADetectionAdapter,
         mini_batches: list[list[torch.Tensor]],
         training_device: torch.device,
-    ) -> dict[str, float | int]:
-        loss_values: list[float] = []
-        entropy_values: list[float] = []
-        consistency_values: list[float] = []
+        require_selection: bool,
+    ) -> list[FrozenTTAReference]:
+        outputs_batches: list[Any] = []
+        with torch.no_grad():
+            for mini_batch in mini_batches:
+                device_batch = _move_batch_to_device(mini_batch, training_device)
+                outputs_batches.append(adapter.forward_tta_outputs(device_batch))
+            references = adapter.capture_references(
+                outputs_batches,
+                require_selection=require_selection,
+            )
+        if require_selection:
+            self._require_reliable_logits(
+                {
+                    "selected_logit_count": sum(
+                        int(reference.initial_stats["selected_logit_count"])
+                        for reference in references
+                    ),
+                    "strict_selected_logit_count": sum(
+                        int(reference.initial_stats["strict_selected_logit_count"])
+                        for reference in references
+                    ),
+                    "max_entropy_candidate_count": sum(
+                        int(reference.initial_stats["max_entropy_candidate_count"])
+                        for reference in references
+                    ),
+                }
+            )
+        return references
+
+    def _evaluate_fixed_objective(
+        self,
+        *,
+        adapter: TTADetectionAdapter,
+        mini_batches: list[list[torch.Tensor]],
+        references: list[FrozenTTAReference],
+        training_device: torch.device,
+    ) -> dict[str, float | int | bool]:
+        weighted_entropy_sum = 0.0
+        weighted_reference_kl_sum = 0.0
         logit_count = 0
         foreground_logit_count = 0
         strict_selected_logit_count = 0
@@ -1348,48 +1857,59 @@ class SurgeonLocalTTAUpdater:
         selected_logit_count = 0
         effective_entropy_thresholds: list[float] = []
         adaptive_entropy_gate_batch_count = 0
-        consistency_batch_count = 0
-        for mini_batch in mini_batches:
-            device_batch = _move_batch_to_device(mini_batch, training_device)
-            outputs = adapter.forward_tta_outputs(device_batch)
-            entropy_loss, loss_stats = adapter.entropy_loss(outputs)
-            self._require_reliable_logits(loss_stats)
-            loss = entropy_loss
-            consistency_value = 0.0
-            if self.consistency_weight > 0.0:
-                augmented = adapter.forward_tta_outputs(device_batch, augment=True)
-                consistency = adapter.consistency_loss(outputs, augmented)
-                if consistency is not None:
-                    consistency_batch_count += 1
-                    consistency_value = float(consistency.detach().item())
-                    loss = loss + self.consistency_weight * consistency
-            loss_values.append(float(loss.detach().item()))
-            entropy_values.append(float(entropy_loss.detach().item()))
-            consistency_values.append(consistency_value)
-            logit_count += int(loss_stats.get("logit_count", 0))
-            foreground_logit_count += int(loss_stats.get("foreground_logit_count", 0))
-            strict_selected_logit_count += int(
-                loss_stats.get("strict_selected_logit_count", 0)
-            )
-            max_entropy_candidate_count += int(
-                loss_stats.get("max_entropy_candidate_count", 0)
-            )
-            selected_logit_count += int(loss_stats.get("selected_logit_count", 0))
-            effective_threshold = _finite_float(
-                loss_stats.get("effective_entropy_threshold")
-            )
-            if effective_threshold is not None:
-                effective_entropy_thresholds.append(effective_threshold)
-            if bool(loss_stats.get("adaptive_entropy_gate_used", False)):
-                adaptive_entropy_gate_batch_count += 1
+        with torch.no_grad():
+            for mini_batch, reference in zip(mini_batches, references):
+                device_batch = _move_batch_to_device(mini_batch, training_device)
+                outputs = adapter.forward_tta_outputs(device_batch)
+                entropy_loss, reference_kl, loss_stats = adapter.anchored_loss(
+                    outputs,
+                    reference,
+                )
+                batch_logit_count = int(loss_stats.get("logit_count", 0))
+                batch_selected_count = int(
+                    loss_stats.get("selected_logit_count", 0)
+                )
+                weighted_entropy_sum += (
+                    float(entropy_loss.detach().item()) * batch_selected_count
+                )
+                weighted_reference_kl_sum += (
+                    float(reference_kl.detach().item()) * batch_logit_count
+                )
+                logit_count += batch_logit_count
+                foreground_logit_count += int(
+                    loss_stats.get("foreground_logit_count", 0)
+                )
+                strict_selected_logit_count += int(
+                    loss_stats.get("strict_selected_logit_count", 0)
+                )
+                max_entropy_candidate_count += int(
+                    loss_stats.get("max_entropy_candidate_count", 0)
+                )
+                selected_logit_count += batch_selected_count
+                effective_threshold = _finite_float(
+                    loss_stats.get("effective_entropy_threshold")
+                )
+                if effective_threshold is not None:
+                    effective_entropy_thresholds.append(effective_threshold)
+                if bool(loss_stats.get("adaptive_entropy_gate_used", False)):
+                    adaptive_entropy_gate_batch_count += 1
+        entropy_loss_value = (
+            weighted_entropy_sum / selected_logit_count
+            if selected_logit_count
+            else float("inf")
+        )
+        reference_kl_value = (
+            weighted_reference_kl_sum / logit_count
+            if logit_count
+            else float("inf")
+        )
         return {
-            "loss": float(np.mean(loss_values)) if loss_values else float("inf"),
-            "entropy_loss": (
-                float(np.mean(entropy_values)) if entropy_values else float("inf")
+            "loss": float(
+                entropy_loss_value
+                + self.reference_consistency_weight * reference_kl_value
             ),
-            "consistency_loss": (
-                float(np.mean(consistency_values)) if consistency_values else 0.0
-            ),
+            "entropy_loss": float(entropy_loss_value),
+            "reference_kl": float(reference_kl_value),
             "logit_count": int(logit_count),
             "foreground_logit_count": int(foreground_logit_count),
             "strict_selected_logit_count": int(strict_selected_logit_count),
@@ -1404,8 +1924,88 @@ class SurgeonLocalTTAUpdater:
             "adaptive_entropy_gate_batch_count": int(
                 adaptive_entropy_gate_batch_count
             ),
-            "consistency_batch_count": int(consistency_batch_count),
+            "frozen_selection": True,
+            "max_selected_logit_count": int(self.max_selected_logit_count),
         }
+
+    def _evaluate_guard_set(
+        self,
+        *,
+        adapter: TTADetectionAdapter,
+        mini_batches: list[list[torch.Tensor]],
+        references: list[FrozenTTAReference],
+        training_device: torch.device,
+    ) -> dict[str, Any]:
+        logit_count = 0
+        reference_foreground_count = 0
+        foreground_count = 0
+        weighted_reference_kl = 0.0
+        modes: set[str] = set()
+        with torch.no_grad():
+            for mini_batch, reference in zip(mini_batches, references):
+                device_batch = _move_batch_to_device(mini_batch, training_device)
+                stats = adapter.guard_stats(
+                    adapter.forward_tta_outputs(device_batch),
+                    reference,
+                )
+                count = int(stats["logit_count"])
+                logit_count += count
+                reference_foreground_count += int(
+                    stats["reference_foreground_logit_count"]
+                )
+                foreground_count += int(stats["foreground_logit_count"])
+                weighted_reference_kl += float(stats["reference_kl"]) * count
+                modes.add(str(stats["logit_mode"]))
+        if reference_foreground_count == 0:
+            growth_ratio = 1.0 if foreground_count == 0 else float("inf")
+        else:
+            growth_ratio = foreground_count / reference_foreground_count
+        return {
+            "sample_count": int(sum(len(batch) for batch in mini_batches)),
+            "logit_count": int(logit_count),
+            "reference_foreground_logit_count": int(reference_foreground_count),
+            "foreground_logit_count": int(foreground_count),
+            "foreground_growth_ratio": float(growth_ratio),
+            "foreground_fraction_increase": float(
+                (foreground_count - reference_foreground_count) / max(1, logit_count)
+            ),
+            "reference_kl": float(weighted_reference_kl / max(1, logit_count)),
+            "logit_mode": ",".join(sorted(modes)),
+        }
+
+    def _candidate_rejection_reasons(
+        self,
+        *,
+        objective: dict[str, Any],
+        guard_stats: dict[str, Any],
+        parameter_delta: float,
+    ) -> list[str]:
+        values = [
+            float(objective.get("loss", float("nan"))),
+            float(guard_stats.get("foreground_growth_ratio", float("nan"))),
+            float(guard_stats.get("foreground_fraction_increase", float("nan"))),
+            float(guard_stats.get("reference_kl", float("nan"))),
+            float(parameter_delta),
+        ]
+        if not all(math.isfinite(value) for value in values):
+            return ["nonfinite_candidate_metrics"]
+        reasons: list[str] = []
+        if float(guard_stats["foreground_growth_ratio"]) > self.max_foreground_growth_ratio:
+            reasons.append("foreground_growth_exceeded")
+        if (
+            float(guard_stats["foreground_fraction_increase"])
+            > self.max_foreground_fraction_increase
+        ):
+            reasons.append("foreground_fraction_increase_exceeded")
+        if float(guard_stats["reference_kl"]) > self.max_reference_kl:
+            reasons.append("reference_kl_exceeded")
+        parameter_tolerance = max(
+            1.0e-6,
+            self.max_relative_param_delta * 1.0e-5,
+        )
+        if float(parameter_delta) > self.max_relative_param_delta + parameter_tolerance:
+            reasons.append("parameter_delta_exceeded")
+        return reasons
 
     def _require_reliable_logits(self, loss_stats: dict[str, Any]) -> None:
         selected_count = int(loss_stats.get("selected_logit_count", 0))
@@ -1505,6 +2105,11 @@ def _gate_stats_payload(stats: dict[str, Any]) -> dict[str, Any]:
         "adaptive_entropy_gate_batch_count": int(
             stats.get("adaptive_entropy_gate_batch_count", 0)
         ),
+        "reference_kl": float(stats.get("reference_kl", 0.0)),
+        "frozen_selection": bool(stats.get("frozen_selection", False)),
+        "max_selected_logit_count": int(
+            stats.get("max_selected_logit_count", 0)
+        ),
     }
 
 
@@ -1514,6 +2119,80 @@ def _prefixed_gate_stats(
     prefix: str,
 ) -> dict[str, Any]:
     return {f"{prefix}{key}": value for key, value in stats.items()}
+
+
+def _evenly_spaced_samples(
+    samples: list[_BufferedSample],
+    count: int,
+) -> list[_BufferedSample]:
+    requested = max(0, int(count))
+    if requested <= 0 or not samples:
+        return []
+    if requested >= len(samples):
+        return list(samples)
+    indices = np.linspace(0, len(samples) - 1, num=requested, dtype=int)
+    return [samples[int(index)] for index in indices]
+
+
+def _relative_named_parameter_delta(
+    named_parameters: list[tuple[str, torch.nn.Parameter]],
+    reference: dict[str, torch.Tensor],
+) -> float:
+    delta_squared = 0.0
+    reference_squared = 0.0
+    for name, parameter in named_parameters:
+        current = parameter.detach()
+        before = reference[name].to(device=current.device, dtype=current.dtype)
+        delta_squared += float(torch.sum((current - before) ** 2).item())
+        reference_squared += float(torch.sum(before**2).item())
+    if not math.isfinite(delta_squared) or not math.isfinite(reference_squared):
+        return float("inf")
+    denominator = max(math.sqrt(reference_squared), 1.0e-12)
+    return math.sqrt(max(0.0, delta_squared)) / denominator
+
+
+def _project_named_parameters(
+    named_parameters: list[tuple[str, torch.nn.Parameter]],
+    reference: dict[str, torch.Tensor],
+    max_relative_delta: float,
+) -> dict[str, Any]:
+    ratio_before = _relative_named_parameter_delta(named_parameters, reference)
+    if not math.isfinite(ratio_before):
+        return {
+            "finite": False,
+            "projected": False,
+            "ratio_before": ratio_before,
+            "ratio_after": ratio_before,
+        }
+    radius = max(0.0, float(max_relative_delta))
+    projected = ratio_before > radius
+    if projected:
+        scale = 0.0 if ratio_before <= 0.0 else radius / ratio_before
+        with torch.no_grad():
+            for name, parameter in named_parameters:
+                before = reference[name].to(
+                    device=parameter.device,
+                    dtype=parameter.dtype,
+                )
+                parameter.copy_(before + (parameter - before) * scale)
+    ratio_after = _relative_named_parameter_delta(named_parameters, reference)
+    return {
+        "finite": math.isfinite(ratio_after),
+        "projected": bool(projected),
+        "ratio_before": float(ratio_before),
+        "ratio_after": float(ratio_after),
+    }
+
+
+def _restore_named_parameters(
+    named_parameters: list[tuple[str, torch.nn.Parameter]],
+    state: dict[str, torch.Tensor],
+) -> None:
+    with torch.no_grad():
+        for name, parameter in named_parameters:
+            parameter.copy_(
+                state[name].to(device=parameter.device, dtype=parameter.dtype)
+            )
 
 
 def _clone_state_dict_to_cpu(state_dict: dict[str, Any]) -> dict[str, Any]:
@@ -1667,6 +2346,35 @@ def _finite_float(value: object) -> float | None:
     return parsed if math.isfinite(parsed) else None
 
 
+def _normalized_reference_kl(
+    reference_probabilities: torch.Tensor,
+    current_probabilities: torch.Tensor,
+    *,
+    mode: str,
+) -> torch.Tensor:
+    if tuple(reference_probabilities.shape) != tuple(current_probabilities.shape):
+        raise _TTASkip("unsupported_tta_output_semantics")
+    reference = reference_probabilities.detach().clamp(
+        _PROBABILITY_EPS,
+        1.0 - _PROBABILITY_EPS,
+    )
+    current = current_probabilities.clamp(
+        _PROBABILITY_EPS,
+        1.0 - _PROBABILITY_EPS,
+    )
+    if str(mode).startswith("sigmoid"):
+        divergence = reference * torch.log(reference / current)
+        divergence = divergence + (1.0 - reference) * torch.log(
+            (1.0 - reference) / (1.0 - current)
+        )
+        return divergence.mean() / math.log(2.0)
+    divergence = (reference * torch.log(reference / current)).sum(dim=-1)
+    return divergence.mean() / max(
+        math.log(max(2, int(reference.shape[-1]))),
+        1.0e-8,
+    )
+
+
 def _extract_differentiable_logits(model: object, outputs: Any) -> tuple[torch.Tensor | None, str]:
     if isinstance(outputs, dict):
         explicit_mode = _valid_tta_logit_mode(outputs.get("_tta_logit_mode"))
@@ -1678,9 +2386,9 @@ def _extract_differentiable_logits(model: object, outputs: Any) -> tuple[torch.T
         ):
             value = outputs.get(key)
             if isinstance(value, torch.Tensor):
+                if explicit_mode is not None:
+                    return value, explicit_mode
                 if key == "pred_logits":
-                    if explicit_mode is not None:
-                        return value, explicit_mode
                     if _looks_like_rfdetr_tta_model(model):
                         return value, "sigmoid_bg_last"
                 return value, mode
