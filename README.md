@@ -335,8 +335,10 @@ baseline:
     training_strategy: surgeon_tta
     quality_mode: output_only_when_no_boundary
     trainable_scope: norm_affine
-    consistency_weight: 0.01
+    consistency_weight: 0.0
     entropy_margin_ratio: 0.4
+    adaptive_entropy_gate: false  # compatibility default
+    max_entropy_margin_ratio: 0.7
   CATR:
     training_strategy: freeze
     training_failure_backoff_sec: 30

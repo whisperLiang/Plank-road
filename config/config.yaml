@@ -1,7 +1,7 @@
 experiment_run:
- experiment_id: suwon5a_weather_yolo26
- scenario: snowy
- video_path: ./video_data/snowy.mp4
+ experiment_id: suwon5a_weather_rainy_yolo26
+ scenario: rainy
+ video_path: ./video_data/rainy.mp4
  max_count: 5000
  edge_count: 1
  repeat: 1
@@ -40,6 +40,8 @@ baseline:
   # correspondence map, so the consistency term stays disabled by default.
   consistency_weight: 0.0
   entropy_margin_ratio: 0.4
+  adaptive_entropy_gate: true
+  max_entropy_margin_ratio: 0.7
  CATR:
   # Engineering variant for this refactor: this reuses the existing
   # Plank-Road frame filter as the keyframe selector, while training

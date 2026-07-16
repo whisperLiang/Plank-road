@@ -258,6 +258,8 @@ class PureEdgeBaselineConfig(ConfigSection):
     min_loss_improvement: float = 1.0e-4
     consistency_weight: float = 0.0
     entropy_margin_ratio: float = 0.4
+    adaptive_entropy_gate: bool = False
+    max_entropy_margin_ratio: float = 0.7
 
 
 @dataclass
@@ -1281,6 +1283,10 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         float(pure_edge.consistency_weight),
         allow_zero=True,
     )
+    if not isinstance(pure_edge.adaptive_entropy_gate, bool):
+        raise ValueError(
+            "baseline.SURGEON.adaptive_entropy_gate must be a boolean"
+        )
     _validate_positive(
         "baseline.SURGEON.entropy_margin_ratio",
         float(pure_edge.entropy_margin_ratio),
@@ -1288,6 +1294,22 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     )
     if float(pure_edge.entropy_margin_ratio) > 1.0:
         raise ValueError("baseline.SURGEON.entropy_margin_ratio must be <= 1")
+    _validate_positive(
+        "baseline.SURGEON.max_entropy_margin_ratio",
+        float(pure_edge.max_entropy_margin_ratio),
+        allow_zero=True,
+    )
+    if float(pure_edge.max_entropy_margin_ratio) > 1.0:
+        raise ValueError(
+            "baseline.SURGEON.max_entropy_margin_ratio must be <= 1"
+        )
+    if float(pure_edge.entropy_margin_ratio) > float(
+        pure_edge.max_entropy_margin_ratio
+    ):
+        raise ValueError(
+            "baseline.SURGEON.entropy_margin_ratio must be <= "
+            "baseline.SURGEON.max_entropy_margin_ratio"
+        )
     edge_policy = str(config.baseline.edge.split_runtime_policy or "").strip().lower()
     if edge_policy != "disabled":
         raise ValueError("baseline.edge.split_runtime_policy must be disabled")

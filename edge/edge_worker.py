@@ -1298,11 +1298,23 @@ class EdgeWorker:
     ) -> dict[str, object]:
         boxes, labels, scores = self._snapshot_result(task)
         confidence = getattr(inference, "confidence", None) if inference is not None else None
-        entropy = None
-        if inference is not None:
-            entropy = getattr(inference, "logit_entropy", None)
-            if entropy is None:
-                entropy = getattr(inference, "feature_spectral_entropy", None)
+        logit_entropy = (
+            getattr(inference, "logit_entropy", None) if inference is not None else None
+        )
+        feature_spectral_entropy = (
+            getattr(inference, "feature_spectral_entropy", None)
+            if inference is not None
+            else None
+        )
+        if logit_entropy is not None:
+            entropy = logit_entropy
+            entropy_source = "logit_entropy"
+        elif feature_spectral_entropy is not None:
+            entropy = feature_spectral_entropy
+            entropy_source = "feature_spectral_entropy"
+        else:
+            entropy = None
+            entropy_source = "missing"
         try:
             confidence_value = float(
                 confidence if confidence is not None else max(scores, default=0.0)
@@ -1319,6 +1331,9 @@ class EdgeWorker:
             "scores": [float(score) for score in scores],
             "confidence": confidence_value,
             "entropy": entropy_value,
+            "entropy_source": entropy_source,
+            "logit_entropy": logit_entropy,
+            "feature_spectral_entropy": feature_spectral_entropy,
             "model_version": str(getattr(self, "model_version", "0") or "0"),
             "result_source": str(result_source or task.result_source or "pending"),
         }

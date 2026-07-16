@@ -32,6 +32,8 @@ def _config(tmp_path: Path) -> SimpleNamespace:
                 min_selected_logit_count=1,
                 consistency_weight=0.0,
                 entropy_margin_ratio=1.0,
+                adaptive_entropy_gate=False,
+                max_entropy_margin_ratio=1.0,
             ),
             CATR=SimpleNamespace(
                 training_strategy="freeze",
@@ -629,6 +631,133 @@ def test_tta_entropy_does_not_fallback_to_a_single_unreliable_logit() -> None:
 
     with pytest.raises(RuntimeError, match="no_reliable_logits"):
         adapter.entropy_loss(outputs)
+
+
+def _sigmoid_logits_for_probabilities(probabilities: list[float]) -> torch.Tensor:
+    foreground = torch.logit(torch.tensor(probabilities, dtype=torch.float32))
+    background_classes = torch.full_like(foreground, -10.0)
+    return torch.stack((foreground, background_classes), dim=-1).requires_grad_(True)
+
+
+def test_tta_adaptive_gate_keeps_strict_selection_when_it_is_sufficient() -> None:
+    detector = FakeDetector(ToyTTAModel())
+    adapter = TTADetectionAdapter(
+        detector,
+        entropy_margin_ratio=0.4,
+        adaptive_entropy_gate=True,
+        max_entropy_margin_ratio=0.7,
+        min_selected_logit_count=2,
+    )
+
+    loss, stats = adapter.entropy_loss(
+        {"cls_logits": _sigmoid_logits_for_probabilities([0.98, 0.97, 0.60])}
+    )
+
+    assert torch.isfinite(loss)
+    assert stats["strict_selected_logit_count"] == 2
+    assert stats["selected_logit_count"] == 2
+    assert stats["adaptive_entropy_gate_used"] is False
+    assert stats["effective_entropy_threshold"] <= 0.4
+
+
+def test_tta_adaptive_gate_supplements_lowest_entropy_logits_to_minimum() -> None:
+    detector = FakeDetector(ToyTTAModel())
+    adapter = TTADetectionAdapter(
+        detector,
+        entropy_margin_ratio=0.4,
+        adaptive_entropy_gate=True,
+        max_entropy_margin_ratio=0.7,
+        min_selected_logit_count=3,
+    )
+
+    loss, stats = adapter.entropy_loss(
+        {"cls_logits": _sigmoid_logits_for_probabilities([0.98, 0.85, 0.82, 0.60])}
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert stats["strict_selected_logit_count"] == 1
+    assert stats["max_entropy_candidate_count"] == 3
+    assert stats["selected_logit_count"] == 3
+    assert stats["adaptive_entropy_gate_used"] is True
+    assert 0.4 < stats["effective_entropy_threshold"] <= 0.7
+
+
+def test_tta_adaptive_gate_skips_when_maximum_margin_pool_is_too_small() -> None:
+    detector = FakeDetector(ToyTTAModel())
+    adapter = TTADetectionAdapter(
+        detector,
+        entropy_margin_ratio=0.4,
+        adaptive_entropy_gate=True,
+        max_entropy_margin_ratio=0.7,
+        min_selected_logit_count=3,
+    )
+
+    with pytest.raises(RuntimeError, match="insufficient_reliable_logits") as exc_info:
+        adapter.entropy_loss(
+            {"cls_logits": _sigmoid_logits_for_probabilities([0.98, 0.85, 0.60])}
+        )
+
+    assert exc_info.value.details["required_selected_logit_count"] == 3
+    assert exc_info.value.details["actual_selected_logit_count"] == 2
+    assert exc_info.value.details["strict_selected_logit_count"] == 1
+
+
+def test_tta_disabled_adaptive_gate_preserves_strict_only_selection() -> None:
+    detector = FakeDetector(ToyTTAModel())
+    adapter = TTADetectionAdapter(
+        detector,
+        entropy_margin_ratio=0.4,
+        adaptive_entropy_gate=False,
+        max_entropy_margin_ratio=0.7,
+        min_selected_logit_count=3,
+    )
+
+    _loss, stats = adapter.entropy_loss(
+        {"cls_logits": _sigmoid_logits_for_probabilities([0.98, 0.85, 0.82])}
+    )
+
+    assert stats["strict_selected_logit_count"] == 1
+    assert stats["selected_logit_count"] == 1
+    assert stats["adaptive_entropy_gate_used"] is False
+
+
+def test_output_entropy_falls_back_to_scores_without_explicit_logit_entropy() -> None:
+    prediction = surgeon_tta._prediction_from_artifacts(
+        {"scores": [0.6, 0.7], "entropy": 0.0}
+    )
+
+    assert "output_entropy" not in prediction
+    assert surgeon_tta._output_entropy(prediction) == pytest.approx(
+        0.9261207,
+        rel=1.0e-5,
+    )
+
+    feature_entropy = surgeon_tta._prediction_from_artifacts(
+        {
+            "scores": [0.6],
+            "entropy": 0.25,
+            "entropy_source": "feature_spectral_entropy",
+            "feature_spectral_entropy": 0.25,
+        }
+    )
+    assert "output_entropy" not in feature_entropy
+    assert surgeon_tta._output_entropy(feature_entropy) == pytest.approx(
+        0.9709506,
+        rel=1.0e-5,
+    )
+
+    explicit = surgeon_tta._prediction_from_artifacts(
+        {"scores": [0.6], "entropy": 0.9, "logit_entropy": 0.0}
+    )
+    assert explicit["output_entropy"] == 0.0
+
+
+@pytest.mark.parametrize("score", [0.0, 1.0])
+def test_output_entropy_is_finite_for_exact_probability_endpoints(score: float) -> None:
+    entropy = surgeon_tta._output_entropy({"scores": [score]})
+
+    assert entropy == pytest.approx(0.0)
 
 
 def test_tta_reliable_logit_gate_enforces_configured_absolute_minimum(tmp_path) -> None:

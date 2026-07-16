@@ -800,6 +800,39 @@ def test_latest_result_reuses_owned_frame_buffer() -> None:
     assert worker.latest_result["frame"] is frame
 
 
+def test_task_artifact_snapshot_preserves_entropy_provenance() -> None:
+    worker = EdgeWorker.__new__(EdgeWorker)
+    worker.model_version = "0"
+    task = Task(1, 1, None, time.time(), (1, 1, 3))
+    task.result_source = "inference"
+    inference = _collection_job().inference
+    inference.feature_spectral_entropy = 0.25
+
+    feature_snapshot = EdgeWorker._task_artifact_snapshot(
+        worker,
+        task,
+        inference,
+        result_source="inference",
+    )
+
+    assert feature_snapshot["entropy"] == pytest.approx(0.25)
+    assert feature_snapshot["entropy_source"] == "feature_spectral_entropy"
+    assert feature_snapshot["logit_entropy"] is None
+    assert feature_snapshot["feature_spectral_entropy"] == pytest.approx(0.25)
+
+    inference.logit_entropy = 0.1
+    logit_snapshot = EdgeWorker._task_artifact_snapshot(
+        worker,
+        task,
+        inference,
+        result_source="inference",
+    )
+
+    assert logit_snapshot["entropy"] == pytest.approx(0.1)
+    assert logit_snapshot["entropy_source"] == "logit_entropy"
+    assert logit_snapshot["logit_entropy"] == pytest.approx(0.1)
+
+
 def test_cached_frame_boundary_attempts_pending_model_update() -> None:
     worker = EdgeWorker.__new__(EdgeWorker)
     worker._stop_event = threading.Event()

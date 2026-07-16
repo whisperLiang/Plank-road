@@ -451,6 +451,30 @@ def test_fig3_omits_missing_inference_latency_without_skipping_breakdown(
     )
 
 
+def test_fig3_keeps_inference_latency_when_retraining_breakdown_is_missing(
+    tmp_path: Path,
+) -> None:
+    normalized = tmp_path / "normalized"
+    figures = tmp_path / "figures"
+    _write_complete_normalized(normalized, repeats=1)
+    latency_rows = [
+        row
+        for row in read_csv(normalized / "latency_breakdown.csv")
+        if not (row["scenario_name"] == "Rainy" and row["method"] == "SURGEON")
+    ]
+    write_csv(normalized / "latency_breakdown.csv", LATENCY_FIELDS, latency_rows)
+
+    report = plot_figures(normalized, figures)
+
+    metadata = report["figure_metadata"]["fig3_retraining_time_breakdown"]
+    assert "Rainy/SURGEON" in metadata["inference_latency_ms"]
+    assert "Rainy/SURGEON" not in metadata["component_seconds"]
+    assert any(
+        "Rainy/SURGEON missing latency rows" in warning
+        for warning in report["partial_data"]["fig3_retraining_time_breakdown"]
+    )
+
+
 def test_single_scenario_results_do_not_draw_empty_scenario_panels(tmp_path: Path) -> None:
     normalized = tmp_path / "normalized"
     figures = tmp_path / "figures"

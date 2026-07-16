@@ -236,6 +236,72 @@ baseline:
     assert config.baseline.SURGEON.train_sample_count == 32
 
 
+def test_pure_edge_adaptive_entropy_gate_config_loads(tmp_path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+baseline:
+  SURGEON:
+    entropy_margin_ratio: 0.4
+    adaptive_entropy_gate: true
+    max_entropy_margin_ratio: 0.7
+""",
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(path)
+
+    assert config.baseline.SURGEON.adaptive_entropy_gate is True
+    assert config.baseline.SURGEON.max_entropy_margin_ratio == pytest.approx(0.7)
+
+
+def test_pure_edge_adaptive_entropy_gate_requires_boolean(tmp_path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+baseline:
+  SURGEON:
+    adaptive_entropy_gate: "false"
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="baseline.SURGEON.adaptive_entropy_gate must be a boolean",
+    ):
+        load_runtime_config(path)
+
+
+@pytest.mark.parametrize(
+    ("entropy_margin", "max_entropy_margin", "message"),
+    [
+        (0.8, 0.7, "entropy_margin_ratio must be <="),
+        (0.4, 1.1, "max_entropy_margin_ratio must be <= 1"),
+        (0.4, -0.1, "max_entropy_margin_ratio"),
+    ],
+)
+def test_pure_edge_entropy_gate_margins_are_validated(
+    tmp_path,
+    entropy_margin: float,
+    max_entropy_margin: float,
+    message: str,
+) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        f"""
+baseline:
+  SURGEON:
+    entropy_margin_ratio: {entropy_margin}
+    max_entropy_margin_ratio: {max_entropy_margin}
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        load_runtime_config(path)
+
+
 def test_pure_edge_training_frame_count_override_requires_positive_value(
     tmp_path,
 ) -> None:

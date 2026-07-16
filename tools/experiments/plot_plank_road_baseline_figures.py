@@ -1084,6 +1084,23 @@ def _plot_fig3(
     component_values_meta: dict[str, dict[str, float]] = defaultdict(dict)
     for scenario in scenarios:
         for method in METHOD_ORDER:
+            summary_keys = [
+                key for key in summary_groups if key[0] == scenario and key[1] == method
+            ]
+            for key in summary_keys:
+                run_values = [
+                    float(value)
+                    for row in summary_groups.get(key, [])
+                    if (value := optional_float(row.get("mean_latency_ms"))) is not None
+                    and math.isfinite(value)
+                ]
+                if run_values:
+                    inference_by_method[(scenario, method)].append(float(np.mean(run_values)))
+                else:
+                    partial.append(
+                        f"{scenario}/{_method_label(method)}/{key[2]}: "
+                        "mean_latency_ms missing for Fig.3 inference latency"
+                    )
             method_keys = [
                 key for key in run_components if key[0] == scenario and key[1] == method
             ]
@@ -1111,20 +1128,6 @@ def _plot_fig3(
             totals_by_method[(scenario, method)].extend(
                 total for key in method_keys if (total := run_totals.get(key)) is not None
             )
-            for key in method_keys:
-                run_values = [
-                    float(value)
-                    for row in summary_groups.get(key, [])
-                    if (value := optional_float(row.get("mean_latency_ms"))) is not None
-                    and math.isfinite(value)
-                ]
-                if run_values:
-                    inference_by_method[(scenario, method)].append(float(np.mean(run_values)))
-                else:
-                    partial.append(
-                        f"{scenario}/{_method_label(method)}/{key[2]}: "
-                        "mean_latency_ms missing for Fig.3 inference latency"
-                    )
 
     if not values:
         return [], "retraining time components missing", partial, {}
