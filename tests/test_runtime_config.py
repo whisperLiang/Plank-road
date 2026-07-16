@@ -9,7 +9,7 @@ def test_default_config_loads_for_main_runtime() -> None:
     config = load_runtime_config("./config/config.yaml")
 
     assert config.baseline.enabled is False
-    assert config.server.edge_model_name == "yolo26n"
+    assert config.server.edge_model_name == "rfdetr_nano"
 
 
 def test_ekya_uses_common_server_models_without_method_override(tmp_path) -> None:
