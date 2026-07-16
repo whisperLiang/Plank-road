@@ -1,7 +1,7 @@
 experiment_run:
- experiment_id: suwon5a_weather_rainy_yolo26
- scenario: rainy
- video_path: ./video_data/rainy.mp4
+ experiment_id: suwon5a_weather_yolo26
+ scenario: snowy
+ video_path: ./video_data/snowy.mp4
  max_count: 5000
  edge_count: 1
  repeat: 1
@@ -31,7 +31,7 @@ baseline:
   train_sample_count: 16
   # Keep local TTA conservative: require a persistent drift window, adapt for
   # only a few steps, and reject updates supported by too few confident logits.
-  num_epoch: 3
+  num_epoch: 30
   require_drift: true
   min_detection_confidence: 0.6
   min_selected_logit_count: 16
