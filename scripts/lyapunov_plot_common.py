@@ -25,6 +25,17 @@ ACTION_LEGEND_LABELS = (
 )
 
 
+def budget_line_specs(trigger) -> tuple[tuple[float, str], ...]:
+    cloud_budget = float(trigger.lambda_cloud)
+    bandwidth_budget = float(trigger.lambda_bw)
+    if np.isclose(cloud_budget, bandwidth_budget):
+        return ((cloud_budget, r"Budgets $\lambda_c=\lambda_b$"),)
+    return (
+        (cloud_budget, r"Cloud budget $\lambda_c$"),
+        (bandwidth_budget, r"Bandwidth budget $\lambda_b$"),
+    )
+
+
 def build_trigger(config_path: Path = CONFIG_PATH):
     return create_resource_aware_trigger(load_runtime_config(config_path).client)
 
@@ -67,16 +78,23 @@ def compute_action_scores(
     q_bw: float | Any = 0.0,
     training_enabled: bool = True,
 ) -> dict[str, Any]:
+    cloud_factor = trigger.feature_cloud_cost_factor
     skip_score = trigger.V * urgency
     raw_only_score = (
-        trigger.w_cloud * (q_cloud + compute_pressure) * (1.0 + compute_pressure)
-        + trigger.w_bw * (q_bw + raw_only_bw_pressure) * (1.0 + raw_only_bw_pressure)
+        trigger.w_cloud * q_cloud * compute_pressure
+        + trigger.w_bw * q_bw * raw_only_bw_pressure
+        + trigger.w_cloud * compute_pressure * (1.0 + compute_pressure)
+        + trigger.w_bw * raw_only_bw_pressure * (1.0 + raw_only_bw_pressure)
         + compute_pressure * feature_ratio
     )
     raw_plus_feature_score = (
-        trigger.w_cloud * (q_cloud + compute_pressure) * (1.0 + 0.5 * compute_pressure)
+        trigger.w_cloud * q_cloud * cloud_factor * compute_pressure
+        + trigger.w_bw * q_bw * raw_plus_feature_bw_pressure
+        + trigger.w_cloud
+        * compute_pressure
+        * (1.0 + cloud_factor * compute_pressure)
         + trigger.w_bw
-        * (q_bw + raw_plus_feature_bw_pressure)
+        * raw_plus_feature_bw_pressure
         * (1.0 + raw_plus_feature_bw_pressure)
         + (1.0 + raw_plus_feature_bw_pressure) * feature_ratio
     )

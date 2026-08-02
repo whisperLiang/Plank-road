@@ -106,10 +106,14 @@ class ResourceAwareTriggerConfig(ConfigSection):
     probe_interval_sec: float = 5.0
     probe_timeout_sec: float = 3.0
     bandwidth_probe_size_bytes: int = 65536
+    V: float = 10.0
+    K_p: float = 1.0
+    K_d: float = 0.5
     lambda_cloud: float = 0.5
     lambda_bw: float = 0.5
     w_cloud: float = 1.0
     w_bw: float = 1.0
+    feature_cloud_cost_factor: float = 0.5
     min_training_samples: int = 10
     drift_bonus: float = 0.35
     upload_time_budget_sec: float = 5.0
@@ -1548,6 +1552,14 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         "client.resource_aware_trigger.bandwidth_probe_size_bytes",
         int(config.client.resource_aware_trigger.bandwidth_probe_size_bytes),
     )
+    feature_cloud_cost_factor = float(
+        config.client.resource_aware_trigger.feature_cloud_cost_factor
+    )
+    if not 0.0 <= feature_cloud_cost_factor <= 1.0:
+        raise ValueError(
+            "client.resource_aware_trigger.feature_cloud_cost_factor must be within [0, 1], "
+            f"got {feature_cloud_cost_factor!r}"
+        )
     if bundle_min_bytes > bundle_max_bytes:
         raise ValueError(
             "client.resource_aware_trigger.bundle_min_bytes must be <= "

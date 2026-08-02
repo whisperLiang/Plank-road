@@ -107,6 +107,7 @@ class ResourceAwareCLTrigger:
         lambda_bw: float = 0.5,
         w_cloud: float = 1.0,
         w_bw: float = 1.0,
+        feature_cloud_cost_factor: float = 0.5,
         min_training_samples: int = 1,
         drift_bonus: float = 0.35,
         upload_time_budget_sec: float = 5.0,
@@ -121,6 +122,10 @@ class ResourceAwareCLTrigger:
         self.lambda_bw = float(lambda_bw)
         self.w_cloud = float(w_cloud)
         self.w_bw = float(w_bw)
+        self.feature_cloud_cost_factor = max(
+            0.0,
+            min(1.0, float(feature_cloud_cost_factor)),
+        )
         self.min_training_samples = int(min_training_samples)
         self.drift_bonus = float(drift_bonus)
         self.upload_time_budget_sec = float(upload_time_budget_sec)
@@ -229,19 +234,33 @@ class ResourceAwareCLTrigger:
         low_conf_feature_ratio = stats.low_quality_feature_bytes / float(
             max(raw_plus_feature_payload_bytes, 1)
         )
+        raw_only_cloud_cost = compute_pressure
+        raw_plus_feature_cloud_cost = self.feature_cloud_cost_factor * compute_pressure
 
         no_train_score = self.V * urgency
-        raw_only_score = (
-            self.w_cloud * (self.Q_cloud + compute_pressure) * (1.0 + compute_pressure)
-            + self.w_bw * (self.Q_bw + raw_only_bw_pressure) * (1.0 + raw_only_bw_pressure)
+        raw_only_regularizer = (
+            self.w_cloud * compute_pressure * (1.0 + compute_pressure)
+            + self.w_bw * raw_only_bw_pressure * (1.0 + raw_only_bw_pressure)
             + compute_pressure * low_conf_feature_ratio
         )
-        raw_plus_feature_score = (
-            self.w_cloud * (self.Q_cloud + compute_pressure) * (1.0 + 0.5 * compute_pressure)
+        raw_only_score = (
+            self.w_cloud * self.Q_cloud * raw_only_cloud_cost
+            + self.w_bw * self.Q_bw * raw_only_bw_pressure
+            + raw_only_regularizer
+        )
+        raw_plus_feature_regularizer = (
+            self.w_cloud
+            * compute_pressure
+            * (1.0 + self.feature_cloud_cost_factor * compute_pressure)
             + self.w_bw
-            * (self.Q_bw + raw_plus_feature_bw_pressure)
+            * raw_plus_feature_bw_pressure
             * (1.0 + raw_plus_feature_bw_pressure)
             + (1.0 + raw_plus_feature_bw_pressure) * low_conf_feature_ratio
+        )
+        raw_plus_feature_score = (
+            self.w_cloud * self.Q_cloud * raw_plus_feature_cloud_cost
+            + self.w_bw * self.Q_bw * raw_plus_feature_bw_pressure
+            + raw_plus_feature_regularizer
         )
         if training_disabled:
             raw_only_score = float("inf")
@@ -259,7 +278,9 @@ class ResourceAwareCLTrigger:
         selected_cloud_cost = 0.0
         selected_bw_cost = 0.0
         if train_now:
-            selected_cloud_cost = compute_pressure
+            selected_cloud_cost = (
+                raw_plus_feature_cloud_cost if send_low_conf_features else raw_only_cloud_cost
+            )
             selected_bw_cost = (
                 raw_plus_feature_bw_pressure if send_low_conf_features else raw_only_bw_pressure
             )
@@ -372,6 +393,7 @@ def create_resource_aware_trigger(config: Any) -> ResourceAwareCLTrigger:
         lambda_bw=float(_get("lambda_bw", 0.5, ra)),
         w_cloud=float(_get("w_cloud", 1.0, ra)),
         w_bw=float(_get("w_bw", 1.0, ra)),
+        feature_cloud_cost_factor=float(_get("feature_cloud_cost_factor", 0.5, ra)),
         min_training_samples=int(
             _get("min_training_samples", getattr(retrain, "collect_num", 1), ra)
         ),

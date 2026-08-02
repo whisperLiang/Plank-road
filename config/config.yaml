@@ -1,7 +1,7 @@
 experiment_run:
- experiment_id: suwon5a_weather_rainy_yolo26
- scenario: rainy
- video_path: ./video_data/rainy.mp4
+ experiment_id: suwon5a_weather_yolo26
+ scenario: snowy
+ video_path: ./video_data/snowy.mp4
  max_count: 5000
  edge_count: 1
  repeat: 1
@@ -95,10 +95,10 @@ client:
  # the max wait time
  wait_thresh: 100
  frame_cache_maxsize: 100
- lightweight: rfdetr_nano
+ lightweight: yolo26n
  # Explicit custom YOLO26 checkpoint. Keep model name as the architecture
  # (yolo26n) and point weights_path at your trained checkpoint.
- weights_path: ./model_management/models/rf-detr-nano.pth
+ weights_path: ./model_management/models/yolo26n.pt
  # Optional display names for custom zero-based checkpoints. Leave empty for
  # COCO models, or fill in the exact training-class order, e.g. ["car", "bus"].
  class_names: ["unidentified", "others", "pedestrian", "micromobility", "car", "bus", "small truck", "truck"]
@@ -167,20 +167,10 @@ client:
   low_quality_rate_threshold: 0.3
   persistence_windows: 3
 
- # Resource-aware CL trigger (two-queue Lyapunov scheduler)
- # Reference: RCCDA (NeurIPS 2025) — Lyapunov drift-plus-penalty
- # https://github.com/Adampi210/RCCDA_resource_constrained_concept_drift_adaptation_code
- #
- # When enabled, gates the teacher-needed/window-drift trigger with a two-queue
- # Lyapunov policy that jointly decides (1) whether to trigger CL and
- # (2) whether teacher-needed samples should also upload features, considering:
- #   - Cloud resource state (CPU / GPU / memory utilisation)
- #   - Network bandwidth to the cloud
- #   - Edge-side teacher-needed sample rate
- #
- # Virtual queues:
- #   Q_cloud  — bounds average cloud cost    ≤  lambda_cloud
- #   Q_bw     — bounds average bandwidth     ≤  lambda_bw
+ # Virtual queues constrain normalized pressure-weighted costs, not raw GPU
+ # seconds or bytes:
+ #   Q_cloud  — average normalized cloud cost ≤ lambda_cloud
+ #   Q_bw     — average normalized link cost  ≤ lambda_bw
  resource_aware_trigger:
   enabled: True
   probe_interval_sec: 5.0
@@ -198,6 +188,7 @@ client:
   # --- Queue importance weights ---
   w_cloud: 1.0           # weight for cloud-cost queue
   w_bw: 1.0              # weight for bandwidth queue
+  feature_cloud_cost_factor: 0.5  # raw+feature cloud cost relative to raw-only
   min_training_samples: 80
   drift_bonus: 0.20
   upload_time_budget_sec: 5.0
@@ -229,9 +220,9 @@ server:
  server_id: 0
  golden: rtdetr_x
  # lightweight model used to generate fine-tuned weights for the edge
- edge_model_name: rfdetr_nano
+ edge_model_name: yolo26n
  # Cloud-side starting point for retraining the edge model; golden uses server.golden.
- weights_path: ./model_management/models/rf-detr-nano.pth
+ weights_path: ./model_management/models/yolo26n.pt
  tinynext_input_size: 640
  # gRPC listen address for the cloud server
  listen_address: "[::]:50051"
