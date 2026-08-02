@@ -16,7 +16,7 @@ dependencies = [
   "opencv-python==4.11.0.86",
   "ortools==9.15.6755",
   "pandas==2.3.3",
-  "Pillow>=10.0",
+  "Pillow>=12.3.0",
   "protobuf>=6.33.5",
   "psutil==7.2.2",
   "pytest>=9.0.3",
@@ -25,10 +25,11 @@ dependencies = [
   "safetensors>=0.4.5",
   "rfdetr>=1.6.5",
   "timm>=1.0.26",
-  "torch>=2.11.0",
+  "setuptools>=83.0.0",
+  "torch>=2.13.0",
   "torchmetrics>=1.8.0",
   "torchlens==2.18.0",
-  "torchvision>=0.26.0",
+  "torchvision>=0.28.0",
   "tqdm>=4.66",
   "transformers",
   "ultralytics>=8.4.41",
@@ -43,7 +44,7 @@ torchlens = { path = "torchlens-2.18.0-py3-none-any.whl" }
 integration = [
   "rfdetr>=1.6.5",
   "timm>=1.0.26",
-  "torchvision>=0.26.0",
+  "torchvision>=0.28.0",
   "ultralytics>=8.4.41",
 ]
 
