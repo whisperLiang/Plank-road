@@ -10,7 +10,7 @@ import torch
 
 from model_management.payload import BoundaryPayload
 
-BOUNDARY_CACHE_PROTOCOL = "torchlens-native-boundary-v2"
+BOUNDARY_CACHE_PROTOCOL = "torchlens-native-boundary"
 
 
 def _runtime_from(value: Any) -> Any:

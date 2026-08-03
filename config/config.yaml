@@ -126,6 +126,11 @@ client:
   storage_format: "safetensors_shard"
   shard_max_samples: 64
   shard_dtype: null # e.g. float16; null to inherit model dtype
+  # Every training trigger already carries 128 teacher-needed raw samples and
+  # the cloud rebuilds their boundary features. Continuously syncing trusted
+  # feature tensors is therefore redundant for this profile and can exceed the
+  # memory available on Jetson-class edges while serializing large shards.
+  sync_high_quality: false
   include_index_json: true
   include_meta_json: true
  continual_learning:
@@ -157,15 +162,44 @@ client:
    ema_decay: 0.95
    deviation_threshold: 1.5
    min_std: 1.0e-4
+   # Prevent a near-zero early variance from turning harmless numerical noise
+   # into a permanent anomaly, and do not let confirmed outliers move the baseline.
+   relative_std_floor: 0.02
+   update_on_anomaly: false
    warmup_samples: 20
+  # Bootstrap one complete cloud training window after startup, then retain only
+  # one in four ordinary low-quality observations after the first model update.
+  # All observations still feed drift detection.
+  teacher_sampling:
+   enabled: true
+   initial_stride: 1
+   base_stride: 4
+   critical_stride: 2
+   critical_confidence: 0.40
+   critical_output_entropy_ratio: 1.50
+   critical_feature_deviation: 6.0
+   retain_empty_predictions: false
   eps: 1.0e-8
   persist_debug_stats: false
  # Sliding-window drift state. Drift is not stored as a sample category.
  window_drift:
   window_size: 100
-  min_window_size: 30
-  low_quality_rate_threshold: 0.3
-  persistence_windows: 3
+  min_window_size: 60
+  # With the conservative 25th-percentile trust gate, a high low-quality rate is
+  # expected. Drift therefore requires a sustained severe rate, not merely >30%.
+  low_quality_rate_threshold: 0.80
+  persistence_windows: 2
+  # Persistence counts spaced checkpoints rather than adjacent overlapping frames.
+  evaluation_stride: 50
+  recovery_rate_threshold: 0.65
+  recovery_windows: 2
+  # Independent precision guard: a smaller fraction of severe anomalies can
+  # confirm drift even when the aggregate low-quality rate remains below 0.80.
+  severe_anomaly_rate_threshold: 0.20
+  recovery_severe_anomaly_rate: 0.10
+  critical_confidence: 0.40
+  critical_output_entropy_ratio: 1.50
+  critical_feature_deviation: 6.0
 
  # Virtual queues constrain normalized pressure-weighted costs, not raw GPU
  # seconds or bytes:
@@ -173,6 +207,9 @@ client:
  #   Q_bw     — average normalized link cost  ≤ lambda_bw
  resource_aware_trigger:
   enabled: True
+  # Only model version 0 may bootstrap once enough teacher-needed samples have
+  # accumulated. Updated models still require persistent drift confirmation.
+  bootstrap_without_drift: True
   probe_interval_sec: 5.0
   probe_timeout_sec: 3.0
   bandwidth_probe_size_bytes: 65536
@@ -189,7 +226,19 @@ client:
   w_cloud: 1.0           # weight for cloud-cost queue
   w_bw: 1.0              # weight for bandwidth queue
   feature_cloud_cost_factor: 0.5  # raw+feature cloud cost relative to raw-only
-  min_training_samples: 80
+  # This is the number of retained teacher-needed samples, not total cached samples.
+  # The bootstrap bundle fills the cloud's 128-sample training window by itself,
+  # avoiding both undersized requests and dependence on large feature uploads.
+  min_training_samples: 128
+  min_training_samples_by_model:
+   rfdetr_nano: 64
+  # The cloud trains on exactly 128 recent samples. Do not upload older samples
+  # that would be discarded immediately when the recent window is truncated.
+  max_training_samples: 128
+  max_training_samples_by_model:
+   rfdetr_nano: 64
+  cooldown_decisions: 75
+  min_training_interval_sec: 180
   drift_bonus: 0.20
   upload_time_budget_sec: 5.0
   # CL bundle byte budget. With a bandwidth estimate, the edge caps the
@@ -335,6 +384,18 @@ server:
   proxy_eval_max_samples: 128
   proxy_eval_validation_fraction: 0.2
   proxy_eval_max_dets: 500
+  # YOLO showed cross-round forgetting on the rainy stream. Keep a cloud-only
+  # reservoir and mix 25% older anchors into each 128-sample training window;
+  # this does not add edge uploads. RF-DETR keeps the latest-only policy that
+  # performed best in the snowy experiment.
+  training_replay_fraction: 0.0
+  training_replay_fraction_by_model:
+   yolo26n: 0.25
+  training_replay_retention_multiplier: 4
+  # Match the edge-side model profile: RF-DETR adapts reliably from 64 samples,
+  # while YOLO retains the default 128-sample window.
+  training_frame_count_by_model:
+   rfdetr_nano: 64
   # RF-DETR fixed-split jobs shrink the effective runtime batch size toward
   # this many optimizer steps per outer round so small bundles do not collapse
   # into a single heavily padded update.
@@ -347,7 +408,9 @@ server:
   teacher_annotation:
    async_enabled: true
    cache_enabled: true
-   wait_timeout_sec: 2
+   # A training request must wait for its already-submitted teacher batches. A
+   # two-second timeout previously converted a valid request into a redundant retry.
+   wait_timeout_sec: 30
    worker_batch_size: 32
    worker_max_queue_size: 4096
    worker_max_retries: 2

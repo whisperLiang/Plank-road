@@ -84,6 +84,9 @@ class TrainingDecision:
     bundle_cap_bytes: int | None = None
     action_scores: dict[str, float] = field(default_factory=dict)
     reason: str = ""
+    cooldown_remaining_decisions: int = 0
+    cooldown_remaining_sec: float = 0.0
+    trigger_token: int | None = None
 
 
 class ResourceAwareCLTrigger:
@@ -109,11 +112,14 @@ class ResourceAwareCLTrigger:
         w_bw: float = 1.0,
         feature_cloud_cost_factor: float = 0.5,
         min_training_samples: int = 1,
+        max_training_samples: int = 0,
         drift_bonus: float = 0.35,
         upload_time_budget_sec: float = 5.0,
         bundle_max_bytes: int = 33554432,
         bundle_min_bytes: int = 8388608,
         bundle_target_upload_sec: float = 45.0,
+        cooldown_decisions: int = 0,
+        min_training_interval_sec: float = 0.0,
     ) -> None:
         self.V = float(V)
         self.K_p = float(K_p)
@@ -127,11 +133,14 @@ class ResourceAwareCLTrigger:
             min(1.0, float(feature_cloud_cost_factor)),
         )
         self.min_training_samples = int(min_training_samples)
+        self.max_training_samples = max(0, int(max_training_samples))
         self.drift_bonus = float(drift_bonus)
         self.upload_time_budget_sec = float(upload_time_budget_sec)
         self.bundle_max_bytes = max(1, int(bundle_max_bytes))
         self.bundle_min_bytes = max(1, min(int(bundle_min_bytes), self.bundle_max_bytes))
         self.bundle_target_upload_sec = max(1e-6, float(bundle_target_upload_sec))
+        self.cooldown_decisions = max(0, int(cooldown_decisions))
+        self.min_training_interval_sec = max(0.0, float(min_training_interval_sec))
 
         self.Q_cloud = 0.0
         self.Q_bw = 0.0
@@ -139,6 +148,9 @@ class ResourceAwareCLTrigger:
         self.loss_prev = 0.0
         self.step = 0
         self.trigger_count = 0
+        self._last_trigger_step: int | None = None
+        self._last_trigger_monotonic: float | None = None
+        self._pending_trigger_costs: dict[int, tuple[float, float]] = {}
         self.history: list[dict[str, Any]] = []
 
     @property
@@ -161,7 +173,38 @@ class ResourceAwareCLTrigger:
         self.loss_prev = 0.0
         self.step = 0
         self.trigger_count = 0
+        self._last_trigger_step = None
+        self._last_trigger_monotonic = None
+        self._pending_trigger_costs.clear()
         self.history.clear()
+
+    def confirm_trigger(self, decision: TrainingDecision) -> None:
+        """Commit resource costs and cooldown after the cloud accepts a job."""
+
+        token = decision.trigger_token
+        if not decision.train_now or token is None:
+            raise ValueError("Only a pending training decision can be confirmed.")
+        costs = self._pending_trigger_costs.pop(int(token), None)
+        if costs is None:
+            raise RuntimeError("Training decision is not pending or was already resolved.")
+        selected_cloud_cost, selected_bw_cost = costs
+        self.trigger_count += 1
+        self._last_trigger_step = int(token)
+        self._last_trigger_monotonic = time.monotonic()
+        self.Q_cloud = max(0.0, self.Q_cloud + selected_cloud_cost - self.lambda_cloud)
+        self.Q_bw = max(0.0, self.Q_bw + selected_bw_cost - self.lambda_bw)
+
+    def cancel_trigger(self, decision: TrainingDecision) -> None:
+        """Release an unaccepted decision without arming post-trigger cooldown."""
+
+        token = decision.trigger_token
+        if token is None:
+            return
+        costs = self._pending_trigger_costs.pop(int(token), None)
+        if costs is None:
+            return
+        self.Q_cloud = max(0.0, self.Q_cloud - self.lambda_cloud)
+        self.Q_bw = max(0.0, self.Q_bw - self.lambda_bw)
 
     def _urgency(
         self,
@@ -230,7 +273,21 @@ class ResourceAwareCLTrigger:
         raw_plus_feature_bw_pressure = self._bandwidth_pressure(
             bandwidth_mbps, raw_plus_feature_payload_bytes
         )
-        training_disabled = stats.total_samples < max(1, self.min_training_samples)
+        training_disabled = stats.low_quality_count < max(1, self.min_training_samples)
+        cooldown_remaining_decisions = 0
+        if self._last_trigger_step is not None:
+            decisions_since_trigger = max(0, self.step - self._last_trigger_step)
+            cooldown_remaining_decisions = max(
+                0,
+                self.cooldown_decisions - decisions_since_trigger,
+            )
+        cooldown_remaining_sec = 0.0
+        if self._last_trigger_monotonic is not None:
+            cooldown_remaining_sec = max(
+                0.0,
+                self.min_training_interval_sec - (time.monotonic() - self._last_trigger_monotonic),
+            )
+        cooldown_active = cooldown_remaining_decisions > 0 or cooldown_remaining_sec > 0.0
         low_conf_feature_ratio = stats.low_quality_feature_bytes / float(
             max(raw_plus_feature_payload_bytes, 1)
         )
@@ -252,9 +309,7 @@ class ResourceAwareCLTrigger:
             self.w_cloud
             * compute_pressure
             * (1.0 + self.feature_cloud_cost_factor * compute_pressure)
-            + self.w_bw
-            * raw_plus_feature_bw_pressure
-            * (1.0 + raw_plus_feature_bw_pressure)
+            + self.w_bw * raw_plus_feature_bw_pressure * (1.0 + raw_plus_feature_bw_pressure)
             + (1.0 + raw_plus_feature_bw_pressure) * low_conf_feature_ratio
         )
         raw_plus_feature_score = (
@@ -262,7 +317,7 @@ class ResourceAwareCLTrigger:
             + self.w_bw * self.Q_bw * raw_plus_feature_bw_pressure
             + raw_plus_feature_regularizer
         )
-        if training_disabled:
+        if training_disabled or cooldown_active:
             raw_only_score = float("inf")
             raw_plus_feature_score = float("inf")
 
@@ -277,6 +332,7 @@ class ResourceAwareCLTrigger:
 
         selected_cloud_cost = 0.0
         selected_bw_cost = 0.0
+        trigger_token: int | None = None
         if train_now:
             selected_cloud_cost = (
                 raw_plus_feature_cloud_cost if send_low_conf_features else raw_only_cloud_cost
@@ -284,13 +340,29 @@ class ResourceAwareCLTrigger:
             selected_bw_cost = (
                 raw_plus_feature_bw_pressure if send_low_conf_features else raw_only_bw_pressure
             )
-            self.trigger_count += 1
+            trigger_token = int(self.step)
+            self._pending_trigger_costs[trigger_token] = (
+                float(selected_cloud_cost),
+                float(selected_bw_cost),
+            )
 
         self.step += 1
-        self.Q_cloud = max(0.0, self.Q_cloud + selected_cloud_cost - self.lambda_cloud)
-        self.Q_bw = max(0.0, self.Q_bw + selected_bw_cost - self.lambda_bw)
-
         if not train_now:
+            self.Q_cloud = max(0.0, self.Q_cloud - self.lambda_cloud)
+            self.Q_bw = max(0.0, self.Q_bw - self.lambda_bw)
+
+        if training_disabled:
+            reason = (
+                "Skipped training until enough teacher-needed samples accumulate "
+                f"({stats.low_quality_count}/{max(1, self.min_training_samples)})."
+            )
+        elif cooldown_active:
+            reason = (
+                "Skipped training during the post-trigger cooldown "
+                f"({cooldown_remaining_decisions} decisions, "
+                f"{cooldown_remaining_sec:.1f}s remaining)."
+            )
+        elif not train_now:
             reason = "Skipped training because Lyapunov penalty outweighed adaptation gain."
         elif send_low_conf_features:
             reason = (
@@ -314,6 +386,9 @@ class ResourceAwareCLTrigger:
             bundle_cap_bytes=self.effective_bundle_cap_bytes(float(bandwidth_mbps)),
             action_scores=action_scores,
             reason=reason,
+            cooldown_remaining_decisions=int(cooldown_remaining_decisions),
+            cooldown_remaining_sec=float(cooldown_remaining_sec),
+            trigger_token=trigger_token,
         )
         self.history.append(
             {
@@ -327,6 +402,8 @@ class ResourceAwareCLTrigger:
                 "bandwidth_mbps": float(bandwidth_mbps),
                 "bundle_cap_bytes": decision.bundle_cap_bytes,
                 "action_scores": action_scores,
+                "cooldown_remaining_decisions": int(cooldown_remaining_decisions),
+                "cooldown_remaining_sec": float(cooldown_remaining_sec),
             }
         )
         return decision
@@ -375,6 +452,7 @@ def estimate_bandwidth(
 def create_resource_aware_trigger(config: Any) -> ResourceAwareCLTrigger:
     ra = getattr(config, "resource_aware_trigger", None)
     retrain = getattr(config, "retrain", None)
+    model_name = str(getattr(config, "lightweight", "") or "").strip()
 
     def _get(key: str, default: Any, *sources: Any) -> Any:
         for source in sources:
@@ -384,6 +462,10 @@ def create_resource_aware_trigger(config: Any) -> ResourceAwareCLTrigger:
             if value is not None:
                 return value
         return default
+
+    def _model_value(key: str, default: Any) -> Any:
+        values = dict(getattr(ra, f"{key}_by_model", {}) or {})
+        return values.get(model_name, _get(key, default, ra))
 
     return ResourceAwareCLTrigger(
         V=float(_get("V", 10.0, ra)),
@@ -395,11 +477,14 @@ def create_resource_aware_trigger(config: Any) -> ResourceAwareCLTrigger:
         w_bw=float(_get("w_bw", 1.0, ra)),
         feature_cloud_cost_factor=float(_get("feature_cloud_cost_factor", 0.5, ra)),
         min_training_samples=int(
-            _get("min_training_samples", getattr(retrain, "collect_num", 1), ra)
+            _model_value("min_training_samples", getattr(retrain, "collect_num", 1))
         ),
+        max_training_samples=int(_model_value("max_training_samples", 0)),
         drift_bonus=float(_get("drift_bonus", 0.35, ra)),
         upload_time_budget_sec=float(_get("upload_time_budget_sec", 5.0, ra)),
         bundle_max_bytes=int(_get("bundle_max_bytes", 33554432, ra)),
         bundle_min_bytes=int(_get("bundle_min_bytes", 8388608, ra)),
         bundle_target_upload_sec=float(_get("bundle_target_upload_sec", 45.0, ra)),
+        cooldown_decisions=int(_get("cooldown_decisions", 0, ra)),
+        min_training_interval_sec=float(_get("min_training_interval_sec", 0.0, ra)),
     )

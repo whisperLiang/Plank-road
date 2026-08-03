@@ -161,6 +161,16 @@ client:
     bundle_max_bytes: 134217728
     bundle_min_bytes: 8388608
     bundle_target_upload_sec: 45.0
+    # Count retained teacher-needed samples and suppress repeated decisions
+    # after a trigger while the updated model is being evaluated.
+    min_training_samples: 128
+    min_training_samples_by_model:
+      rfdetr_nano: 64
+    max_training_samples: 128
+    max_training_samples_by_model:
+      rfdetr_nano: 64
+    cooldown_decisions: 75
+    min_training_interval_sec: 180
 ```
 
 ```yaml

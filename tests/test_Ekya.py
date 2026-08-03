@@ -469,7 +469,7 @@ def test_controller_training_window_includes_previous_decision_window(
     assert sorted(labels) == [1, 2, 3, 4]
 
 
-def test_controller_training_window_rejects_unlabeled_previous_window(
+def test_controller_rejects_training_when_previous_window_is_unlabeled(
     tmp_path: Path,
 ) -> None:
     from cloud.baselines.Ekya.controller import (
@@ -504,8 +504,11 @@ def test_controller_training_window_rejects_unlabeled_previous_window(
     with controller.frame_buffer._lock:
         controller.frame_buffer._completed_windows[previous.window_id] = previous
 
-    with pytest.raises(RuntimeError, match="previous decision window"):
-        controller._training_window_and_labels_for(current, _teacher_labels(3, 4))
+    with pytest.raises(RuntimeError, match="previous decision window to be labeled"):
+        controller._training_window_and_labels_for(
+            current,
+            _teacher_labels(3, 4),
+        )
 
 
 def test_ekya_config_reuses_common_server_models(tmp_path: Path) -> None:

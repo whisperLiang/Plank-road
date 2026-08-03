@@ -161,20 +161,27 @@ def _select_low_quality_trigger_records(
     *,
     send_low_conf_features: bool,
     bundle_cap_bytes: int | None,
+    max_samples: int | None = None,
     split_plan: SplitPlan | None = None,
 ) -> tuple[list, dict[str, Any]]:
     cap = None if bundle_cap_bytes is None else max(1, int(bundle_cap_bytes))
+    sample_cap = None if max_samples in (None, 0) else max(1, int(max_samples))
     selected = []
     selected_bytes = 0
     selected_feature_paths: set[str] = set()
-    omitted = 0
-    for record in sorted(
-        [record for record in records if record.quality_bucket == LOW_QUALITY],
-        key=_quality_sort_key,
-    ):
+    eligible = [record for record in records if record.quality_bucket == LOW_QUALITY]
+    ordered = sorted(eligible, key=_quality_sort_key)
+    if sample_cap is not None and len(ordered) > sample_cap:
+        drift_records = [record for record in ordered if record.in_drift_window]
+        regular_records = [record for record in ordered if not record.in_drift_window]
+        chosen = drift_records[-sample_cap:]
+        remaining = sample_cap - len(chosen)
+        if remaining > 0:
+            chosen = regular_records[-remaining:] + chosen
+        ordered = sorted(chosen, key=_quality_sort_key)
+    for record in ordered:
         raw_path = _record_abs_path(sample_store, record.raw_relpath)
         if raw_path is None or not os.path.exists(raw_path):
-            omitted += 1
             continue
         feature_paths = (
             _low_quality_trigger_feature_paths(record, split_plan=split_plan)
@@ -187,7 +194,6 @@ def _select_low_quality_trigger_records(
         )
         protected = bool(getattr(record, "in_drift_window", False))
         if cap is not None and not protected and selected and selected_bytes + source_bytes > cap:
-            omitted += 1
             continue
         selected.append(record)
         selected_bytes += source_bytes
@@ -199,8 +205,9 @@ def _select_low_quality_trigger_records(
             else "low_quality_trigger_raw_only"
         ),
         "bundle_cap_bytes": 0 if cap is None else int(cap),
+        "max_samples": 0 if sample_cap is None else int(sample_cap),
         "selected_sample_count": len(selected),
-        "omitted_sample_count": omitted + max(0, len(records) - len(selected) - omitted),
+        "omitted_sample_count": max(0, len(eligible) - len(selected)),
         "source_total_bytes": int(selected_bytes),
         "zip_payload_bytes": 0,
     }
@@ -348,6 +355,7 @@ def pack_low_quality_trigger_bundle(
     edge_session_id: str | None = None,
     model_metadata: Mapping[str, object] | None = None,
     bundle_cap_bytes: int | None = None,
+    max_samples: int | None = None,
     shard_size: int | None = None,
 ) -> tuple[bytes, dict]:
     zip_path, manifest, _ = pack_low_quality_trigger_bundle_to_file(
@@ -360,6 +368,7 @@ def pack_low_quality_trigger_bundle(
         edge_session_id=edge_session_id,
         model_metadata=model_metadata,
         bundle_cap_bytes=bundle_cap_bytes,
+        max_samples=max_samples,
         shard_size=shard_size,
     )
     try:
@@ -383,6 +392,7 @@ def pack_low_quality_trigger_bundle_to_file(
     edge_session_id: str | None = None,
     model_metadata: Mapping[str, object] | None = None,
     bundle_cap_bytes: int | None = None,
+    max_samples: int | None = None,
     shard_size: int | None = None,
     output_dir: str | None = None,
 ) -> tuple[str, dict, dict]:
@@ -403,6 +413,7 @@ def pack_low_quality_trigger_bundle_to_file(
         send_low_conf_features=send_low_conf_features,
         split_plan=split_plan,
         bundle_cap_bytes=bundle_cap_bytes,
+        max_samples=max_samples,
     )
     resolved_shard_size = max(1, int(shard_size or 64))
     model_meta = {
@@ -786,6 +797,7 @@ def submit_continual_learning_job(
     model_metadata: Mapping[str, object] | None = None,
     edge_session_id: str | None = None,
     bundle_cap_bytes: int | None = None,
+    max_samples: int | None = None,
     trigger_shard_size: int | None = None,
     bandwidth_mbps: float = 0.0,
     request_id: str | None = None,
@@ -818,11 +830,10 @@ def submit_continual_learning_job(
             edge_session_id=edge_session_id,
             model_metadata=model_metadata,
             bundle_cap_bytes=bundle_cap_bytes,
+            max_samples=max_samples,
             shard_size=trigger_shard_size,
         )
-        uploaded_sample_ids = [
-            str(value) for value in list(manifest.get("sample_ids", []) or [])
-        ]
+        uploaded_sample_ids = [str(value) for value in list(manifest.get("sample_ids", []) or [])]
         zip_payload_bytes = len(payload_zip)
         payload_metrics = measure_trigger_bundle_payload(payload_zip)
         selection_policy = dict(manifest.get("selection_policy", {}) or {})

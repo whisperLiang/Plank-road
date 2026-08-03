@@ -90,7 +90,7 @@ def test_high_quality_feature_label_shard_writes_runtime_contract_feature_abi(tm
         confidence=0.9,
         split_config_id="split-a",
         model_id="yolo26n",
-        model_version="v1",
+        model_version="1",
         front_version="1",
         quality_bucket=HIGH_QUALITY,
         inference_result={"boxes": [], "labels": [], "scores": []},
@@ -110,7 +110,7 @@ def test_high_quality_feature_label_shard_writes_runtime_contract_feature_abi(tm
         request_id="upload-abi",
         split_context={
             "model_id": contract.model_id,
-            "model_version": "v1",
+            "model_version": "1",
             "edge_session_id": "session-a",
             "front_version": contract.front_version,
             "split_config_id": contract.split_config_id,
@@ -143,6 +143,29 @@ def test_high_quality_feature_label_shard_writes_runtime_contract_feature_abi(tm
     assert index_payload["feature_abi_id"] == contract.feature_abi_id
     assert meta_payload["feature_abi_id"] == contract.feature_abi_id
     assert meta_payload["metadata"]["feature_abi_spec"] == contract.feature_abi_spec
+
+
+def test_split_runtime_contract_rejects_missing_current_identity() -> None:
+    tensors = {"boundary": torch.zeros((1, 2, 3), dtype=torch.float16)}
+    contract = SplitRuntimeContract.create(
+        edge_id=1,
+        model_id="yolo26n",
+        split_config_id="split-a",
+        canonical_split_key="after:test",
+        edge_split_id="after:test",
+        cloud_batch_split_id="after:test",
+        input_tensor_shape=[1, 3, 320, 320],
+        input_resize_mode="direct_resize",
+        boundary_tensor_labels=list(tensors),
+        front_version="1",
+        feature_tensors=tensors,
+        runtime_identity={"graph_signature": "current-contract"},
+    )
+    payload = contract.to_dict()
+    payload.pop("feature_abi_id")
+
+    with pytest.raises(ValueError, match="feature_abi_id"):
+        SplitRuntimeContract.from_dict(payload)
 
 
 def test_high_quality_safetensors_bundle_creates_nested_shard_paths(tmp_path) -> None:
@@ -178,7 +201,7 @@ def test_high_quality_safetensors_bundle_creates_nested_shard_paths(tmp_path) ->
         confidence=0.9,
         split_config_id="split-a",
         model_id="yolo26n",
-        model_version="v1",
+        model_version="1",
         front_version="1",
         quality_bucket=HIGH_QUALITY,
         inference_result={"boxes": [], "labels": [], "scores": []},
@@ -198,7 +221,7 @@ def test_high_quality_safetensors_bundle_creates_nested_shard_paths(tmp_path) ->
         request_id="upload-safetensors",
         split_context={
             "model_id": contract.model_id,
-            "model_version": "v1",
+            "model_version": "1",
             "front_version": contract.front_version,
             "split_config_id": contract.split_config_id,
             "canonical_split_key": contract.canonical_split_key,

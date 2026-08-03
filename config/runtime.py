@@ -16,9 +16,7 @@ from common.experiment_results import (
 )
 from config.baseline import ALLOWED_BASELINE_METHODS, validate_baseline_method
 
-_CANONICAL_ENV_PATH_SEGMENTS = {
-    method.casefold(): method for method in ALLOWED_BASELINE_METHODS
-}
+_CANONICAL_ENV_PATH_SEGMENTS = {method.casefold(): method for method in ALLOWED_BASELINE_METHODS}
 
 
 @dataclass
@@ -78,7 +76,21 @@ class BoundaryFeatureEntropyConfig(ConfigSection):
     ema_decay: float = 0.95
     deviation_threshold: float = 1.5
     min_std: float = 1.0e-4
+    relative_std_floor: float = 0.02
+    update_on_anomaly: bool = False
     warmup_samples: int = 20
+
+
+@dataclass
+class TeacherSamplingConfig(ConfigSection):
+    enabled: bool = True
+    initial_stride: int = 1
+    base_stride: int = 4
+    critical_stride: int = 2
+    critical_confidence: float = 0.40
+    critical_output_entropy_ratio: float = 1.50
+    critical_feature_deviation: float = 6.0
+    retain_empty_predictions: bool = False
 
 
 @dataclass
@@ -88,6 +100,7 @@ class SampleQualityConfig(ConfigSection):
     boundary_feature_entropy: BoundaryFeatureEntropyConfig = field(
         default_factory=BoundaryFeatureEntropyConfig
     )
+    teacher_sampling: TeacherSamplingConfig = field(default_factory=TeacherSamplingConfig)
     eps: float = 1.0e-8
     persist_debug_stats: bool = False
 
@@ -98,11 +111,20 @@ class WindowDriftConfig(ConfigSection):
     min_window_size: int = 30
     low_quality_rate_threshold: float = 0.3
     persistence_windows: int = 3
+    evaluation_stride: int = 1
+    recovery_rate_threshold: float = 0.24
+    recovery_windows: int = 2
+    severe_anomaly_rate_threshold: float = 0.20
+    recovery_severe_anomaly_rate: float = 0.10
+    critical_confidence: float = 0.40
+    critical_output_entropy_ratio: float = 1.50
+    critical_feature_deviation: float = 6.0
 
 
 @dataclass
 class ResourceAwareTriggerConfig(ConfigSection):
     enabled: bool = True
+    bootstrap_without_drift: bool = False
     probe_interval_sec: float = 5.0
     probe_timeout_sec: float = 3.0
     bandwidth_probe_size_bytes: int = 65536
@@ -115,6 +137,11 @@ class ResourceAwareTriggerConfig(ConfigSection):
     w_bw: float = 1.0
     feature_cloud_cost_factor: float = 0.5
     min_training_samples: int = 10
+    min_training_samples_by_model: dict[str, int] = field(default_factory=dict)
+    max_training_samples: int = 0
+    max_training_samples_by_model: dict[str, int] = field(default_factory=dict)
+    cooldown_decisions: int = 0
+    min_training_interval_sec: float = 0.0
     drift_bonus: float = 0.35
     upload_time_budget_sec: float = 5.0
     bundle_max_bytes: int = 33554432
@@ -127,6 +154,7 @@ class FeatureUploadConfig(ConfigSection):
     storage_format: str = "safetensors_shard"
     shard_max_samples: int = 64
     shard_dtype: str | None = None
+    sync_high_quality: bool = True
     include_index_json: bool = True
     include_meta_json: bool = True
 
@@ -142,8 +170,6 @@ class FixedSplitConfig(ConfigSection):
     configured_training_batch: int | None = None
     validation_batches: list[int] | None = None
     inference_num_threads: int = 12
-    # Deprecated compatibility field; fixed split planning validates all candidates.
-    max_candidates: int = 0
     max_boundary_count: int = 8
     max_payload_bytes: int = 33554432
     privacy_leakage_epsilon: float = 1e-12
@@ -225,6 +251,10 @@ class ContinualLearningConfig(ConfigSection):
     proxy_eval_patience: int = 0
     proxy_eval_min_delta: float = 0.0
     proxy_eval_frame_cache_enabled: bool = True
+    training_replay_fraction: float = 0.0
+    training_replay_fraction_by_model: dict[str, float] = field(default_factory=dict)
+    training_replay_retention_multiplier: int = 4
+    training_frame_count_by_model: dict[str, int] = field(default_factory=dict)
     split_learning_rate: float = 1e-3
     wrapper_fixed_split_learning_rate: float = 3e-5
     tinynext_fixed_split_learning_rate: float = 1e-3
@@ -324,9 +354,7 @@ class BaselineConfig(ConfigSection):
     edge: BaselineEdgeConfig = field(default_factory=BaselineEdgeConfig)
     training: BaselineTrainingConfig = field(default_factory=BaselineTrainingConfig)
     SURGEON: PureEdgeBaselineConfig = field(default_factory=PureEdgeBaselineConfig)
-    CATR: AccuracyTriggerBaselineConfig = field(
-        default_factory=AccuracyTriggerBaselineConfig
-    )
+    CATR: AccuracyTriggerBaselineConfig = field(default_factory=AccuracyTriggerBaselineConfig)
 
     def __post_init__(self) -> None:
         self.method = validate_baseline_method(self.method)
@@ -515,9 +543,7 @@ class ClientConfig(ConfigSection):
     continual_learning: ClientContinualLearningConfig = field(
         default_factory=ClientContinualLearningConfig
     )
-    experiment_results: ExperimentResultsConfig = field(
-        default_factory=ExperimentResultsConfig
-    )
+    experiment_results: ExperimentResultsConfig = field(default_factory=ExperimentResultsConfig)
 
 
 @dataclass
@@ -534,9 +560,7 @@ class ServerConfig(ConfigSection):
     workspace_root: str = "./cache/server_workspace"
     edge_affine_workers: EdgeAffineWorkersConfig = field(default_factory=EdgeAffineWorkersConfig)
     baselines: ServerBaselinesConfig = field(default_factory=ServerBaselinesConfig)
-    experiment_results: ExperimentResultsConfig = field(
-        default_factory=ExperimentResultsConfig
-    )
+    experiment_results: ExperimentResultsConfig = field(default_factory=ExperimentResultsConfig)
 
 
 @dataclass
@@ -545,9 +569,7 @@ class RuntimeConfig(ConfigSection):
     client: ClientConfig = field(default_factory=ClientConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     baseline: BaselineConfig = field(default_factory=BaselineConfig)
-    experiment_results: ExperimentResultsConfig = field(
-        default_factory=ExperimentResultsConfig
-    )
+    experiment_results: ExperimentResultsConfig = field(default_factory=ExperimentResultsConfig)
 
     def __post_init__(self) -> None:
         self.client.experiment_results = self.experiment_results
@@ -582,6 +604,10 @@ def _section(section_cls, value: Mapping[str, Any] | None):
         known["boundary_feature_entropy"] = _section(
             BoundaryFeatureEntropyConfig,
             known.get("boundary_feature_entropy"),
+        )
+        known["teacher_sampling"] = _section(
+            TeacherSamplingConfig,
+            known.get("teacher_sampling"),
         )
     elif section_cls is SplitLearningConfig:
         known["fixed_split"] = _section(FixedSplitConfig, known.get("fixed_split"))
@@ -854,7 +880,11 @@ def _reject_removed_config_fields(config: RuntimeConfig) -> None:
         "baseline": (config.baseline, {"run_id", "results_root"}),
         "baseline.SURGEON": (
             config.baseline.SURGEON,
-            {"trigger_low_quality_samples", "max_local_buffer_samples"},
+            {"trigger_low_quality_samples", "max_local_buffer_samples", "tta_steps"},
+        ),
+        "client.split_learning.fixed_split": (
+            config.client.split_learning.fixed_split,
+            {"max_candidates", "privacy_metric_lower_bound"},
         ),
         "runtime": (config, {"sample_pool"}),
         "client": (config.client, {"sample_pool"}),
@@ -952,16 +982,12 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         "suffix_thread_tuning_iterations",
     ):
         if field_name in fixed_split_extras:
-            raise ValueError(
-                removed_fields[f"client.split_learning.fixed_split.{field_name}"]
-            )
-    if (
-        isinstance(fixed_split_cfg.inference_num_threads, bool)
-        or not isinstance(fixed_split_cfg.inference_num_threads, int)
+            raise ValueError(removed_fields[f"client.split_learning.fixed_split.{field_name}"])
+    if isinstance(fixed_split_cfg.inference_num_threads, bool) or not isinstance(
+        fixed_split_cfg.inference_num_threads, int
     ):
         raise ValueError(
-            "client.split_learning.fixed_split.inference_num_threads "
-            "must be a positive integer."
+            "client.split_learning.fixed_split.inference_num_threads must be a positive integer."
         )
     _validate_positive(
         "client.split_learning.fixed_split.inference_num_threads",
@@ -1082,13 +1108,10 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     )
     if training_frame_count < int(resolved_window_size):
         raise ValueError(
-            "baseline.training.training_frame_count must be >= "
-            "server.baselines.Ekya.window_size"
+            "baseline.training.training_frame_count must be >= server.baselines.Ekya.window_size"
         )
     if int(resolved_num_frames) < int(resolved_window_size):
-        raise ValueError(
-            "server.baselines.Ekya.num_frames must be >= window_size"
-        )
+        raise ValueError("server.baselines.Ekya.num_frames must be >= window_size")
     microprofile_epochs = _configured_value(
         ekya_cfg.microprofile.microprofile_epochs,
         baseline_training.microprofile_epochs,
@@ -1102,10 +1125,7 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         1.0 - float(continual_learning.proxy_eval_validation_fraction),
     )
     if float(train_val_split) <= 0.0 or float(train_val_split) >= 1.0:
-        raise ValueError(
-            "server.baselines.Ekya.dataset."
-            "train_val_split must be in (0, 1)"
-        )
+        raise ValueError("server.baselines.Ekya.dataset.train_val_split must be in (0, 1)")
     min_train_samples = _configured_value(
         ekya_cfg.dataset.min_train_samples,
         baseline_training.min_training_samples,
@@ -1128,15 +1148,9 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         accuracy_cfg.agreement_iou_threshold,
     )
     if float(evaluation_score_threshold) < 0.0:
-        raise ValueError(
-            "server.baselines.Ekya.evaluation."
-            "score_threshold must be non-negative"
-        )
+        raise ValueError("server.baselines.Ekya.evaluation.score_threshold must be non-negative")
     if float(evaluation_iou_threshold) <= 0.0 or float(evaluation_iou_threshold) > 1.0:
-        raise ValueError(
-            "server.baselines.Ekya.evaluation."
-            "iou_threshold must be in (0, 1]"
-        )
+        raise ValueError("server.baselines.Ekya.evaluation.iou_threshold must be in (0, 1]")
     ekya_train_mode = (
         str(
             _configured_value(
@@ -1149,10 +1163,7 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         .lower()
     )
     if ekya_train_mode not in {"full", "freeze"}:
-        raise ValueError(
-            "server.baselines.Ekya.retraining."
-            "train_mode must be full or freeze"
-        )
+        raise ValueError("server.baselines.Ekya.retraining.train_mode must be full or freeze")
     trainable_param_ratio = (
         ekya_cfg.retraining.trainable_param_ratio
         if ekya_cfg.retraining.trainable_param_ratio is not None
@@ -1171,10 +1182,7 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             float(trainable_param_ratio),
         )
         if float(trainable_param_ratio) > 1.0:
-            raise ValueError(
-                "server.baselines.Ekya.retraining."
-                "trainable_param_ratio must be <= 1"
-            )
+            raise ValueError("server.baselines.Ekya.retraining.trainable_param_ratio must be <= 1")
     max_train_jobs = _configured_value(
         ekya_cfg.retraining.max_concurrent_train_jobs,
         continual_learning.max_concurrent_jobs,
@@ -1183,19 +1191,13 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         "server.baselines.Ekya.retraining.max_concurrent_train_jobs",
         int(max_train_jobs),
     )
-    optimizer_name = (
-        str(baseline_training.optimizer_name or "")
-        .strip()
-        .lower()
-    )
+    optimizer_name = str(baseline_training.optimizer_name or "").strip().lower()
     if optimizer_name not in {
         "adamw",
         "adam",
         "sgd",
     }:
-        raise ValueError(
-            "baseline.training.optimizer_name must be adamw, adam, or sgd"
-        )
+        raise ValueError("baseline.training.optimizer_name must be adamw, adam, or sgd")
     if float(baseline_training.weight_decay) < 0.0:
         raise ValueError("baseline.training.weight_decay must be >= 0")
     _validate_positive(
@@ -1219,8 +1221,7 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     pure_edge = config.baseline.SURGEON
     if str(pure_edge.label_source) not in {"pseudo_label", "local_gt_dir", "none"}:
         raise ValueError(
-            "baseline.SURGEON.label_source must be one of "
-            "pseudo_label, local_gt_dir, none"
+            "baseline.SURGEON.label_source must be one of pseudo_label, local_gt_dir, none"
         )
     if bool(pure_edge.use_cloud_teacher):
         raise ValueError("baseline.SURGEON.use_cloud_teacher must remain false")
@@ -1235,9 +1236,7 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     pure_edge.quality_mode = quality_mode
     trainable_scope = str(pure_edge.trainable_scope or "").strip().lower()
     if trainable_scope != "norm_affine":
-        raise ValueError(
-            "baseline.SURGEON.trainable_scope must be norm_affine"
-        )
+        raise ValueError("baseline.SURGEON.trainable_scope must be norm_affine")
     pure_edge.trainable_scope = trainable_scope
     if pure_edge.training_frame_count is not None:
         _validate_positive(
@@ -1288,9 +1287,7 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             allow_zero=True,
         )
         if float(pure_edge.min_detection_confidence) > 1.0:
-            raise ValueError(
-                "baseline.SURGEON.min_detection_confidence must be <= 1"
-            )
+            raise ValueError("baseline.SURGEON.min_detection_confidence must be <= 1")
     _validate_positive(
         "baseline.SURGEON.min_selected_logit_count",
         int(pure_edge.min_selected_logit_count),
@@ -1299,9 +1296,7 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         "baseline.SURGEON.max_selected_logit_count",
         int(pure_edge.max_selected_logit_count),
     )
-    if int(pure_edge.max_selected_logit_count) < int(
-        pure_edge.min_selected_logit_count
-    ):
+    if int(pure_edge.max_selected_logit_count) < int(pure_edge.min_selected_logit_count):
         raise ValueError(
             "baseline.SURGEON.max_selected_logit_count must be >= "
             "baseline.SURGEON.min_selected_logit_count"
@@ -1311,12 +1306,6 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         float(pure_edge.min_loss_improvement),
         allow_zero=True,
     )
-    legacy_tta_steps = (getattr(pure_edge, "_extras", {}) or {}).get("tta_steps")
-    if legacy_tta_steps is not None:
-        _validate_positive(
-            "baseline.SURGEON.tta_steps",
-            int(legacy_tta_steps),
-        )
     _validate_positive(
         "baseline.SURGEON.consistency_weight",
         float(pure_edge.consistency_weight),
@@ -1332,9 +1321,7 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         float(pure_edge.max_foreground_growth_ratio),
     )
     if float(pure_edge.max_foreground_growth_ratio) < 1.0:
-        raise ValueError(
-            "baseline.SURGEON.max_foreground_growth_ratio must be >= 1"
-        )
+        raise ValueError("baseline.SURGEON.max_foreground_growth_ratio must be >= 1")
     for name in (
         "max_foreground_fraction_increase",
         "max_reference_kl",
@@ -1349,9 +1336,7 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         if value > 1.0:
             raise ValueError(f"baseline.SURGEON.{name} must be <= 1")
     if not isinstance(pure_edge.adaptive_entropy_gate, bool):
-        raise ValueError(
-            "baseline.SURGEON.adaptive_entropy_gate must be a boolean"
-        )
+        raise ValueError("baseline.SURGEON.adaptive_entropy_gate must be a boolean")
     _validate_positive(
         "baseline.SURGEON.entropy_margin_ratio",
         float(pure_edge.entropy_margin_ratio),
@@ -1365,12 +1350,8 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         allow_zero=True,
     )
     if float(pure_edge.max_entropy_margin_ratio) > 1.0:
-        raise ValueError(
-            "baseline.SURGEON.max_entropy_margin_ratio must be <= 1"
-        )
-    if float(pure_edge.entropy_margin_ratio) > float(
-        pure_edge.max_entropy_margin_ratio
-    ):
+        raise ValueError("baseline.SURGEON.max_entropy_margin_ratio must be <= 1")
+    if float(pure_edge.entropy_margin_ratio) > float(pure_edge.max_entropy_margin_ratio):
         raise ValueError(
             "baseline.SURGEON.entropy_margin_ratio must be <= "
             "baseline.SURGEON.max_entropy_margin_ratio"
@@ -1389,9 +1370,7 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     )
     accuracy_cfg = config.baseline.CATR
     if float(accuracy_cfg.trainable_param_ratio) > 1.0:
-        raise ValueError(
-            "baseline.CATR.trainable_param_ratio must be <= 1"
-        )
+        raise ValueError("baseline.CATR.trainable_param_ratio must be <= 1")
     _validate_positive(
         "baseline.CATR.trigger_window_size",
         int(accuracy_cfg.trigger_window_size),
@@ -1410,13 +1389,9 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         float(accuracy_cfg.history_decay),
     )
     if float(accuracy_cfg.history_decay) > 1.0:
-        raise ValueError(
-            "baseline.CATR.history_decay must be <= 1"
-        )
+        raise ValueError("baseline.CATR.history_decay must be <= 1")
     if str(accuracy_cfg.metric or "").strip() != "teacher_f1":
-        raise ValueError(
-            "baseline.CATR.metric must be teacher_f1"
-        )
+        raise ValueError("baseline.CATR.metric must be teacher_f1")
     for name in ("agreement_iou_threshold", "agreement_score_threshold"):
         value = float(getattr(accuracy_cfg, name))
         _validate_positive(
@@ -1425,9 +1400,7 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             allow_zero=True,
         )
         if value > 1.0:
-            raise ValueError(
-                f"baseline.CATR.{name} must be <= 1"
-            )
+            raise ValueError(f"baseline.CATR.{name} must be <= 1")
     empty_policy = str(accuracy_cfg.agreement_empty_empty_policy or "").strip().lower()
     if empty_policy not in {"score_one", "exclude", "score_zero"}:
         raise ValueError(
@@ -1442,19 +1415,11 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
             allow_zero=True,
         )
         if float(accuracy_cfg.absolute_accuracy_floor) > 1.0:
-            raise ValueError(
-                "baseline.CATR.absolute_accuracy_floor "
-                "must be <= 1"
-            )
+            raise ValueError("baseline.CATR.absolute_accuracy_floor must be <= 1")
     allowed_baseline_training = {"freeze"}
-    accuracy_strategy = str(
-        accuracy_cfg.training_strategy or ""
-    ).strip()
+    accuracy_strategy = str(accuracy_cfg.training_strategy or "").strip()
     if accuracy_strategy not in allowed_baseline_training:
-        raise ValueError(
-            "baseline.CATR.training_strategy must be "
-            "freeze"
-        )
+        raise ValueError("baseline.CATR.training_strategy must be freeze")
     feature_upload = config.client.feature_upload
     if str(feature_upload.storage_format).strip().lower() not in {
         "safetensors_shard",
@@ -1469,6 +1434,11 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         "client.feature_upload.shard_max_samples",
         int(feature_upload.shard_max_samples),
     )
+    if not isinstance(feature_upload.sync_high_quality, bool):
+        raise ValueError(
+            "client.feature_upload.sync_high_quality must be a boolean, "
+            f"got {feature_upload.sync_high_quality!r}"
+        )
     if not isinstance(feature_upload.include_index_json, bool):
         raise ValueError(
             "client.feature_upload.include_index_json must be a boolean, "
@@ -1552,6 +1522,65 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         "client.resource_aware_trigger.bandwidth_probe_size_bytes",
         int(config.client.resource_aware_trigger.bandwidth_probe_size_bytes),
     )
+    if not isinstance(config.client.resource_aware_trigger.bootstrap_without_drift, bool):
+        raise ValueError(
+            "client.resource_aware_trigger.bootstrap_without_drift must be a boolean, "
+            f"got {config.client.resource_aware_trigger.bootstrap_without_drift!r}"
+        )
+    _validate_positive(
+        "client.resource_aware_trigger.max_training_samples",
+        int(config.client.resource_aware_trigger.max_training_samples),
+        allow_zero=True,
+    )
+    max_training_samples = int(config.client.resource_aware_trigger.max_training_samples)
+    min_training_samples = int(config.client.resource_aware_trigger.min_training_samples)
+    if max_training_samples and max_training_samples < min_training_samples:
+        raise ValueError(
+            "client.resource_aware_trigger.max_training_samples must be zero or >= "
+            "client.resource_aware_trigger.min_training_samples"
+        )
+    min_training_samples_by_model = dict(
+        config.client.resource_aware_trigger.min_training_samples_by_model
+    )
+    max_training_samples_by_model = dict(
+        config.client.resource_aware_trigger.max_training_samples_by_model
+    )
+    for model_name, model_minimum in min_training_samples_by_model.items():
+        if not str(model_name).strip():
+            raise ValueError(
+                "client.resource_aware_trigger.min_training_samples_by_model "
+                "requires non-empty model names"
+            )
+        _validate_positive(
+            f"client.resource_aware_trigger.min_training_samples_by_model[{model_name!r}]",
+            int(model_minimum),
+        )
+        resolved_maximum = int(
+            max_training_samples_by_model.get(model_name, max_training_samples)
+        )
+        if resolved_maximum and resolved_maximum < int(model_minimum):
+            raise ValueError(
+                "client.resource_aware_trigger.max_training_samples_by_model values must be "
+                "zero or >= the effective model minimum"
+            )
+    for model_name, model_maximum in max_training_samples_by_model.items():
+        if not str(model_name).strip():
+            raise ValueError(
+                "client.resource_aware_trigger.max_training_samples_by_model "
+                "requires non-empty model names"
+            )
+        resolved_maximum = int(model_maximum)
+        _validate_positive(
+            f"client.resource_aware_trigger.max_training_samples_by_model[{model_name!r}]",
+            resolved_maximum,
+            allow_zero=True,
+        )
+        resolved_minimum = int(min_training_samples_by_model.get(model_name, min_training_samples))
+        if resolved_maximum and resolved_maximum < resolved_minimum:
+            raise ValueError(
+                "client.resource_aware_trigger.max_training_samples_by_model values must be "
+                "zero or >= the effective model minimum"
+            )
     feature_cloud_cost_factor = float(
         config.client.resource_aware_trigger.feature_cloud_cost_factor
     )
@@ -1607,10 +1636,21 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     )
     if float(boundary_quality.min_std) < 0.0:
         raise ValueError("client.sample_quality.boundary_feature_entropy.min_std must be >= 0")
+    if not isinstance(boundary_quality.update_on_anomaly, bool):
+        raise ValueError(
+            "client.sample_quality.boundary_feature_entropy.update_on_anomaly "
+            "must be a boolean"
+        )
     if int(boundary_quality.warmup_samples) < 0:
         raise ValueError(
             "client.sample_quality.boundary_feature_entropy.warmup_samples must be >= 0"
         )
+    teacher_sampling = config.client.sample_quality.teacher_sampling
+    for field_name in ("enabled", "retain_empty_predictions"):
+        if not isinstance(getattr(teacher_sampling, field_name), bool):
+            raise ValueError(
+                f"client.sample_quality.teacher_sampling.{field_name} must be a boolean"
+            )
     _validate_positive("client.sample_quality.eps", float(config.client.sample_quality.eps))
     _validate_positive(
         "client.window_drift.window_size",
@@ -1630,9 +1670,7 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
     if not isinstance(edge_affine.enabled, bool):
         raise ValueError("server.edge_affine_workers.enabled must be a boolean")
     if str(edge_affine.mode) != "edge_affine_single_gpu_mps":
-        raise ValueError(
-            "server.edge_affine_workers.mode must be edge_affine_single_gpu_mps"
-        )
+        raise ValueError("server.edge_affine_workers.mode must be edge_affine_single_gpu_mps")
     if str(edge_affine.edge_workers.assignment) != "one_worker_per_edge":
         raise ValueError(
             "server.edge_affine_workers.edge_workers.assignment must be one_worker_per_edge"
@@ -1779,6 +1817,37 @@ def _validate_runtime_config(config: RuntimeConfig) -> None:
         raise ValueError(
             "server.continual_learning.proxy_eval_min_delta must be >= 0, "
             f"got {config.server.continual_learning.proxy_eval_min_delta!r}"
+        )
+    replay_fraction = float(config.server.continual_learning.training_replay_fraction)
+    if not 0.0 <= replay_fraction < 1.0:
+        raise ValueError(
+            "server.continual_learning.training_replay_fraction must be in [0, 1), "
+            f"got {config.server.continual_learning.training_replay_fraction!r}"
+        )
+    for model_name, model_fraction in dict(
+        config.server.continual_learning.training_replay_fraction_by_model
+    ).items():
+        value = float(model_fraction)
+        if not str(model_name).strip() or not 0.0 <= value < 1.0:
+            raise ValueError(
+                "server.continual_learning.training_replay_fraction_by_model must map "
+                f"non-empty model names to values in [0, 1), got {model_name!r}: {model_fraction!r}"
+            )
+    _validate_positive(
+        "server.continual_learning.training_replay_retention_multiplier",
+        int(config.server.continual_learning.training_replay_retention_multiplier),
+    )
+    for model_name, frame_count in dict(
+        config.server.continual_learning.training_frame_count_by_model
+    ).items():
+        if not str(model_name).strip():
+            raise ValueError(
+                "server.continual_learning.training_frame_count_by_model requires "
+                "non-empty model names"
+            )
+        _validate_positive(
+            f"server.continual_learning.training_frame_count_by_model[{model_name!r}]",
+            int(frame_count),
         )
     if not isinstance(
         config.server.continual_learning.proxy_eval_frame_cache_enabled,

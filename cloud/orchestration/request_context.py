@@ -261,7 +261,10 @@ class RequestContextMixin:
     ) -> RecentTrainingWindowStore:
         return RecentTrainingWindowStore(
             self._recent_training_window_path(edge_id=edge_id, manifest=manifest),
-            max_samples=int(self.training_frame_count),
+            max_samples=(
+                int(self.training_frame_count)
+                * max(1, int(getattr(self, "training_replay_retention_multiplier", 1)))
+            ),
         )
 
     @staticmethod

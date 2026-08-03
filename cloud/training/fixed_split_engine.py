@@ -46,6 +46,20 @@ class FixedSplitRetrainEngine:
         )
 
         proxy_metrics_before: ProxyMetrics = {}
+        baseline_proxy_metric: float | None = None
+        if can_select_by_proxy:
+            baseline_proxy_eval = adapter.evaluate_proxy(
+                context,
+                epoch=0,
+                stage_label="proxy evaluation before training",
+                max_samples=config.max_eval_samples,
+            )
+            proxy_results.append(baseline_proxy_eval)
+            proxy_eval_time += baseline_proxy_eval.elapsed
+            proxy_metrics_before = dict(baseline_proxy_eval.metrics)
+            baseline_proxy_metric = baseline_proxy_eval.metric
+            self._log_proxy_eval(log, plan, baseline_proxy_eval)
+
         best_candidate: CandidateState | None = None
         early_stopper = ProxyEarlyStopper(config)
         optimizer = adapter.build_optimizer(context)
@@ -85,7 +99,11 @@ class FixedSplitRetrainEngine:
             proxy_eval_time += proxy_eval.elapsed
             self._log_proxy_eval(log, plan, proxy_eval)
 
-            incumbent_metrics = best_candidate.proxy_metrics if best_candidate is not None else None
+            incumbent_metrics = (
+                best_candidate.proxy_metrics
+                if best_candidate is not None
+                else proxy_metrics_before
+            )
             improved = adapter.metrics_are_better(
                 proxy_eval.metrics,
                 incumbent_metrics,
@@ -110,7 +128,11 @@ class FixedSplitRetrainEngine:
             decision = early_stopper.record(
                 proxy_eval,
                 improved=improved,
-                best_metric=(best_candidate.proxy_metric if best_candidate is not None else None),
+                best_metric=(
+                    best_candidate.proxy_metric
+                    if best_candidate is not None
+                    else baseline_proxy_metric
+                ),
             )
             if decision.should_stop:
                 early_stop_reason = decision.reason
@@ -133,16 +155,17 @@ class FixedSplitRetrainEngine:
             proxy_metrics_after = dict(best_candidate.proxy_metrics or {})
         elif can_select_by_proxy:
             result_available = False
-            if proxy_results:
-                proxy_metrics_after = dict(proxy_results[-1].metrics)
+            proxy_metrics_after = dict(proxy_metrics_before)
             context.model.load_state_dict(baseline_state, strict=False)
             _set_eval(context.model)
             log.warning(
                 "[FixedSplitCL][Candidate] model_name={} model_family={} "
-                "no publishable checkpoint because validation {} was unavailable.",
+                "no publishable checkpoint because validation {} did not improve "
+                "the pre-training baseline by min_delta={}.",
                 plan.model_name,
                 plan.model_family,
                 "proxy_mAP_50_95",
+                float(config.min_delta),
             )
         elif context.validation_gt_annotations and config.enabled and proxy_results:
             proxy_metrics_after = dict(proxy_results[-1].metrics)

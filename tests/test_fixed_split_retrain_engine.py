@@ -111,7 +111,7 @@ def _context(adapter: FakeAdapter, *, model_family: str = "surprise") -> FixedSp
 
 
 def test_engine_flow_is_decoupled_from_model_family() -> None:
-    adapter = FakeAdapter(metrics=[0.2, 0.3, 0.28])
+    adapter = FakeAdapter(metrics=[0.1, 0.2, 0.3, 0.28])
     context = _context(adapter, model_family="not-a-special-family")
 
     result = FixedSplitRetrainEngine().run(context)
@@ -122,7 +122,7 @@ def test_engine_flow_is_decoupled_from_model_family() -> None:
 
 
 def test_engine_saves_and_restores_best_candidate_on_metric_improvement() -> None:
-    adapter = FakeAdapter(metrics=[0.6, 0.55, 0.5])
+    adapter = FakeAdapter(metrics=[0.4, 0.6, 0.55, 0.5])
     context = _context(adapter)
 
     result = FixedSplitRetrainEngine().run(context)
@@ -133,7 +133,7 @@ def test_engine_saves_and_restores_best_candidate_on_metric_improvement() -> Non
 
 
 def test_engine_early_stop_reduces_training_epochs() -> None:
-    adapter = FakeAdapter(metrics=[0.9, 0.91, 0.91])
+    adapter = FakeAdapter(metrics=[0.85, 0.9, 0.91, 0.91])
     context = _context(adapter)
     context.plan.proxy_eval_config.interval_epochs = 1
     context.plan.proxy_eval_config.patience = 2
@@ -147,31 +147,33 @@ def test_engine_early_stop_reduces_training_epochs() -> None:
 
 
 def test_engine_tracks_proxy_and_suffix_times_separately() -> None:
-    adapter = FakeAdapter(metrics=[0.2, 0.3, 0.35], train_suffix_time=0.75)
+    adapter = FakeAdapter(metrics=[0.1, 0.2, 0.3, 0.35], train_suffix_time=0.75)
     context = _context(adapter)
 
     result = FixedSplitRetrainEngine().run(context)
 
     assert result.suffix_forward_backward_time == 5 * 0.75
-    assert result.proxy_eval_time == 3 * 0.125
+    assert result.proxy_eval_time == 4 * 0.125
 
 
 def test_engine_restores_baseline_without_proxy_candidate_eval() -> None:
-    adapter = FakeAdapter(metrics=[])
+    adapter = FakeAdapter(metrics=[0.4])
     context = _context(adapter)
     context.plan.proxy_eval_config.eval_final = False
     context.plan.proxy_eval_config.interval_epochs = 100
 
     result = FixedSplitRetrainEngine().run(context)
 
-    assert adapter.eval_calls == []
+    assert adapter.eval_calls == [(0, "proxy evaluation before training")]
     assert result.best_candidate is None
     assert result.result_available is False
+    assert result.proxy_metrics_before["primary_metric"] == 0.4
+    assert result.proxy_metrics_after["primary_metric"] == 0.4
     assert context.model.weight.item() == 0.0
 
 
 def test_engine_restores_baseline_when_validation_metric_is_unavailable() -> None:
-    adapter = FakeAdapter(metrics=[None, None, None])
+    adapter = FakeAdapter(metrics=[None, None, None, None])
     context = _context(adapter)
 
     result = FixedSplitRetrainEngine().run(context)
@@ -183,15 +185,28 @@ def test_engine_restores_baseline_when_validation_metric_is_unavailable() -> Non
     assert context.model.weight.item() == 0.0
 
 
-def test_engine_ignores_external_baseline_proxy_metrics() -> None:
-    adapter = FakeAdapter(metrics=[])
+def test_engine_evaluates_actual_baseline_without_candidate_checkpoints() -> None:
+    adapter = FakeAdapter(metrics=[0.4])
     context = _context(adapter)
     context.plan.proxy_eval_config.eval_final = False
     context.plan.proxy_eval_config.interval_epochs = 100
 
     result = FixedSplitRetrainEngine().run(context)
 
-    assert result.proxy_eval_time == 0.0
-    assert result.proxy_metrics_before == {}
+    assert result.proxy_eval_time == 0.125
+    assert result.proxy_metrics_before["primary_metric"] == 0.4
     assert result.result_available is False
+    assert context.model.weight.item() == 0.0
+
+
+def test_engine_rejects_candidates_that_regress_from_baseline() -> None:
+    adapter = FakeAdapter(metrics=[0.7, 0.6, 0.65, 0.69])
+    context = _context(adapter)
+
+    result = FixedSplitRetrainEngine().run(context)
+
+    assert result.best_candidate is None
+    assert result.result_available is False
+    assert result.proxy_metrics_before["primary_metric"] == 0.7
+    assert result.proxy_metrics_after["primary_metric"] == 0.7
     assert context.model.weight.item() == 0.0

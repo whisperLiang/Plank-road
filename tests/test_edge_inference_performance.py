@@ -20,12 +20,12 @@ from edge.edge_worker import (
     SampleCollectionJob,
     SampleStatsDelta,
     SampleWriteJob,
-    _FixedSplitRuntimeError,
     _accepted_uploaded_sample_ids,
+    _FixedSplitRuntimeError,
     _lower_current_thread_priority,
 )
 from edge.info import TASK_STATE
-from edge.sample_quality import LOW_QUALITY
+from edge.sample_quality import HIGH_QUALITY, LOW_QUALITY
 from edge.task import Task
 from edge_client import _write_buffered_task_result, _write_task_result
 from model_management import object_detection as object_detection_module
@@ -641,6 +641,91 @@ def test_enabled_split_runtime_never_falls_back_when_unavailable() -> None:
 
     with pytest.raises(RuntimeError, match="runtime is unavailable"):
         worker._resolve_active_splitter(None, (4, 4))
+
+
+def test_initial_model_can_bootstrap_without_confirmed_drift() -> None:
+    worker = EdgeWorker.__new__(EdgeWorker)
+    worker.config = SimpleNamespace(
+        resource_aware_trigger=SimpleNamespace(
+            bootstrap_without_drift=True,
+            min_training_samples=64,
+        )
+    )
+    worker.resource_trigger_enabled = True
+    worker.resource_trigger = SimpleNamespace(min_training_samples=64)
+    worker.model_version = "0"
+
+    assert worker._bootstrap_training_ready(SimpleNamespace(low_quality_count=63)) is False
+    assert worker._bootstrap_training_ready(SimpleNamespace(low_quality_count=64)) is True
+
+
+def test_updated_model_still_requires_confirmed_drift() -> None:
+    worker = EdgeWorker.__new__(EdgeWorker)
+    worker.config = SimpleNamespace(
+        resource_aware_trigger=SimpleNamespace(
+            bootstrap_without_drift=True,
+            min_training_samples=64,
+        )
+    )
+    worker.resource_trigger_enabled = True
+    worker.resource_trigger = SimpleNamespace(min_training_samples=64)
+    worker.model_version = "1"
+
+    assert worker._bootstrap_training_ready(SimpleNamespace(low_quality_count=128)) is False
+
+
+def test_high_quality_storage_follows_sync_configuration() -> None:
+    worker = EdgeWorker.__new__(EdgeWorker)
+    worker.high_quality_sync_enabled = False
+
+    assert worker._should_store_quality_sample(
+        quality_bucket=HIGH_QUALITY,
+        raw_sample_selected=False,
+    ) is False
+    assert worker._should_store_quality_sample(
+        quality_bucket=LOW_QUALITY,
+        raw_sample_selected=True,
+    ) is True
+    assert worker._should_store_quality_sample(
+        quality_bucket=LOW_QUALITY,
+        raw_sample_selected=False,
+    ) is False
+
+    worker.high_quality_sync_enabled = True
+    assert worker._should_store_quality_sample(
+        quality_bucket=HIGH_QUALITY,
+        raw_sample_selected=False,
+    ) is True
+
+
+def test_disabled_high_quality_sync_excludes_unsent_feature_bytes_from_trigger() -> None:
+    worker = EdgeWorker.__new__(EdgeWorker)
+    worker.high_quality_sync_enabled = False
+    worker.sample_store = SimpleNamespace(
+        stats=lambda: {
+            "total_samples": 2,
+            "high_quality_count": 1,
+            "low_quality_count": 1,
+            "low_quality_rate": 0.5,
+            "high_quality_feature_bytes": 10_000,
+            "low_quality_feature_bytes": 0,
+            "low_quality_raw_bytes": 100,
+        }
+    )
+
+    stats = worker._stats_for_training_trigger()
+
+    assert stats["high_quality_feature_bytes"] == 0
+
+
+def test_resource_trigger_uses_window_low_quality_rate() -> None:
+    stats = SimpleNamespace(low_quality_rate=0.5)
+    drift_state = SimpleNamespace(low_quality_rate=0.8)
+
+    retained_rate = EdgeWorker._apply_window_quality_rate(stats, drift_state)
+
+    assert retained_rate == pytest.approx(0.5)
+    assert stats.low_quality_rate == pytest.approx(0.8)
 
 
 def test_split_runtime_rejects_frame_size_change_without_disabling_split() -> None:

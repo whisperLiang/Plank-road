@@ -43,7 +43,7 @@ def _runtime_and_boundary():
     return runtime, runtime.run_prefix(example)
 
 
-def test_replay_boundary_cache_v2_round_trips_and_validates(tmp_path) -> None:
+def test_replay_boundary_cache_round_trips_and_validates(tmp_path) -> None:
     runtime, boundary = _runtime_and_boundary()
     codec = BoundaryPayloadCacheCodec(runtime)
     path = tmp_path / "boundary.pt.gz"

@@ -200,6 +200,8 @@ class EntropyQualityClassifier:
         feature_ema_decay: float = 0.95,
         feature_deviation_threshold: float = 1.5,
         feature_min_std: float = 1.0e-4,
+        feature_relative_std_floor: float = 0.02,
+        feature_update_on_anomaly: bool = False,
         feature_warmup_samples: int = 20,
         eps: float = 1.0e-8,
         persist_debug_stats: bool = False,
@@ -216,6 +218,8 @@ class EntropyQualityClassifier:
         self.feature_ema_decay = max(0.0, min(0.999999, float(feature_ema_decay)))
         self.feature_deviation_threshold = float(feature_deviation_threshold)
         self.feature_min_std = max(0.0, float(feature_min_std))
+        self.feature_relative_std_floor = max(0.0, float(feature_relative_std_floor))
+        self.feature_update_on_anomaly = bool(feature_update_on_anomaly)
         self.feature_warmup_samples = max(0, int(feature_warmup_samples))
         self.eps = max(float(eps), 1.0e-12)
         self.persist_debug_stats = bool(persist_debug_stats)
@@ -241,10 +245,22 @@ class EntropyQualityClassifier:
                 _get_config_value(feature_cfg, "deviation_threshold", 1.5)
             ),
             feature_min_std=float(_get_config_value(feature_cfg, "min_std", 1.0e-4)),
+            feature_relative_std_floor=float(
+                _get_config_value(feature_cfg, "relative_std_floor", 0.02)
+            ),
+            feature_update_on_anomaly=bool(
+                _get_config_value(feature_cfg, "update_on_anomaly", False)
+            ),
             feature_warmup_samples=int(_get_config_value(feature_cfg, "warmup_samples", 20)),
             eps=float(_get_config_value(config, "eps", 1.0e-8)),
             persist_debug_stats=bool(_get_config_value(config, "persist_debug_stats", False)),
         )
+
+    def reset(self) -> None:
+        """Reset model-dependent calibration after a model update."""
+
+        self._output_windows.clear()
+        self._feature_states.clear()
 
     def classify(
         self,
@@ -374,20 +390,25 @@ class EntropyQualityClassifier:
             )
             return float(feature_entropy), self.feature_min_std, None, False, True
 
-        prior_std = max(math.sqrt(max(0.0, state.variance)), self.feature_min_std)
+        prior_std = max(
+            math.sqrt(max(0.0, state.variance)),
+            self.feature_min_std,
+            abs(float(state.mean)) * self.feature_relative_std_floor,
+        )
         deviation = abs(float(feature_entropy) - float(state.mean)) / max(prior_std, self.eps)
         warmed = state.count >= self.feature_warmup_samples
         feature_normal = warmed and deviation <= self.feature_deviation_threshold
 
-        decay = self.feature_ema_decay
-        delta = float(feature_entropy) - float(state.mean)
-        new_mean = (decay * float(state.mean)) + ((1.0 - decay) * float(feature_entropy))
-        new_variance = decay * (float(state.variance) + ((1.0 - decay) * delta * delta))
-        self._feature_states[key] = _FeatureEntropyState(
-            count=state.count + 1,
-            mean=float(new_mean),
-            variance=float(max(0.0, new_variance)),
-        )
+        if not warmed or feature_normal or self.feature_update_on_anomaly:
+            decay = self.feature_ema_decay
+            delta = float(feature_entropy) - float(state.mean)
+            new_mean = (decay * float(state.mean)) + ((1.0 - decay) * float(feature_entropy))
+            new_variance = decay * (float(state.variance) + ((1.0 - decay) * delta * delta))
+            self._feature_states[key] = _FeatureEntropyState(
+                count=state.count + 1,
+                mean=float(new_mean),
+                variance=float(max(0.0, new_variance)),
+            )
         return (
             float(state.mean),
             float(prior_std),

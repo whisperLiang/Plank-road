@@ -243,6 +243,7 @@ def test_runtime_cache_key_ignores_device_for_split_abi() -> None:
     payload = key.as_dict()
 
     assert "adapter_version" not in payload
+    assert "runtime_version" not in payload
     assert "device" not in payload
     assert "runtime_identity_id" not in payload
     assert "runtime_batch_validation_signature" not in payload

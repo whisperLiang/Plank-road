@@ -298,7 +298,10 @@ class FixedSplitPipeline(
                     "accepted_low_quality_sample_ids_json="
                     f"{json.dumps(accepted_low_quality_sample_ids, separators=(',', ':'))}"
                 )
-                recent_samples = recent_window.latest_samples(self.training_frame_count)
+                recent_samples = recent_window.training_samples(
+                    self.training_frame_count,
+                    replay_fraction=float(getattr(self, "training_replay_fraction", 0.0)),
+                )
                 self._log_stage_duration(
                     "feature readiness + recent training-window append",
                     stage_started,

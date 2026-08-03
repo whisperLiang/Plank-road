@@ -27,11 +27,11 @@ from tools.experiments.plot_plank_road_baseline_figures import (  # noqa: E402
     _timestamped_frames,
 )
 
-DATA_DIR = (
+BASE_DATA_DIR = (
     PROJECT_ROOT
     / "results"
     / "experiments"
-    / "suwon5a_weather_rainy"
+    / "weather_model_comparison_rfdetr_nano"
     / "normalized"
 )
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "figures"
@@ -71,7 +71,12 @@ COMPONENT_COLORS = {
     "retrain": "#D8908A",
     "update": "#88B6B0",
 }
-
+DATA_DIRS = {
+    "plank_road": BASE_DATA_DIR,
+    "SURGEON": BASE_DATA_DIR,
+    "CATR": BASE_DATA_DIR,
+    "Ekya": BASE_DATA_DIR,
+}
 plt.rcParams.update(
     {
         "font.family": "sans-serif",
@@ -98,15 +103,15 @@ def load_dynamic_data() -> tuple[
     dict[str, list[tuple[float, float]]],
     dict[str, dict[str, int]],
 ]:
-    frame_rows = _normalized_rows(read_csv(DATA_DIR / "frame_metrics.csv"))
-    event_rows = _normalized_rows(read_csv(DATA_DIR / "adaptation_events.csv"))
-    series_by_run = _frame_series_by_run(frame_rows, "f1")
-    timestamped = _timestamped_frames(frame_rows)
-
     curves: dict[str, tuple[list[float], list[float]]] = {}
     event_pairs: dict[str, list[tuple[float, float]]] = {}
     omitted_events: dict[str, dict[str, int]] = {}
     for method in METHOD_ORDER:
+        data_dir = DATA_DIRS[method]
+        frame_rows = _normalized_rows(read_csv(data_dir / "frame_metrics.csv"))
+        event_rows = _normalized_rows(read_csv(data_dir / "adaptation_events.csv"))
+        series_by_run = _frame_series_by_run(frame_rows, "f1")
+        timestamped = _timestamped_frames(frame_rows)
         run_series = _run_series_for(
             series_by_run,
             scenario=SCENARIO,
@@ -132,10 +137,12 @@ def load_dynamic_data() -> tuple[
 
 
 def load_component_data() -> dict[str, dict[str, float]]:
-    latency_rows = _normalized_rows(read_csv(DATA_DIR / "latency_breakdown.csv"))
-    run_groups = _run_latency_groups(latency_rows)
     components: dict[str, dict[str, float]] = {}
     for method in METHOD_ORDER:
+        latency_rows = _normalized_rows(
+            read_csv(DATA_DIRS[method] / "latency_breakdown.csv")
+        )
+        run_groups = _run_latency_groups(latency_rows)
         matching_runs = [
             rows
             for (scenario, item_method, _), rows in run_groups.items()

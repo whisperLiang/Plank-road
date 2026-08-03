@@ -111,24 +111,11 @@ class SplitConstraints:
     validate_candidates: bool = True
     configured_training_batch: int | None = field(default=None, compare=False)
     validation_batches: tuple[int, ...] = field(default_factory=tuple, compare=False)
-    # Deprecated compatibility field; fixed split planning now considers all candidates.
-    max_candidates: int = 0
     max_boundary_count: int = 8
     max_payload_bytes: int = 32 * 1024 * 1024
     privacy_leakage_epsilon: float = PRIVACY_LEAKAGE_EPSILON
-    privacy_metric_lower_bound: float | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if (
-            self.privacy_metric_lower_bound is not None
-            and float(self.privacy_leakage_upper_bound) <= 0.0
-        ):
-            object.__setattr__(
-                self,
-                "privacy_leakage_upper_bound",
-                float(self.privacy_metric_lower_bound),
-            )
-        object.__setattr__(self, "privacy_metric_lower_bound", None)
         if self.configured_training_batch is not None:
             object.__setattr__(
                 self,
@@ -146,22 +133,6 @@ class SplitConstraints:
     def from_config(cls, config: Any | None) -> "SplitConstraints":
         if config is None:
             return cls()
-        extras = getattr(config, "_extras", {}) or {}
-        legacy_privacy_bound = getattr(config, "privacy_metric_lower_bound", None)
-        privacy_leakage_upper_bound = getattr(config, "privacy_leakage_upper_bound", None)
-        default_privacy_bound = getattr(type(config), "privacy_leakage_upper_bound", None)
-        if "privacy_metric_lower_bound" in extras and (
-            privacy_leakage_upper_bound is None
-            or (
-                default_privacy_bound is not None
-                and float(privacy_leakage_upper_bound) == float(default_privacy_bound)
-            )
-        ):
-            privacy_leakage_upper_bound = legacy_privacy_bound
-        if privacy_leakage_upper_bound is None:
-            privacy_leakage_upper_bound = (
-                legacy_privacy_bound if legacy_privacy_bound is not None else 0.0
-            )
         configured_training_batch = _positive_int_or_none(
             getattr(config, "configured_training_batch", None)
         )
@@ -173,12 +144,11 @@ class SplitConstraints:
                 if batch is not None and batch not in validation_batches:
                     validation_batches.append(batch)
         return cls(
-            privacy_leakage_upper_bound=float(privacy_leakage_upper_bound),
+            privacy_leakage_upper_bound=float(config.privacy_leakage_upper_bound),
             max_layer_freezing_ratio=float(getattr(config, "max_layer_freezing_ratio", 1.0)),
             validate_candidates=bool(getattr(config, "validate_candidates", True)),
             configured_training_batch=configured_training_batch,
             validation_batches=tuple(validation_batches),
-            max_candidates=int(getattr(config, "max_candidates", 0)),
             max_boundary_count=int(getattr(config, "max_boundary_count", 8)),
             max_payload_bytes=int(getattr(config, "max_payload_bytes", 32 * 1024 * 1024)),
             privacy_leakage_epsilon=float(

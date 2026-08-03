@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from cloud.contracts import validate_low_quality_manifest
-from model_management.split_contract import build_runtime_contract
+from cloud.contracts import validate_low_quality_manifest, validate_runtime_contract
+from model_management.split_contract import build_runtime_contract, classify_contract_compatibility
 
 
 def _runtime_contract() -> dict[str, object]:
@@ -59,14 +59,53 @@ def test_low_quality_manifest_requires_runtime_contract() -> None:
         validate_low_quality_manifest(manifest)
 
 
-def test_low_quality_manifest_ignores_legacy_version_fields() -> None:
+@pytest.mark.parametrize("field_name", ("feature_abi_id", "feature_abi_spec"))
+def test_low_quality_manifest_requires_matching_feature_abi(field_name: str) -> None:
     manifest = _low_quality_manifest()
-    manifest["protocol_version"] = "legacy"
-    manifest["split_plan"] = {
-        **dict(manifest["split_plan"]),
-        "plan_version": "fixed-split.v9",
-    }
+    manifest_contract = dict(manifest["runtime_contract"])
+    if field_name == "feature_abi_id":
+        manifest_contract[field_name] = "different-feature-abi"
+    else:
+        manifest_contract[field_name] = {"different": "feature-abi-spec"}
+    manifest["runtime_contract"] = manifest_contract
 
-    payload = validate_low_quality_manifest(manifest)
+    with pytest.raises(RuntimeError, match=field_name):
+        validate_low_quality_manifest(manifest)
 
-    assert payload["model_id"] == "yolo26n"
+
+@pytest.mark.parametrize("field_name", ("feature_abi_id", "feature_abi_spec"))
+def test_runtime_contract_requires_current_feature_abi(field_name: str) -> None:
+    runtime_contract = _runtime_contract()
+    runtime_contract.pop(field_name)
+
+    with pytest.raises(RuntimeError, match=field_name):
+        validate_runtime_contract(runtime_contract)
+
+
+def test_contract_compatibility_does_not_rebuild_missing_feature_abi() -> None:
+    current = _runtime_contract()
+    missing_abi = dict(current)
+    missing_abi.pop("feature_abi_id")
+
+    compatibility = classify_contract_compatibility(missing_abi, current)
+
+    assert compatibility["compatible"] is False
+    assert compatibility["reason"] == "missing_edge_feature_abi_id"
+
+
+@pytest.mark.parametrize(
+    ("target", "field_name"),
+    (("manifest", "protocol_version"), ("split_plan", "plan_version")),
+)
+def test_low_quality_manifest_rejects_removed_version_fields(
+    target: str,
+    field_name: str,
+) -> None:
+    manifest = _low_quality_manifest()
+    if target == "manifest":
+        manifest[field_name] = "removed"
+    else:
+        manifest["split_plan"] = {**dict(manifest["split_plan"]), field_name: "removed"}
+
+    with pytest.raises(RuntimeError, match=field_name):
+        validate_low_quality_manifest(manifest)

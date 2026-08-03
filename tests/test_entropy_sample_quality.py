@@ -242,6 +242,35 @@ def test_feature_ema_is_isolated_by_model_split_and_abi() -> None:
     assert "feature_entropy_warmup" in quality.reason
 
 
+def test_feature_anomaly_does_not_poison_reference_by_default() -> None:
+    classifier = _classifier(
+        feature_warmup_samples=1,
+        feature_relative_std_floor=0.01,
+        feature_update_on_anomaly=False,
+    )
+    classifier.classify(_pred(0.1), _payload([1.0, 1.0, 1.0, 1.0]), "m", "s", "a")
+
+    first = classifier.classify(
+        _pred(0.1), _payload([100.0, 0.0, 0.0, 0.0]), "m", "s", "a"
+    )
+    second = classifier.classify(
+        _pred(0.1), _payload([100.0, 0.0, 0.0, 0.0]), "m", "s", "a"
+    )
+
+    assert first.feature_normal is False
+    assert second.feature_entropy_deviation == first.feature_entropy_deviation
+
+
+def test_quality_calibration_can_be_reset_after_model_update() -> None:
+    classifier = _classifier()
+    classifier.classify(_pred(0.1), _payload([1.0, 1.0]), "m", "s", "a")
+
+    classifier.reset()
+
+    assert classifier._output_windows == {}
+    assert classifier._feature_states == {}
+
+
 def test_sample_store_persists_minimal_quality_metadata_by_default(tmp_path) -> None:
     store = EdgeSampleStore(str(tmp_path / "store"))
     payload = _payload([1.0, 1.0, 1.0, 1.0])

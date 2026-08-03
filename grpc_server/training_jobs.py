@@ -408,10 +408,10 @@ class TrainingJobManager:
             # Model version tracking: assign result version on success
             if success and job.model_data:
                 try:
-                    result_version = str(int(job.base_model_version) + 1)
+                    result_model_version = str(int(job.base_model_version) + 1)
                 except (ValueError, TypeError):
-                    result_version = "1"
-                job.result_model_version = result_version
+                    result_model_version = "1"
+                job.result_model_version = result_model_version
 
                 # Stale detection: if the edge has already advanced past the
                 # base version this job was trained on, mark it STALE.
@@ -420,8 +420,8 @@ class TrainingJobManager:
                     if int(current_edge_version) > int(job.base_model_version):
                         job.status = JOB_STATUS_STALE
                         job.message = (
-                            f"STALE: edge model advanced to v{current_edge_version} "
-                            f"while job was based on v{job.base_model_version}"
+                            f"STALE: edge model advanced to version {current_edge_version} "
+                            f"while job was based on version {job.base_model_version}"
                         )
                         logger.warning(
                             "Training job marked STALE: edge={} base_version={} "

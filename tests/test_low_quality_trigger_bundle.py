@@ -29,7 +29,7 @@ def test_trigger_bundle_payload_measurement_accounts_for_all_bytes() -> None:
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("raw_shards/raw.tar", b"raw" * 100)
         archive.writestr("feature_shards/features.bin", b"feature" * 100)
-        archive.writestr("trigger_manifest.json", b'{"version": 1}')
+        archive.writestr("trigger_manifest.json", b'{}')
 
     metrics = measure_trigger_bundle_payload(buffer.getvalue())
 
@@ -37,9 +37,7 @@ def test_trigger_bundle_payload_measurement_accounts_for_all_bytes() -> None:
     assert metrics["feature_bytes"] > 0
     assert metrics["prediction_metadata_bytes"] > 0
     assert (
-        metrics["raw_frame_bytes"]
-        + metrics["feature_bytes"]
-        + metrics["prediction_metadata_bytes"]
+        metrics["raw_frame_bytes"] + metrics["feature_bytes"] + metrics["prediction_metadata_bytes"]
         == metrics["total_upload_bytes"]
     )
 
@@ -148,6 +146,37 @@ def test_raw_feature_selection_counts_shared_artifacts_once(tmp_path) -> None:
 
     assert [record.sample_id for record in selected] == ["low-1", "low-2"]
     assert stats["source_total_bytes"] == 26
+
+
+def test_trigger_sample_cap_keeps_most_recent_drift_samples(tmp_path) -> None:
+    root = tmp_path / "edge_store"
+    raw_dir = root / "raw"
+    raw_dir.mkdir(parents=True)
+    records = []
+    for index in range(1, 4):
+        (raw_dir / f"{index}.jpg").write_bytes(bytes([index]))
+        records.append(
+            SimpleNamespace(
+                sample_id=f"low-{index}",
+                quality_bucket=LOW_QUALITY,
+                timestamp=f"2026-01-01T00:00:0{index}Z",
+                raw_relpath=f"raw/{index}.jpg",
+                feature_ref=None,
+                in_drift_window=True,
+            )
+        )
+
+    selected, stats = _select_low_quality_trigger_records(
+        SimpleNamespace(root_dir=str(root)),
+        records,
+        send_low_conf_features=False,
+        bundle_cap_bytes=None,
+        max_samples=2,
+    )
+
+    assert [record.sample_id for record in selected] == ["low-2", "low-3"]
+    assert stats["max_samples"] == 2
+    assert stats["omitted_sample_count"] == 1
 
 
 def test_raw_feature_low_quality_bundle_imports_current_feature_ref(tmp_path) -> None:

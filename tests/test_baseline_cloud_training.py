@@ -105,7 +105,7 @@ def test_freeze_strategy_uses_cloud_teacher_targets(tmp_path: Path, monkeypatch)
         map_location="cpu",
         weights_only=False,
     )
-    assert payload["format"] == "state_dict_delta.v1"
+    assert payload["format"] == "state_dict_delta"
     assert payload["state_dict"]
     assert built_models
 
@@ -579,7 +579,7 @@ def _fake_update_serializer(model, **kwargs) -> bytes:
     buffer = io.BytesIO()
     torch.save(
         {
-            "format": "state_dict_delta.v1",
+            "format": "state_dict_delta",
             "state_dict": {
                 name: value.detach().cpu()
                 for name, value in model.state_dict().items()

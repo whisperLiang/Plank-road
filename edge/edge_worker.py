@@ -31,6 +31,7 @@ from edge.sample_quality import LOW_QUALITY, EntropyQualityClassifier
 from edge.sample_store import EdgeSampleStore
 from edge.sample_sync import HighQualitySampleSyncer
 from edge.task import Task
+from edge.teacher_sample_selector import LowQualityTeacherSampler
 from edge.transmit import (
     download_trained_model,
     get_training_job_status,
@@ -478,10 +479,7 @@ class AsyncSampleWriter:
                     store_started = time.perf_counter()
                     record = self.sample_store.store_sample(**job.store_kwargs)
                     frame_index = int(job.store_kwargs.get("frame_index") or 0)
-                    if (
-                        frame_index <= 1
-                        or frame_index % self.performance_log_every_n_frames == 0
-                    ):
+                    if frame_index <= 1 or frame_index % self.performance_log_every_n_frames == 0:
                         logger.info(
                             "[EdgePerfAsyncStore] sample_id={} frame={} "
                             "async_sample_store_ms={:.3f} async_writer_queue_size={}",
@@ -592,21 +590,32 @@ class EdgeWorker:
 
         self.edge_processor = DiffProcessor.str_to_class(config.feature)()
         self.small_object_detection = Object_Detection(config, type="small inference")
-        quality_cfg = getattr(config, "sample_quality", None)
+        quality_cfg = config.sample_quality
         self.quality_classifier = EntropyQualityClassifier.from_config(quality_cfg)
-        drift_cfg = getattr(config, "window_drift", None)
+        self.teacher_sample_selector = LowQualityTeacherSampler.from_config(quality_cfg)
+        drift_cfg = config.window_drift
         self.window_drift_detector = WindowDriftDetector(
-            window_size=int(getattr(drift_cfg, "window_size", 100)),
-            min_window_size=int(getattr(drift_cfg, "min_window_size", 30)),
-            low_quality_rate_threshold=float(getattr(drift_cfg, "low_quality_rate_threshold", 0.3)),
-            persistence_windows=int(getattr(drift_cfg, "persistence_windows", 3)),
+            window_size=int(drift_cfg.window_size),
+            min_window_size=int(drift_cfg.min_window_size),
+            low_quality_rate_threshold=float(drift_cfg.low_quality_rate_threshold),
+            persistence_windows=int(drift_cfg.persistence_windows),
+            evaluation_stride=int(drift_cfg.evaluation_stride),
+            recovery_rate_threshold=float(drift_cfg.recovery_rate_threshold),
+            recovery_windows=int(drift_cfg.recovery_windows),
+            severe_anomaly_rate_threshold=float(drift_cfg.severe_anomaly_rate_threshold),
+            recovery_severe_anomaly_rate=float(drift_cfg.recovery_severe_anomaly_rate),
+            critical_confidence=float(drift_cfg.critical_confidence),
+            critical_output_entropy_ratio=float(drift_cfg.critical_output_entropy_ratio),
+            critical_feature_deviation=float(drift_cfg.critical_feature_deviation),
         )
         baseline_cfg = getattr(config, "baseline", None)
         self.baseline_mode = bool(getattr(baseline_cfg, "enabled", False))
         baseline_edge_cfg = getattr(baseline_cfg, "edge", None) if baseline_cfg else None
-        self.baseline_split_runtime_policy = str(
-            getattr(baseline_edge_cfg, "split_runtime_policy", "disabled") or "disabled"
-        ).strip().lower()
+        self.baseline_split_runtime_policy = (
+            str(getattr(baseline_edge_cfg, "split_runtime_policy", "disabled") or "disabled")
+            .strip()
+            .lower()
+        )
 
         self.resource_trigger: ResourceAwareCLTrigger | None = None
         self._cloud_state: CloudResourceState | None = None
@@ -660,7 +669,8 @@ class EdgeWorker:
         self._pending_model_update_lock = threading.Lock()
         self.pending_model_update: PendingModelUpdate | None = None
         self.edge_session_id = uuid.uuid4().hex
-        feature_upload_cfg = getattr(self.config, "feature_upload", None)
+        feature_upload_cfg = self.config.feature_upload
+        self.high_quality_sync_enabled = bool(feature_upload_cfg.sync_high_quality)
         self.sample_store = EdgeSampleStore(
             os.path.join(self.config.retrain.cache_path, "sample_store"),
             feature_storage_format=str(
@@ -693,18 +703,13 @@ class EdgeWorker:
                 self.sample_store,
                 server_ip=self.config.server_ip,
                 edge_id=self.edge_id,
-                feature_upload_config=getattr(self.config, "feature_upload", None),
+                feature_upload_config=self.config.feature_upload,
+                enabled=self.high_quality_sync_enabled,
                 context_provider=self._sample_sync_context,
                 log_internal_ids=self.log_internal_ids,
             )
         self.bundle_cache_path = os.path.join(self.config.retrain.cache_path, "server_bundle")
-        self.min_low_quality_samples = int(
-            getattr(
-                self.config.retrain,
-                "min_low_quality_samples",
-                getattr(self.config.retrain, "collect_num", 1),
-            )
-        )
+        self.min_low_quality_samples = int(self.config.retrain.min_low_quality_samples)
         self.training_poll_interval_sec = self._resolve_training_poll_interval(config)
         self.training_not_found_grace_sec = self._resolve_training_not_found_grace(config)
         self.resource_probe_interval_sec = self._resolve_resource_probe_interval(config)
@@ -856,9 +861,7 @@ class EdgeWorker:
                 self.model_id,
                 safe_error_summary(exc),
             )
-            raise _FixedSplitRuntimeError(
-                "Fixed split runtime initialisation failed."
-            ) from exc
+            raise _FixedSplitRuntimeError("Fixed split runtime initialisation failed.") from exc
         except Exception as exc:
             logger.error(
                 "Failed to initialise fixed split plan: {}.",
@@ -873,9 +876,7 @@ class EdgeWorker:
                 },
                 runtime=True,
             )
-            raise _FixedSplitRuntimeError(
-                "Failed to initialise fixed split runtime."
-            ) from exc
+            raise _FixedSplitRuntimeError("Failed to initialise fixed split runtime.") from exc
 
     def _init_baseline_split_runtime(
         self,
@@ -1113,6 +1114,8 @@ class EdgeWorker:
 
     def _stats_for_training_trigger(self) -> dict[str, Any]:
         stats = dict(self.sample_store.stats())
+        if not self.high_quality_sync_enabled:
+            stats["high_quality_feature_bytes"] = 0
         lock = getattr(self, "_pending_sample_stats_lock", None)
         if lock is None:
             return stats
@@ -1179,12 +1182,12 @@ class EdgeWorker:
         except Exception as exc:
             self._apply_pending_sample_stats(job.stats_delta, sign=-1)
             logger.warning(
-                "Async sample writer unavailable; dropped sample without synchronous fallback: {}.",
+                "Async sample writer unavailable; dropped sample: {}.",
                 safe_error_summary(exc),
             )
             log_diagnostic_debug(
                 self,
-                "async sample writer fallback diagnostics",
+                "async sample writer failure diagnostics",
                 lambda error=exc: {
                     "sample_id": job.store_kwargs.get("sample_id"),
                     "error": repr(error),
@@ -1208,8 +1211,7 @@ class EdgeWorker:
             return True
         except Full:
             logger.warning(
-                "Async sample collector queue full; dropped sample {} without "
-                "blocking inference.",
+                "Async sample collector queue full; dropped sample {} without blocking inference.",
                 job.sample_id,
             )
             log_diagnostic_debug(
@@ -1220,13 +1222,12 @@ class EdgeWorker:
             return False
         except Exception as exc:
             logger.warning(
-                "Async sample collector unavailable; dropped sample without "
-                "synchronous fallback: {}.",
+                "Async sample collector unavailable; dropped sample: {}.",
                 safe_error_summary(exc),
             )
             log_diagnostic_debug(
                 self,
-                "sample collector fallback diagnostics",
+                "sample collector failure diagnostics",
                 lambda error=exc: {
                     "sample_id": job.sample_id,
                     "error": repr(error),
@@ -1241,9 +1242,7 @@ class EdgeWorker:
         try:
             return bool(collector.flush(timeout=timeout))
         except Exception as exc:
-            logger.error(
-                "Failed to flush async sample collector: {}.", safe_error_summary(exc)
-            )
+            logger.error("Failed to flush async sample collector: {}.", safe_error_summary(exc))
             return False
 
     def _flush_sample_writer(self, *, timeout: float = 10.0) -> bool:
@@ -1263,9 +1262,7 @@ class EdgeWorker:
         try:
             return bool(syncer.flush(timeout=timeout, include_partial=True))
         except Exception as exc:
-            logger.error(
-                "Failed to flush high-quality sample syncer: {}.", safe_error_summary(exc)
-            )
+            logger.error("Failed to flush high-quality sample syncer: {}.", safe_error_summary(exc))
             return False
 
     def _feature_upload_shard_size(self) -> int | None:
@@ -1298,13 +1295,9 @@ class EdgeWorker:
     ) -> dict[str, object]:
         boxes, labels, scores = self._snapshot_result(task)
         confidence = getattr(inference, "confidence", None) if inference is not None else None
-        logit_entropy = (
-            getattr(inference, "logit_entropy", None) if inference is not None else None
-        )
+        logit_entropy = getattr(inference, "logit_entropy", None) if inference is not None else None
         feature_spectral_entropy = (
-            getattr(inference, "feature_spectral_entropy", None)
-            if inference is not None
-            else None
+            getattr(inference, "feature_spectral_entropy", None) if inference is not None else None
         )
         if logit_entropy is not None:
             entropy = logit_entropy
@@ -1471,9 +1464,7 @@ class EdgeWorker:
         logger.warning(
             "Continual learning sample collection disabled for edge model {}: {}.",
             self.model_id,
-            safe_error_summary(
-                self.split_learning_disable_reason or "split learning unavailable"
-            ),
+            safe_error_summary(self.split_learning_disable_reason or "split learning unavailable"),
         )
 
     def _reset_pending_training_cycle(self) -> None:
@@ -1685,6 +1676,8 @@ class EdgeWorker:
             self.sample_store.clear()
         if update.reset_drift:
             self.window_drift_detector.reset()
+            self.quality_classifier.reset()
+            self.teacher_sample_selector.on_model_update()
         if update.report:
             reported, report_message = report_edge_model_version(
                 self.config.server_ip,
@@ -1962,13 +1955,13 @@ class EdgeWorker:
     def _make_training_decision(
         self,
         *,
-        drift_state: DriftWindowState,
         stats: PendingTrainingStats,
+        drift_detected: bool,
     ) -> TrainingDecision:
         if self.resource_trigger_enabled and self.resource_trigger is not None:
             cloud_state, bandwidth_mbps = self._resource_probe_snapshot()
             return self.resource_trigger.decide(
-                drift_detected=drift_state.drift_detected,
+                drift_detected=bool(drift_detected),
                 cloud_state=cloud_state,
                 bandwidth_mbps=bandwidth_mbps,
                 sample_stats=stats,
@@ -1984,6 +1977,36 @@ class EdgeWorker:
             reason="Resource-aware continual-learning trigger is disabled.",
         )
 
+    def _bootstrap_training_ready(self, stats: PendingTrainingStats) -> bool:
+        resource_cfg = self.config.resource_aware_trigger
+        if not self.resource_trigger_enabled or not resource_cfg.bootstrap_without_drift:
+            return False
+        if str(self.model_version) != "0":
+            return False
+        if self.resource_trigger is None:
+            raise RuntimeError("resource-aware trigger is enabled but not initialized")
+        min_samples = int(self.resource_trigger.min_training_samples)
+        return int(stats.low_quality_count) >= max(1, min_samples)
+
+    def _should_store_quality_sample(
+        self,
+        *,
+        quality_bucket: str,
+        raw_sample_selected: bool,
+    ) -> bool:
+        if str(quality_bucket) == LOW_QUALITY:
+            return bool(raw_sample_selected)
+        return self.high_quality_sync_enabled
+
+    @staticmethod
+    def _apply_window_quality_rate(
+        stats: PendingTrainingStats,
+        drift_state: DriftWindowState,
+    ) -> float:
+        retained_sample_rate = float(stats.low_quality_rate)
+        stats.low_quality_rate = float(drift_state.low_quality_rate)
+        return retained_sample_rate
+
     def collect_data(self, task: Task, frame, inference: InferenceArtifacts) -> bool:
         split_plan = self.fixed_split_plan
         if split_plan is None:
@@ -1995,11 +2018,9 @@ class EdgeWorker:
             or getattr(split_plan, "split_config_id", "")
             or ""
         )
-        feature_abi_id = str(
-            runtime_contract.get("feature_abi_id")
-            or runtime_contract.get("feature_layout_id")
-            or ""
-        )
+        feature_abi_id = str(runtime_contract.get("feature_abi_id") or "")
+        if not feature_abi_id:
+            raise RuntimeError("Fixed split plan is missing the current feature ABI identifier.")
         job = SampleCollectionJob(
             sample_id=self._next_sample_id(task),
             frame_index=task.frame_index,
@@ -2055,48 +2076,86 @@ class EdgeWorker:
                 },
             )
             async_drift_ms = (time.perf_counter() - drift_started) * 1000.0
-            save_raw = quality.quality_bucket == LOW_QUALITY
-            retrain_cfg = getattr(getattr(self, "config", None), "retrain", None)
-            persist_debug_stats = bool(
-                getattr(quality_classifier, "persist_debug_stats", False)
+            teacher_selector = self.teacher_sample_selector
+            teacher_selection = teacher_selector.select(quality)
+            save_raw = quality.quality_bucket == LOW_QUALITY and teacher_selection.selected
+            should_store = self._should_store_quality_sample(
+                quality_bucket=quality.quality_bucket,
+                raw_sample_selected=save_raw,
             )
-            store_kwargs = {
-                "sample_id": job.sample_id,
-                "frame_index": job.frame_index,
-                "confidence": confidence,
-                "split_config_id": job.split_config_id,
-                "model_id": job.model_id,
-                "model_version": job.model_version,
-                "front_version": job.front_version,
-                "quality_bucket": quality.quality_bucket,
-                "quality_metadata": quality.quality_metadata(
-                    persist_debug_stats=persist_debug_stats
-                ),
-                "window_id": quality.window_id,
-                "in_drift_window": quality.in_drift_window,
-                "inference_result": inference.to_inference_result(),
-                "intermediate": inference.intermediate,
-                "raw_frame": frame if save_raw else None,
-                "raw_jpeg_quality": int(getattr(retrain_cfg, "raw_jpeg_quality", 82)),
-                "input_image_size": list(frame.shape[:2]),
-                "input_tensor_shape": inference.input_tensor_shape,
-                "input_resize_mode": inference.input_resize_mode,
-                "runtime_contract": job.runtime_contract,
-            }
-            writer_queued = self._submit_sample_write(
-                SampleWriteJob(
-                    store_kwargs=store_kwargs,
-                    stats_delta=SampleStatsDelta.from_values(
-                        quality_bucket=quality.quality_bucket,
-                        in_drift_window=quality.in_drift_window,
+            retrain_cfg = self.config.retrain
+            persist_debug_stats = bool(quality_classifier.persist_debug_stats)
+            if should_store:
+                store_kwargs = {
+                    "sample_id": job.sample_id,
+                    "frame_index": job.frame_index,
+                    "confidence": confidence,
+                    "split_config_id": job.split_config_id,
+                    "model_id": job.model_id,
+                    "model_version": job.model_version,
+                    "front_version": job.front_version,
+                    "quality_bucket": quality.quality_bucket,
+                    "quality_metadata": quality.quality_metadata(
+                        persist_debug_stats=persist_debug_stats
                     ),
+                    "window_id": quality.window_id,
+                    "in_drift_window": quality.in_drift_window,
+                    "inference_result": inference.to_inference_result(),
+                    "intermediate": inference.intermediate,
+                    "raw_frame": frame if save_raw else None,
+                    "raw_jpeg_quality": int(retrain_cfg.raw_jpeg_quality),
+                    "input_image_size": list(frame.shape[:2]),
+                    "input_tensor_shape": inference.input_tensor_shape,
+                    "input_resize_mode": inference.input_resize_mode,
+                    "runtime_contract": job.runtime_contract,
+                }
+                writer_queued = self._submit_sample_write(
+                    SampleWriteJob(
+                        store_kwargs=store_kwargs,
+                        stats_delta=SampleStatsDelta.from_values(
+                            quality_bucket=quality.quality_bucket,
+                            in_drift_window=quality.in_drift_window,
+                        ),
+                    )
                 )
+
+            self._record_experiment_metric(
+                "sample_quality_summary",
+                frame_id=int(job.frame_index),
+                quality_bucket=str(quality.quality_bucket),
+                quality_reason=str(quality.reason),
+                window_id=str(quality.window_id or ""),
+                in_drift_window=bool(quality.in_drift_window),
+                confidence=confidence,
+                output_entropy=quality.output_entropy,
+                output_entropy_threshold=quality.output_entropy_threshold,
+                feature_entropy_deviation=quality.feature_entropy_deviation,
+                raw_sample_selected=bool(save_raw),
+                teacher_sample_reason=str(teacher_selection.reason),
+                teacher_sample_selection_rate=float(teacher_selector.effective_selection_rate),
+            )
+            trigger_stats = PendingTrainingStats.from_mapping(self._stats_for_training_trigger())
+            self._record_experiment_metric(
+                "drift_window_summary",
+                frame_id=int(job.frame_index),
+                window_id=str(quality.window_id or ""),
+                drift_detected=bool(drift_state.drift_detected),
+                drift_started=bool(drift_state.drift_started),
+                drift_ended=bool(drift_state.drift_ended),
+                evaluation_performed=bool(drift_state.evaluation_performed),
+                drift_score=float(drift_state.drift_score),
+                window_low_quality_rate=float(drift_state.low_quality_rate),
+                window_severe_anomaly_rate=float(drift_state.severe_anomaly_rate),
+                low_quality_count=int(trigger_stats.low_quality_count),
+                total_samples=int(trigger_stats.total_samples),
             )
 
             if self.retrain_flag:
                 return
 
-            if not bool(drift_state.drift_detected):
+            bootstrap_ready = self._bootstrap_training_ready(trigger_stats)
+            effective_drift = bool(drift_state.drift_detected or bootstrap_ready)
+            if not effective_drift:
                 self._drift_probe_active = False
                 return
 
@@ -2109,26 +2168,16 @@ class EdgeWorker:
                     return
 
             stats = PendingTrainingStats.from_mapping(self._stats_for_training_trigger())
-            stats.drift_detected = bool(drift_state.drift_detected)
+            retained_sample_low_quality_rate = self._apply_window_quality_rate(
+                stats,
+                drift_state,
+            )
+            bootstrap_ready = self._bootstrap_training_ready(stats)
+            effective_drift = bool(drift_state.drift_detected or bootstrap_ready)
+            stats.drift_detected = effective_drift
             decision = self._make_training_decision(
-                drift_state=drift_state,
                 stats=stats,
-            )
-            self._record_experiment_metric(
-                "sample_quality_summary",
-                frame_id=int(job.frame_index),
-                quality_bucket=str(quality.quality_bucket),
-                window_id=str(quality.window_id or ""),
-                in_drift_window=bool(quality.in_drift_window),
-                confidence=confidence,
-            )
-            self._record_experiment_metric(
-                "drift_window_summary",
-                frame_id=int(job.frame_index),
-                window_id=str(quality.window_id or ""),
-                drift_detected=bool(drift_state.drift_detected),
-                low_quality_count=int(stats.low_quality_count),
-                total_samples=int(stats.total_samples),
+                drift_detected=effective_drift,
             )
             self._record_experiment_metric(
                 "resource_trigger_decision",
@@ -2142,8 +2191,13 @@ class EdgeWorker:
                 cloud_compute_pressure=float(decision.compute_pressure),
                 bandwidth_pressure=float(decision.bandwidth_pressure),
                 bundle_cap_bytes=int(decision.bundle_cap_bytes or 0),
+                window_low_quality_rate=float(stats.low_quality_rate),
+                retained_sample_low_quality_rate=float(retained_sample_low_quality_rate),
+                cooldown_remaining_decisions=int(decision.cooldown_remaining_decisions),
+                cooldown_remaining_sec=float(decision.cooldown_remaining_sec),
+                bootstrap_trigger_eligible=bool(bootstrap_ready),
             )
-            if decision.train_now and stats.total_samples > 0:
+            if decision.train_now and stats.low_quality_count > 0:
                 self.pending_training_decision = decision
                 self.retrain_flag = True
                 self.collect_flag = False
@@ -2186,6 +2240,8 @@ class EdgeWorker:
 
             decision = self.pending_training_decision
             if self.fixed_split_plan is None or decision is None:
+                if decision is not None and self.resource_trigger is not None:
+                    self.resource_trigger.cancel_trigger(decision)
                 self._reset_pending_training_cycle()
                 continue
 
@@ -2232,6 +2288,7 @@ class EdgeWorker:
                     edge_session_id=str(getattr(self, "edge_session_id", "") or ""),
                     send_low_conf_features=decision.send_low_conf_features,
                     bundle_cap_bytes=decision.bundle_cap_bytes,
+                    max_samples=self.resource_trigger.max_training_samples,
                     trigger_shard_size=self._feature_upload_shard_size(),
                     bandwidth_mbps=decision.bandwidth_mbps,
                     channel=training_channel,
@@ -2243,8 +2300,14 @@ class EdgeWorker:
                         "[EdgeCL] cloud continual learning submission failed: {}.",
                         safe_error_summary(msg),
                     )
+                    if self.resource_trigger is not None:
+                        self.resource_trigger.cancel_trigger(decision)
                     self._reset_pending_training_cycle()
                     continue
+
+                if self.resource_trigger is None:
+                    raise RuntimeError("resource-aware trigger is unavailable")
+                self.resource_trigger.confirm_trigger(decision)
 
                 self._record_experiment_metric(
                     "bundle_built",
@@ -2266,8 +2329,7 @@ class EdgeWorker:
                     "bundle_upload_done",
                     job_id=job_id,
                     model_version=str(self.model_version),
-                    timestamp_ms=upload_metrics.get("upload_done_at_ms")
-                    or int(time.time() * 1000),
+                    timestamp_ms=upload_metrics.get("upload_done_at_ms") or int(time.time() * 1000),
                     **{
                         key: value
                         for key, value in upload_metrics.items()
@@ -2358,8 +2420,7 @@ class EdgeWorker:
                             self._record_experiment_metric(
                                 "training_job_started",
                                 timestamp_ms=int(
-                                    getattr(reply, "started_at_ms", 0)
-                                    or time.time() * 1000
+                                    getattr(reply, "started_at_ms", 0) or time.time() * 1000
                                 ),
                                 job_id=job_id,
                                 status=status,
@@ -2374,8 +2435,7 @@ class EdgeWorker:
                         self._record_experiment_metric(
                             "training_job_succeeded",
                             timestamp_ms=int(
-                                getattr(reply, "finished_at_ms", 0)
-                                or time.time() * 1000
+                                getattr(reply, "finished_at_ms", 0) or time.time() * 1000
                             ),
                             job_id=job_id,
                             status=status,
@@ -2392,9 +2452,7 @@ class EdgeWorker:
                             job_id=job_id,
                             channel=training_channel,
                         )
-                        model_update_download_ms = (
-                            time.perf_counter() - download_started
-                        ) * 1000.0
+                        model_update_download_ms = (time.perf_counter() - download_started) * 1000.0
                         if not success:
                             logger.error(
                                 "[EdgeCL] model update download failed: reason={}.",
@@ -2406,9 +2464,7 @@ class EdgeWorker:
                                     base64.b64decode(model_b64, validate=True)
                                 )
                             except (TypeError, ValueError):
-                                model_update_download_bytes = len(
-                                    str(model_b64).encode("utf-8")
-                                )
+                                model_update_download_bytes = len(str(model_b64).encode("utf-8"))
                             self._record_experiment_metric(
                                 "model_update_downloaded",
                                 job_id=job_id,
@@ -2429,8 +2485,7 @@ class EdgeWorker:
                         self._record_experiment_metric(
                             "training_job_waiting_for_samples",
                             timestamp_ms=int(
-                                getattr(reply, "finished_at_ms", 0)
-                                or time.time() * 1000
+                                getattr(reply, "finished_at_ms", 0) or time.time() * 1000
                             ),
                             job_id=job_id,
                             status=status,
@@ -2675,9 +2730,7 @@ class EdgeWorker:
                 )
                 continue
 
-            local_enqueued = float(
-                getattr(task, "local_queue_enqueued_perf", time.perf_counter())
-            )
+            local_enqueued = float(getattr(task, "local_queue_enqueued_perf", time.perf_counter()))
             task.set_timing("local_queue_wait", (time.perf_counter() - local_enqueued) * 1000.0)
             current_frame = task.frame_edge
             frame_image_size = tuple(int(value) for value in current_frame.shape[:2])

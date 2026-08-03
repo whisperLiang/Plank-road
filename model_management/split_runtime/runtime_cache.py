@@ -9,7 +9,7 @@ from typing import Any
 
 import torch
 
-from .torchlens_native_runtime import SplitSpec, torchlens_runtime_version
+from .torchlens_native_runtime import SplitSpec
 
 
 def _stable_json_dumps(payload: object) -> str:
@@ -90,7 +90,6 @@ def split_spec_hash(split_spec: SplitSpec) -> str:
 class RuntimeCacheKey:
     model_name: str
     model_family: str
-    runtime_version: str
     graph_signature: str | None
     split_plan_hash: str
     symbolic_input_schema_hash: str
@@ -101,7 +100,6 @@ class RuntimeCacheKey:
         return {
             "model_name": self.model_name,
             "model_family": self.model_family,
-            "runtime_version": self.runtime_version,
             "graph_signature": self.graph_signature,
             "split_plan_hash": self.split_plan_hash,
             "symbolic_input_schema_hash": self.symbolic_input_schema_hash,
@@ -131,7 +129,6 @@ def make_runtime_cache_key(
     return RuntimeCacheKey(
         model_name=str(model_name),
         model_family=str(model_family),
-        runtime_version=torchlens_runtime_version(),
         graph_signature=graph_signature,
         split_plan_hash=split_plan_hash_value or split_spec_hash(split_spec),
         symbolic_input_schema_hash=schema_hash,

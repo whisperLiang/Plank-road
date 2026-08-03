@@ -5,6 +5,13 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
+
+def reject_removed_fields(payload: Mapping[str, object], *field_names: str) -> None:
+    present = [field_name for field_name in field_names if field_name in payload]
+    if present:
+        raise RuntimeError(f"Removed contract field(s): {', '.join(present)}.")
+
+
 def stable_json(payload: object) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
@@ -38,6 +45,7 @@ def require_int_list(payload: Mapping[str, object], field_name: str) -> list[int
 
 def validate_runtime_contract(runtime_contract: Mapping[str, object]) -> dict[str, Any]:
     contract = dict(runtime_contract)
+    reject_removed_fields(contract, "version", "runtime_version", "format_version")
     if str(contract.get("runtime_backend") or "") != "torchlens_native":
         raise RuntimeError(
             "Fixed split runtime_contract must use runtime_backend='torchlens_native'."
@@ -45,6 +53,7 @@ def validate_runtime_contract(runtime_contract: Mapping[str, object]) -> dict[st
     for field_name in (
         "logical_split_id",
         "feature_layout_id",
+        "feature_abi_id",
         "model_id",
         "model_version",
         "input_resize_mode",
@@ -54,11 +63,16 @@ def validate_runtime_contract(runtime_contract: Mapping[str, object]) -> dict[st
     labels = contract.get("boundary_tensor_labels")
     if not isinstance(labels, (list, tuple)) or not labels:
         raise RuntimeError("Fixed split runtime_contract is missing boundary_tensor_labels.")
+    abi_spec = contract.get("feature_abi_spec")
+    if not isinstance(abi_spec, Mapping) or not abi_spec:
+        raise RuntimeError("Fixed split runtime_contract is missing feature_abi_spec.")
+    reject_removed_fields(abi_spec, "version", "runtime_version", "adapter_version")
     return contract
 
 
 def validate_fixed_split_plan(split_plan: Mapping[str, object]) -> dict[str, Any]:
     plan = require_mapping(split_plan, field_name="fixed split plan")
+    reject_removed_fields(plan, "plan_version")
     runtime_contract = require_mapping(
         plan.get("runtime_contract"),
         field_name="fixed split plan runtime_contract",
@@ -68,6 +82,7 @@ def validate_fixed_split_plan(split_plan: Mapping[str, object]) -> dict[str, Any
 
 def validate_low_quality_manifest(manifest: Mapping[str, object]) -> dict[str, Any]:
     payload = require_mapping(manifest, field_name="low-quality trigger manifest")
+    reject_removed_fields(payload, "protocol_version")
     split_plan = require_mapping(payload.get("split_plan"), field_name="split_plan")
     manifest_contract = validate_runtime_contract(
         require_mapping(payload.get("runtime_contract"), field_name="runtime_contract")
@@ -76,6 +91,8 @@ def validate_low_quality_manifest(manifest: Mapping[str, object]) -> dict[str, A
     for field_name in (
         "logical_split_id",
         "feature_layout_id",
+        "feature_abi_id",
+        "feature_abi_spec",
         "model_id",
         "model_version",
         "input_tensor_shape",
@@ -101,6 +118,7 @@ def validate_low_quality_manifest(manifest: Mapping[str, object]) -> dict[str, A
 
 def validate_high_quality_sync_manifest(manifest: Mapping[str, object]) -> dict[str, Any]:
     payload = require_mapping(manifest, field_name="high-quality sync manifest")
+    reject_removed_fields(payload, "protocol_version")
     runtime_contract = validate_runtime_contract(
         require_mapping(payload.get("runtime_contract"), field_name="runtime_contract")
     )

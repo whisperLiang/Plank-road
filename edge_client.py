@@ -329,9 +329,7 @@ def _experiment_result_upload_enabled(
     experiment_results: object,
 ) -> bool:
     enabled = bool(getattr(experiment_results, "enabled", False))
-    upload_enabled = bool(
-        getattr(experiment_results, "upload_enabled", enabled)
-    )
+    upload_enabled = bool(getattr(experiment_results, "upload_enabled", enabled))
     return enabled and upload_enabled
 
 
@@ -372,9 +370,7 @@ def _upload_experiment_run_artifacts_if_enabled(
 def _baseline_split_runtime_policy(baseline_config) -> str:
     edge_cfg = getattr(baseline_config, "edge", None)
     policy = (
-        str(getattr(edge_cfg, "split_runtime_policy", "disabled") or "disabled")
-        .strip()
-        .lower()
+        str(getattr(edge_cfg, "split_runtime_policy", "disabled") or "disabled").strip().lower()
     )
     if policy != "disabled":
         raise ValueError("baseline.edge.split_runtime_policy must be disabled")
@@ -602,9 +598,7 @@ def _run_video_loop(
                                 "frame_id": int(index),
                                 "latency_ms": latency_ms,
                                 "result_source": str(task.result_source or ""),
-                                "model_version": str(
-                                    getattr(edge, "model_version", "0") or "0"
-                                ),
+                                "model_version": str(getattr(edge, "model_version", "0") or "0"),
                                 "num_detections": len(detection_boxes),
                                 "timing_ms": dict(getattr(task, "timing_ms", {}) or {}),
                             }
@@ -775,9 +769,7 @@ def _write_edge_summary(
         "label_schema": str(label_schema or ""),
         "class_names": list(class_names or []),
         "student_model": str(getattr(config, "lightweight", "") or ""),
-        "teacher_model": str(
-            getattr(config, "experiment_teacher_model", "") or ""
-        ),
+        "teacher_model": str(getattr(config, "experiment_teacher_model", "") or ""),
         "sampled_frame_count": int(sampled_frame_count),
         "offline_result_archival": method == "SURGEON",
         "archive_upload_excluded_from_communication_cost": True,
@@ -853,8 +845,10 @@ def _run_ekya_style_edge_stream(
         run_id=baseline_run_id,
         video_path=_effective_video_source(config),
     )
-    edge_output_dir = Path(output_dir) if output_dir is not None else (
-        Path("results") / "edge" / baseline_run_id / "baselines" / EKYA_METHOD
+    edge_output_dir = (
+        Path(output_dir)
+        if output_dir is not None
+        else (Path("results") / "edge" / baseline_run_id / "baselines" / EKYA_METHOD)
     )
     edge_output_dir.mkdir(parents=True, exist_ok=True)
     display_events_path = edge_output_dir / "display_events.csv"
@@ -1107,13 +1101,11 @@ def _append_display_event_row(path: Path, fields: list[str], event) -> None:
         ),
         "edge_render_latency_ms": max(
             0.0,
-            (float(event.timestamp_edge_display) - float(event.timestamp_edge_receive))
-            * 1000.0,
+            (float(event.timestamp_edge_display) - float(event.timestamp_edge_receive)) * 1000.0,
         ),
         "edge_e2e_display_latency_ms": max(
             0.0,
-            (float(event.timestamp_edge_display) - float(event.timestamp_edge_capture))
-            * 1000.0,
+            (float(event.timestamp_edge_display) - float(event.timestamp_edge_capture)) * 1000.0,
         ),
         "displayed": "true" if bool(event.displayed) else "false",
         "drop_reason": event.drop_reason,
@@ -1192,9 +1184,7 @@ if __name__ == "__main__":
     runtime_config = load_runtime_config(args.yaml_path)
     config = runtime_config.client
     experiment_run = runtime_config.experiment_run
-    config.experiment_teacher_model = str(
-        getattr(runtime_config.server, "golden", "") or ""
-    )
+    config.experiment_teacher_model = str(getattr(runtime_config.server, "golden", "") or "")
     experiment_results = runtime_config.experiment_results
     if args.experiment_results_root is not None:
         experiment_results.local_root_dir = args.experiment_results_root
@@ -1209,6 +1199,11 @@ if __name__ == "__main__":
         config.retrain.cache_path = f"./cache/edge_{args.edge_id}"
     if args.video_path is not None:
         config.source.video_path = args.video_path
+    if args.scenario is not None:
+        # Keep per-frame replay metadata aligned with the experiment identity.
+        # Previously --scenario only changed the run directory, while the
+        # configured scenario leaked into every prediction row.
+        config.source.scenario_name = normalize_scenario_slug(args.scenario)
     if args.max_count is not None:
         config.source.max_count = args.max_count
     if args.server_ip is not None:
@@ -1244,16 +1239,10 @@ if __name__ == "__main__":
     video_identity = _resolve_video_identity(config)
     experiment_identity = _create_experiment_identity(
         experiment_id=(
-            args.experiment_id
-            if args.experiment_id is not None
-            else experiment_run.experiment_id
+            args.experiment_id if args.experiment_id is not None else experiment_run.experiment_id
         ),
         scenario=args.scenario if args.scenario is not None else experiment_run.scenario,
-        edge_count=(
-            args.edge_count
-            if args.edge_count is not None
-            else experiment_run.edge_count
-        ),
+        edge_count=(args.edge_count if args.edge_count is not None else experiment_run.edge_count),
         repeat=args.repeat if args.repeat is not None else experiment_run.repeat,
         method=method,
         video_identity=video_identity,

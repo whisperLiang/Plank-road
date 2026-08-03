@@ -5,7 +5,7 @@ from typing import Any
 
 import torch
 
-MODEL_DELTA_PAYLOAD_FORMAT = "state_dict_delta.v1"
+MODEL_DELTA_PAYLOAD_FORMAT = "state_dict_delta"
 _THRESHOLD_STATE_NAMES = frozenset(
     {
         "plank_threshold_low",
@@ -123,7 +123,7 @@ def build_state_dict_delta_payload(
 
 def require_state_dict_delta_payload(payload: object) -> Mapping[str, Any]:
     if not isinstance(payload, Mapping):
-        raise RuntimeError("Cloud model update must be a state_dict_delta.v1 payload.")
+        raise RuntimeError("Cloud model update must be a state_dict_delta payload.")
     if payload.get("format") != MODEL_DELTA_PAYLOAD_FORMAT:
         raise RuntimeError(
             "Unsupported cloud model update format: "

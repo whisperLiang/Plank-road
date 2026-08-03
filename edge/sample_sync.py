@@ -25,11 +25,7 @@ from edge.sample_quality import HIGH_QUALITY
 from edge.sample_store import EdgeSampleStore, StoredSampleRecord
 from model_management.detection_box_projection import ORIGINAL_XYXY
 from model_management.payload import BoundaryPayload
-from model_management.split_contract import (
-    build_feature_abi_spec,
-    feature_abi_id,
-    feature_layout_from_tensors,
-)
+from model_management.split_contract import feature_layout_from_tensors
 
 UPLOAD_LEDGER_FILENAME = "upload_ledger.json"
 UPLOAD_PENDING = "pending"
@@ -354,41 +350,10 @@ def pack_high_quality_sync_bundle_to_file(
             )
         feature_abi_spec = dict(runtime_contract.get("feature_abi_spec") or {})
         feature_abi_value = str(runtime_contract.get("feature_abi_id") or "")
-        if not feature_abi_spec and inferred_feature_layout:
-            boundary_schema = (
-                runtime_contract.get("boundary_schema")
-                if isinstance(runtime_contract.get("boundary_schema"), Mapping)
-                else None
+        if not feature_abi_value or not feature_abi_spec:
+            raise RuntimeError(
+                "High-quality feature sync requires the current feature ABI contract."
             )
-            feature_abi_spec = build_feature_abi_spec(
-                model_id=model_id,
-                model_family=str(
-                    context.get("model_family") or runtime_contract.get("model_family") or ""
-                ),
-                canonical_split_key=str(
-                    canonical_split_key
-                    or runtime_contract.get("logical_split_id")
-                    or edge_split_id
-                    or ""
-                ),
-                graph_signature=str(
-                    runtime_contract.get("trace_signature")
-                    or runtime_contract.get("graph_signature")
-                    or ""
-                ),
-                boundary_tensor_labels=inferred_boundary_labels,
-                boundary_schema=boundary_schema,
-                feature_layout=inferred_feature_layout,
-                input_tensor_shape=[int(dim) for dim in input_tensor_shape],
-                input_resize_mode=input_resize_mode,
-                runtime_identity={"runtime_contract": runtime_contract},
-            )
-        if not feature_abi_value and feature_abi_spec:
-            feature_abi_value = feature_abi_id(feature_abi_spec)
-        if feature_abi_value:
-            runtime_contract.setdefault("feature_abi_id", feature_abi_value)
-        if feature_abi_spec:
-            runtime_contract.setdefault("feature_abi_spec", dict(feature_abi_spec))
         runtime_context = {
             "model_id": model_id,
             "model_family": str(context.get("model_family") or ""),

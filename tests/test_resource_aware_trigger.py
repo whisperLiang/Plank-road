@@ -1,12 +1,33 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from edge.resource_aware_trigger import (
     CloudResourceState,
     PendingTrainingStats,
     ResourceAwareCLTrigger,
+    create_resource_aware_trigger,
 )
+
+
+def test_model_specific_sample_limits_override_defaults() -> None:
+    config = SimpleNamespace(
+        lightweight="rfdetr_nano",
+        retrain=SimpleNamespace(collect_num=8),
+        resource_aware_trigger=SimpleNamespace(
+            min_training_samples=128,
+            min_training_samples_by_model={"rfdetr_nano": 64},
+            max_training_samples=128,
+            max_training_samples_by_model={"rfdetr_nano": 64},
+        ),
+    )
+
+    trigger = create_resource_aware_trigger(config)
+
+    assert trigger.min_training_samples == 64
+    assert trigger.max_training_samples == 64
 
 
 def _cloud(pressure: float) -> CloudResourceState:
@@ -123,7 +144,97 @@ def test_raw_plus_feature_uses_discounted_cloud_cost_in_queue_update() -> None:
             low_quality_feature_bytes=1,
         ),
     )
+    trigger.confirm_trigger(decision)
 
     assert decision.train_now is True
     assert decision.send_low_conf_features is True
     assert trigger.Q_cloud == pytest.approx(10.5)
+
+
+def test_training_minimum_counts_teacher_needed_samples_not_total_samples() -> None:
+    trigger = ResourceAwareCLTrigger(V=100.0, min_training_samples=5)
+
+    decision = trigger.decide(
+        drift_detected=True,
+        cloud_state=_cloud(0.0),
+        bandwidth_mbps=1_000.0,
+        sample_stats=_stats(
+            total_samples=100,
+            low_quality_count=4,
+            low_quality_rate=0.04,
+        ),
+    )
+
+    assert decision.train_now is False
+    assert "teacher-needed samples" in decision.reason
+
+
+def test_post_trigger_decision_cooldown_suppresses_immediate_retraining() -> None:
+    trigger = ResourceAwareCLTrigger(
+        V=100.0,
+        K_p=0.0,
+        K_d=0.0,
+        min_training_samples=1,
+        cooldown_decisions=2,
+    )
+    stats = _stats(total_samples=1, low_quality_count=1, low_quality_rate=1.0)
+
+    first = trigger.decide(
+        drift_detected=True,
+        cloud_state=_cloud(0.0),
+        bandwidth_mbps=1_000.0,
+        sample_stats=stats,
+    )
+    trigger.confirm_trigger(first)
+    second = trigger.decide(
+        drift_detected=True,
+        cloud_state=_cloud(0.0),
+        bandwidth_mbps=1_000.0,
+        sample_stats=stats,
+    )
+    third = trigger.decide(
+        drift_detected=True,
+        cloud_state=_cloud(0.0),
+        bandwidth_mbps=1_000.0,
+        sample_stats=stats,
+    )
+
+    assert first.train_now is True
+    assert second.train_now is False
+    assert second.cooldown_remaining_decisions == 1
+    assert third.train_now is True
+
+
+def test_cancelled_trigger_does_not_arm_cooldown_or_charge_resources() -> None:
+    trigger = ResourceAwareCLTrigger(
+        V=100.0,
+        K_p=0.0,
+        K_d=0.0,
+        lambda_cloud=0.0,
+        lambda_bw=0.0,
+        min_training_samples=1,
+        cooldown_decisions=10,
+        min_training_interval_sec=60.0,
+    )
+    stats = _stats(total_samples=1, low_quality_count=1, low_quality_rate=1.0)
+
+    failed = trigger.decide(
+        drift_detected=True,
+        cloud_state=_cloud(0.5),
+        bandwidth_mbps=1_000.0,
+        sample_stats=stats,
+    )
+    trigger.cancel_trigger(failed)
+    retry = trigger.decide(
+        drift_detected=True,
+        cloud_state=_cloud(0.5),
+        bandwidth_mbps=1_000.0,
+        sample_stats=stats,
+    )
+
+    assert retry.train_now is True
+    assert retry.cooldown_remaining_decisions == 0
+    assert retry.cooldown_remaining_sec == 0.0
+    assert trigger.trigger_count == 0
+    assert trigger.Q_cloud == 0.0
+    assert trigger.Q_bw == 0.0

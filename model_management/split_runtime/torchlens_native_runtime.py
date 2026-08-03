@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.metadata
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
@@ -8,6 +7,7 @@ import torch
 import torchlens as tl
 
 from .torchlens_forward_guard import torchlens_forward_guard
+
 DEFAULT_SPLIT_MODE = "generated_eager"
 BoundaryPayload = tl.ReplayBoundary
 ReplayBoundary = tl.ReplayBoundary
@@ -50,13 +50,6 @@ class SplitCandidateMetadata:
     boundary_nodes: tuple[str, ...]
     prefix_nodes: tuple[str, ...]
     suffix_nodes: tuple[str, ...]
-
-
-def torchlens_runtime_version() -> str:
-    try:
-        return importlib.metadata.version("torchlens")
-    except importlib.metadata.PackageNotFoundError:
-        return "unknown"
 
 
 def normalize_example_inputs(example_inputs: Any) -> tuple[Any, ...]:
@@ -320,6 +313,5 @@ __all__ = [
     "prepare_split_runtime",
     "require_torchlens_native_split_api",
     "resolve_split_candidate_metadata",
-    "torchlens_runtime_version",
     "trace_signature",
 ]

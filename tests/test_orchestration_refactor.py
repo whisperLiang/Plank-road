@@ -60,6 +60,7 @@ def _config(tmp_path: Path) -> SimpleNamespace:
         proxy_eval_validation_fraction=0.2,
         proxy_eval_max_dets=500,
         proxy_eval_frame_cache_enabled=True,
+        training_frame_count_by_model={"yolo26n": 3},
         split_learning_rate=1e-3,
         wrapper_fixed_split_learning_rate=3e-5,
         tinynext_fixed_split_learning_rate=1e-3,
@@ -89,6 +90,7 @@ def test_cloud_orchestrator_imports_initializes_and_alias_survives(tmp_path) -> 
     try:
         assert learner.max_concurrent_jobs == 1
         assert learner.settings.batch_size == 2
+        assert learner.training_frame_count == 3
         assert Path(learner.weight_folder) == Path.cwd() / "model_management" / "models"
         assert isinstance(alias, CloudFixedSplitOrchestrator)
     finally:

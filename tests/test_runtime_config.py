@@ -10,6 +10,142 @@ def test_default_config_loads_for_main_runtime() -> None:
 
     assert config.baseline.enabled is False
     assert config.server.edge_model_name == "yolo26n"
+    assert config.client.feature_upload.sync_high_quality is False
+    assert config.client.resource_aware_trigger.max_training_samples == 128
+    assert config.client.resource_aware_trigger.min_training_samples_by_model == {
+        "rfdetr_nano": 64
+    }
+    assert config.client.resource_aware_trigger.max_training_samples_by_model == {
+        "rfdetr_nano": 64
+    }
+    assert config.client.resource_aware_trigger.bootstrap_without_drift is True
+    assert config.server.continual_learning.training_replay_fraction_by_model == {
+        "yolo26n": 0.25
+    }
+    assert config.server.continual_learning.training_frame_count_by_model == {
+        "rfdetr_nano": 64
+    }
+
+
+def test_high_quality_feature_sync_flag_is_loaded(tmp_path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+client:
+  feature_upload:
+    sync_high_quality: false
+""",
+        encoding="utf-8",
+    )
+
+    config = load_runtime_config(path)
+
+    assert config.client.feature_upload.sync_high_quality is False
+
+
+@pytest.mark.parametrize("yaml_value", ["1", '"false"'])
+def test_high_quality_feature_sync_flag_requires_boolean(tmp_path, yaml_value: str) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        f"""
+client:
+  feature_upload:
+    sync_high_quality: {yaml_value}
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="sync_high_quality"):
+        load_runtime_config(path)
+
+
+@pytest.mark.parametrize("field_name", ["enabled", "retain_empty_predictions"])
+@pytest.mark.parametrize("yaml_value", ["1", '"false"'])
+def test_teacher_sampling_flags_require_boolean(
+    tmp_path,
+    field_name: str,
+    yaml_value: str,
+) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        f"""
+client:
+  sample_quality:
+    teacher_sampling:
+      {field_name}: {yaml_value}
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=field_name):
+        load_runtime_config(path)
+
+
+@pytest.mark.parametrize("yaml_value", ["1", '"false"'])
+def test_feature_update_on_anomaly_requires_boolean(tmp_path, yaml_value: str) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        f"""
+client:
+  sample_quality:
+    boundary_feature_entropy:
+      update_on_anomaly: {yaml_value}
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="update_on_anomaly"):
+        load_runtime_config(path)
+
+
+def test_training_upload_cap_cannot_be_smaller_than_trigger_minimum(tmp_path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+client:
+  resource_aware_trigger:
+    min_training_samples: 8
+    max_training_samples: 7
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="max_training_samples"):
+        load_runtime_config(path)
+
+
+def test_model_training_minimum_cannot_exceed_inherited_upload_cap(tmp_path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+client:
+  resource_aware_trigger:
+    min_training_samples: 8
+    max_training_samples: 8
+    min_training_samples_by_model:
+      yolo26n: 9
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="max_training_samples_by_model"):
+        load_runtime_config(path)
+
+
+@pytest.mark.parametrize("yaml_value", ["1", '"true"'])
+def test_bootstrap_without_drift_requires_boolean(tmp_path, yaml_value: str) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        f"""
+client:
+  resource_aware_trigger:
+    bootstrap_without_drift: {yaml_value}
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="bootstrap_without_drift"):
+        load_runtime_config(path)
 
 
 def test_ekya_uses_common_server_models_without_method_override(tmp_path) -> None:
@@ -114,6 +250,41 @@ client:
     )
 
     with pytest.raises(ValueError, match=replacement):
+        load_runtime_config(path)
+
+
+@pytest.mark.parametrize("field", ["max_candidates", "privacy_metric_lower_bound"])
+def test_removed_fixed_split_compatibility_fields_are_rejected(
+    tmp_path,
+    field: str,
+) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        f"""
+client:
+  split_learning:
+    fixed_split:
+      {field}: 1
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=field):
+        load_runtime_config(path)
+
+
+def test_removed_surgeon_tta_steps_is_rejected(tmp_path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+baseline:
+  SURGEON:
+    tta_steps: 4
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="tta_steps"):
         load_runtime_config(path)
 
 

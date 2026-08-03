@@ -116,6 +116,48 @@ class RecentTrainingWindowStore:
         selected = samples[-limit:]
         return [_strip_internal_fields(sample) for sample in selected]
 
+    def training_samples(
+        self,
+        count: int,
+        *,
+        replay_fraction: float = 0.0,
+    ) -> list[dict[str, object]]:
+        """Return recent samples plus deterministic anchors from older rounds."""
+        limit = max(1, int(count))
+        fraction = max(0.0, min(0.999999, float(replay_fraction)))
+        state = self._load_state()
+        samples = [
+            dict(sample)
+            for sample in list(state.get("samples", []) or [])
+            if isinstance(sample, Mapping) and str(sample.get("sample_id") or "")
+        ]
+        samples.sort(
+            key=lambda sample: (
+                int(sample.get(_SEQUENCE_KEY) or 0),
+                str(sample.get("sample_id") or ""),
+            )
+        )
+        if len(samples) <= limit or fraction <= 0.0:
+            return [_strip_internal_fields(sample) for sample in samples[-limit:]]
+
+        if limit <= 1:
+            return [_strip_internal_fields(samples[-1])]
+
+        replay_count = min(limit - 1, max(1, round(limit * fraction)))
+        recent_count = limit - replay_count
+        older = samples[:-recent_count]
+        recent = samples[-recent_count:]
+        if len(older) <= replay_count:
+            selected = older + recent[-(limit - len(older)) :]
+        else:
+            step = len(older) / float(replay_count)
+            anchors = [
+                older[min(len(older) - 1, int((index + 0.5) * step))]
+                for index in range(replay_count)
+            ]
+            selected = anchors + recent
+        return [_strip_internal_fields(sample) for sample in selected]
+
     def sample_count(self) -> int:
         return len(self.latest_samples(self.max_samples))
 

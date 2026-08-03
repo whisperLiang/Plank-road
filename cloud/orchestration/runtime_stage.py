@@ -561,11 +561,6 @@ class FixedSplitRuntimeContractMixin:
                 int(dim) for dim in list(context.get("input_tensor_shape", []) or [])
             ],
             "input_resize_mode": str(context.get("input_resize_mode") or "direct_resize"),
-            "runtime_version": str(
-                getattr(runtime, "runtime_version", None)
-                or getattr(runtime, "version", None)
-                or type(runtime).__name__
-            ),
             "graph_signature": str(
                 getattr(getattr(runtime, "trace_graph", None), "graph_shape_hash", "") or ""
             ),

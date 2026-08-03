@@ -404,23 +404,20 @@ def test_fixed_split_enumerates_full_pool_before_constraint_filtering() -> None:
 
         def enumerate_candidates(self, **kwargs):
             self.seen_kwargs = dict(kwargs)
-            candidates = list(self._candidates)
-            max_candidates = kwargs.get("max_candidates")
-            if max_candidates is not None:
-                candidates = candidates[: int(max_candidates)]
-            return candidates
+            return list(self._candidates)
 
     splitter = FakeSplitter()
     constraints = SplitConstraints(
         privacy_leakage_upper_bound=0.01,
         max_layer_freezing_ratio=0.75,
-        max_candidates=1,
     )
 
     eligible, stats = _enumerate_feasible_candidates(splitter, constraints)
 
-    assert splitter.seen_kwargs is not None
-    assert "max_candidates" not in splitter.seen_kwargs
+    assert splitter.seen_kwargs == {
+        "max_boundary_count": constraints.max_boundary_count,
+        "max_payload_bytes": constraints.max_payload_bytes,
+    }
     assert [item[0].candidate_id for item in eligible] == ["after:eligible"]
     assert stats.total_candidates == 5
     assert stats.eligible_candidates == 1
@@ -468,7 +465,7 @@ def test_fixed_split_validates_all_eligible_candidates_without_limit() -> None:
             }
 
     runtime = FakeSplitter()
-    constraints = SplitConstraints(validate_candidates=True, max_candidates=1)
+    constraints = SplitConstraints(validate_candidates=True)
     eligible = [
         (candidate("after:fail", payload_bytes=1), 0.0, 0.0),
         (candidate("after:success", payload_bytes=2), 0.0, 0.0),
@@ -578,6 +575,7 @@ def test_fixed_split_uses_configured_training_batch_when_validation_batches_omit
         )
 
     class FixedSplitConfig:
+        privacy_leakage_upper_bound = 0.15
         configured_training_batch = 4
         validate_candidates = True
 

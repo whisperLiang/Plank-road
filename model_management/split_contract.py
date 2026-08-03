@@ -128,7 +128,6 @@ def _symbolize_batch_shape(shape: object, *, batch_symbol: str = "B") -> list[in
 @dataclass(frozen=True)
 class FeatureAbiSpec:
     model_family: str
-    runtime_version: str
     canonical_split_key: str
     graph_signature: str
     boundary_tensor_labels: list[str]
@@ -192,7 +191,6 @@ def build_feature_abi_spec(
     *,
     model_id: str = "",
     model_family: str = "",
-    runtime_version: str = "",
     canonical_split_key: str = "",
     graph_signature: str = "",
     boundary_tensor_labels: list[str] | tuple[str, ...] | None = None,
@@ -234,7 +232,6 @@ def build_feature_abi_spec(
     )
     spec = FeatureAbiSpec(
         model_family=resolved_model_family,
-        runtime_version=str(runtime_version or identity.get("runtime_version") or ""),
         canonical_split_key=str(
             canonical_split_key
             or identity.get("canonical_split_key")
@@ -329,7 +326,7 @@ def compute_feature_layout_id(
     feature_layout: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> str:
     payload = {
-        "version": "feature-layout.v3",
+        "format": "feature-layout",
         "model_id": str(model_id or ""),
         "model_version": str(model_version or ""),
         "logical_split_id": str(logical_split_id or ""),
@@ -422,61 +419,11 @@ def _contract_payload(contract: Mapping[str, Any] | object | None) -> dict[str, 
 
 
 def _payload_feature_abi_id(payload: Mapping[str, Any]) -> str:
-    abi_id = str(payload.get("feature_abi_id") or "")
-    if abi_id:
-        return abi_id
-    abi_spec = payload.get("feature_abi_spec")
-    if isinstance(abi_spec, Mapping) and abi_spec:
-        return feature_abi_id(abi_spec)
-    feature_layout_payload = {
-        str(label): dict(spec)
-        for label, spec in dict(payload.get("feature_layout") or {}).items()
-        if isinstance(spec, Mapping)
-    }
-    if not feature_layout_payload:
-        return ""
-    runtime_identity = dict(payload.get("runtime_identity") or {})
-    spec = build_feature_abi_spec(
-        model_id=str(payload.get("model_id") or runtime_identity.get("model_id") or ""),
-        model_family=str(payload.get("model_family") or runtime_identity.get("model_family") or ""),
-        canonical_split_key=str(
-            payload.get("canonical_split_key")
-            or payload.get("cloud_batch_split_id")
-            or runtime_identity.get("canonical_split_key")
-            or runtime_identity.get("cloud_batch_split_id")
-            or payload.get("logical_split_id")
-            or ""
-        ),
-        graph_signature=str(
-            payload.get("graph_signature")
-            or runtime_identity.get("graph_signature")
-            or payload.get("trace_signature")
-            or ""
-        ),
-        boundary_tensor_labels=[
-            str(label) for label in list(payload.get("boundary_tensor_labels") or [])
-        ],
-        boundary_schema=(
-            payload.get("boundary_schema")
-            if isinstance(payload.get("boundary_schema"), Mapping)
-            else None
-        ),
-        feature_layout=feature_layout_payload,
-        input_tensor_shape=list(payload.get("input_tensor_shape") or []),
-        input_resize_mode=str(payload.get("input_resize_mode") or ""),
-        runtime_identity=runtime_identity,
-    )
-    return feature_abi_id(spec)
+    return str(payload.get("feature_abi_id") or "")
 
 
 def _payload_runtime_identity_id(payload: Mapping[str, Any]) -> str:
-    identity_id = str(payload.get("runtime_identity_id") or "")
-    if identity_id:
-        return identity_id
-    identity = payload.get("runtime_identity")
-    if isinstance(identity, Mapping) and identity:
-        return runtime_identity_id(identity)
-    return str(payload.get("contract_id") or "")
+    return str(payload.get("runtime_identity_id") or "")
 
 
 def classify_contract_compatibility(
@@ -498,20 +445,13 @@ def classify_contract_compatibility(
         reason = "missing_edge_runtime_contract"
     elif not cloud:
         reason = "missing_cloud_runtime_contract"
-    elif edge_abi_id and cloud_abi_id:
+    elif not edge_abi_id:
+        reason = "missing_edge_feature_abi_id"
+    elif not cloud_abi_id:
+        reason = "missing_cloud_feature_abi_id"
+    else:
         compatible = edge_abi_id == cloud_abi_id
         reason = "compatible" if compatible else "feature_abi_id"
-    else:
-        edge_spec = edge.get("feature_abi_spec")
-        cloud_spec = cloud.get("feature_abi_spec")
-        if isinstance(edge_spec, Mapping) and isinstance(cloud_spec, Mapping):
-            compatible = _stable_json(edge_spec) == _stable_json(cloud_spec)
-            reason = "compatible" if compatible else "feature_abi_spec"
-        else:
-            compatible = bool(
-                edge_layout_id and cloud_layout_id and edge_layout_id == cloud_layout_id
-            )
-            reason = "legacy_feature_layout_id_compatible" if compatible else "feature_layout_id"
 
     if compatible and edge_runtime_id and cloud_runtime_id and edge_runtime_id != cloud_runtime_id:
         reason = "runtime_identity_changed_but_feature_abi_compatible"
@@ -635,7 +575,6 @@ def _runtime_identity_payload(
         "cloud_batch_split_id": str(cloud_batch_split_id),
         "input_tensor_shape": [int(dim) for dim in list(input_tensor_shape or [])],
         "input_resize_mode": str(input_resize_mode or "direct_resize"),
-        "runtime_version": "",
         "split_plan_hash": "",
         "symbolic_input_schema_hash": "",
         "dynamic_batch": None,
@@ -684,24 +623,18 @@ class SplitRuntimeContract:
     contract_aliases: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        if not self.runtime_identity_id:
-            self.runtime_identity_id = (
-                runtime_identity_id(self.runtime_identity)
-                if self.runtime_identity
-                else str(self.contract_id)
+        required = {
+            "contract_id": self.contract_id,
+            "runtime_identity": self.runtime_identity,
+            "runtime_identity_id": self.runtime_identity_id,
+            "feature_abi_spec": self.feature_abi_spec,
+            "feature_abi_id": self.feature_abi_id,
+        }
+        missing = [name for name, value in required.items() if not value]
+        if missing:
+            raise ValueError(
+                f"SplitRuntimeContract is missing current field(s): {', '.join(missing)}."
             )
-        if not self.feature_abi_spec:
-            self.feature_abi_spec = build_feature_abi_spec(
-                model_id=self.model_id,
-                canonical_split_key=self.canonical_split_key,
-                boundary_tensor_labels=self.boundary_tensor_labels,
-                feature_layout=self.feature_layout,
-                input_tensor_shape=self.input_tensor_shape,
-                input_resize_mode=self.input_resize_mode,
-                runtime_identity=self.runtime_identity,
-            )
-        if not self.feature_abi_id and self.feature_abi_spec:
-            self.feature_abi_id = feature_abi_id(self.feature_abi_spec)
 
     @classmethod
     def create(
@@ -795,46 +728,34 @@ class SplitRuntimeContract:
             if isinstance(spec, Mapping)
         }
         layout_id = str(
-            payload.get("feature_layout_id")
-            or (feature_layout_id(feature_layout_payload) if feature_layout_payload else "")
+            payload.get("feature_layout_id") or ""
         )
+        if not layout_id:
+            raise ValueError("SplitRuntimeContract is missing current field: feature_layout_id.")
         identity = dict(payload.get("runtime_identity") or {})
         if not identity:
-            identity = _runtime_identity_payload(
-                model_id=str(payload["model_id"]),
-                front_version=str(payload.get("front_version") or "0"),
-                split_config_id=str(payload["split_config_id"]),
-                canonical_split_key=str(payload["canonical_split_key"]),
-                cloud_batch_split_id=str(payload["cloud_batch_split_id"]),
-                input_tensor_shape=[int(dim) for dim in payload.get("input_tensor_shape", [])],
-                input_resize_mode=str(payload.get("input_resize_mode") or "direct_resize"),
-                feature_layout_id_value=layout_id,
-                runtime_identity=None,
-            )
-        identity_id = str(payload.get("runtime_identity_id") or runtime_identity_id(identity))
+            raise ValueError("SplitRuntimeContract is missing current field: runtime_identity.")
+        identity_id = str(payload.get("runtime_identity_id") or "")
+        if not identity_id:
+            raise ValueError("SplitRuntimeContract is missing current field: runtime_identity_id.")
         abi_spec = {
             str(key): value for key, value in dict(payload.get("feature_abi_spec") or {}).items()
         }
         if not abi_spec:
-            abi_spec = build_feature_abi_spec(
-                model_id=str(payload["model_id"]),
-                canonical_split_key=str(payload["canonical_split_key"]),
-                boundary_tensor_labels=[
-                    str(label) for label in list(payload.get("boundary_tensor_labels", []) or [])
-                ],
-                feature_layout=feature_layout_payload,
-                input_tensor_shape=[int(dim) for dim in payload.get("input_tensor_shape", [])],
-                input_resize_mode=str(payload.get("input_resize_mode") or "direct_resize"),
-                runtime_identity=identity,
-            )
-        abi_id = str(payload.get("feature_abi_id") or feature_abi_id(abi_spec))
+            raise ValueError("SplitRuntimeContract is missing current field: feature_abi_spec.")
+        abi_id = str(payload.get("feature_abi_id") or "")
+        if not abi_id:
+            raise ValueError("SplitRuntimeContract is missing current field: feature_abi_id.")
+        contract_id = str(payload.get("contract_id") or "")
+        if not contract_id:
+            raise ValueError("SplitRuntimeContract is missing current field: contract_id.")
         aliases = [
             dict(item)
             for item in list(payload.get("contract_aliases") or [])
             if isinstance(item, Mapping)
         ]
         return cls(
-            contract_id=str(payload.get("contract_id") or identity_id),
+            contract_id=contract_id,
             edge_id=str(payload["edge_id"]),
             model_id=str(payload["model_id"]),
             split_config_id=str(payload["split_config_id"]),

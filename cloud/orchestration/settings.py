@@ -63,6 +63,8 @@ class OrchestrationSettings:
     fixed_split_runtime_diagnostics: bool
     log_internal_ids: bool
     training_frame_count: int
+    training_replay_fraction: float
+    training_replay_retention_multiplier: int
     recent_training_window_root: str
     split_contract_root: str
     feature_cache: FeatureCacheSettings
@@ -76,8 +78,27 @@ class OrchestrationSettings:
             str(getattr(config, "workspace_root", "./cache/server_workspace"))
         )
         teacher_cfg = getattr(cl_cfg, "teacher_annotation", None) if cl_cfg is not None else None
+        edge_model_name = str(getattr(config, "edge_model_name", "rfdetr_nano"))
+        replay_fraction_by_model = dict(
+            getattr(cl_cfg, "training_replay_fraction_by_model", {}) or {}
+        )
+        training_replay_fraction = float(
+            replay_fraction_by_model.get(
+                edge_model_name,
+                getattr(cl_cfg, "training_replay_fraction", 0.0),
+            )
+        )
+        training_frame_count_by_model = dict(
+            getattr(cl_cfg, "training_frame_count_by_model", {}) or {}
+        )
+        training_frame_count = int(
+            training_frame_count_by_model.get(
+                edge_model_name,
+                getattr(config, "training_frame_count", 128),
+            )
+        )
         return cls(
-            edge_model_name=str(getattr(config, "edge_model_name", "rfdetr_nano")),
+            edge_model_name=edge_model_name,
             workspace_root=workspace_root,
             default_num_epoch=int(getattr(cl_cfg, "num_epoch", 2)) if cl_cfg else 2,
             max_concurrent_jobs=int(getattr(cl_cfg, "max_concurrent_jobs", 2)) if cl_cfg else 2,
@@ -94,7 +115,12 @@ class OrchestrationSettings:
             if cl_cfg
             else False,
             log_internal_ids=bool(getattr(cl_cfg, "log_internal_ids", False)) if cl_cfg else False,
-            training_frame_count=max(1, int(getattr(config, "training_frame_count", 128))),
+            training_frame_count=max(1, training_frame_count),
+            training_replay_fraction=max(0.0, min(0.999999, training_replay_fraction)),
+            training_replay_retention_multiplier=max(
+                1,
+                int(getattr(cl_cfg, "training_replay_retention_multiplier", 4)),
+            ),
             recent_training_window_root=os.path.abspath(
                 str(
                     getattr(
@@ -267,6 +293,10 @@ class PipelineLifecycleMixin:
         self.fixed_split_runtime_smoke_validate = settings.fixed_split_runtime_smoke_validate
         self.fixed_split_runtime_diagnostics = settings.fixed_split_runtime_diagnostics
         self.training_frame_count = settings.training_frame_count
+        self.training_replay_fraction = settings.training_replay_fraction
+        self.training_replay_retention_multiplier = (
+            settings.training_replay_retention_multiplier
+        )
         self.feature_cache_mode = (
             (str(getattr(cl_cfg, "feature_cache_mode", "auto")) if cl_cfg else "auto")
             .strip()

@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
-
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from cloud.orchestration.recent_training_window import RecentTrainingWindowStore
 from cloud.orchestration.request_context import RequestContextMixin
@@ -69,6 +68,37 @@ def test_recent_training_window_slides_without_consuming_selected_samples(tmp_pa
         "frame-3",
         "frame-4",
     ]
+
+
+def test_training_samples_mix_old_anchors_with_recent_samples(tmp_path) -> None:
+    store = RecentTrainingWindowStore(str(tmp_path / "window"), max_samples=16)
+    store.append_samples([_sample(f"frame-{index}", index) for index in range(16)])
+
+    selected = store.training_samples(8, replay_fraction=0.25)
+
+    assert [sample["sample_id"] for sample in selected[-6:]] == [
+        "frame-10",
+        "frame-11",
+        "frame-12",
+        "frame-13",
+        "frame-14",
+        "frame-15",
+    ]
+    assert [sample["sample_id"] for sample in selected[:2]] == ["frame-2", "frame-7"]
+
+
+def test_training_samples_without_replay_returns_latest_samples(tmp_path) -> None:
+    store = RecentTrainingWindowStore(str(tmp_path / "window"), max_samples=8)
+    store.append_samples([_sample(f"frame-{index}", index) for index in range(8)])
+
+    assert store.training_samples(4, replay_fraction=0.0) == store.latest_samples(4)
+
+
+def test_training_samples_with_replay_supports_single_sample_windows(tmp_path) -> None:
+    store = RecentTrainingWindowStore(str(tmp_path / "window"), max_samples=4)
+    store.append_samples([_sample(f"frame-{index}", index) for index in range(4)])
+
+    assert store.training_samples(1, replay_fraction=0.25) == [_sample("frame-3", 3)]
 
 
 def test_recent_training_window_reset_clears_initial_model_state(tmp_path) -> None:
