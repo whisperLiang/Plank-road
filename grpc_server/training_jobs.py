@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import shutil
 import time
 import uuid
 from collections import deque
@@ -344,18 +345,18 @@ class TrainingJobManager:
             },
         )
 
+        temporary_workspace = None
         try:
             if payload_zip:
-                workspace = str(
-                    prepare_request_workspace(
-                        workspace_root,
-                        edge_id=edge_id,
-                        request_kind=(request_kind or self._request_kind_for_job_type(job_type)),
-                        payload_zip=payload_zip,
-                        client_cache_path=workspace,
-                        log_internal_ids=self.log_internal_ids,
-                    )
+                temporary_workspace = prepare_request_workspace(
+                    workspace_root,
+                    edge_id=edge_id,
+                    request_kind=(request_kind or self._request_kind_for_job_type(job_type)),
+                    payload_zip=payload_zip,
+                    client_cache_path=workspace,
+                    log_internal_ids=self.log_internal_ids,
                 )
+                workspace = str(temporary_workspace)
             lease_scope = getattr(self.continual_learner, "gpu_lease_scope", None)
             context = (
                 lease_scope(
@@ -391,6 +392,9 @@ class TrainingJobManager:
             success = False
             model_data = ""
             message = str(exc)
+        finally:
+            if temporary_workspace is not None:
+                shutil.rmtree(temporary_workspace, ignore_errors=True)
 
         with self._cv:
             job = self._jobs.get(job_id)

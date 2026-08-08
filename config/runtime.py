@@ -226,6 +226,7 @@ class FeatureCacheConfig(ConfigSection):
     feature_rebuild_batch_size: int = 16
     gc_enabled: bool = False
     gc_dry_run: bool = True
+    gc_max_live_generations: int = 3
 
     def __post_init__(self) -> None:
         self.view_source = str(self.view_source).strip().lower()

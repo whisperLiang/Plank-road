@@ -1,8 +1,7 @@
 param(
     [int]$MaxCount = 5000,
     [int]$PollSeconds = 20,
-    [int]$RunTimeoutHours = 36,
-    [int]$SshTimeoutSeconds = 20
+    [int]$RunTimeoutHours = 36
 )
 
 $ErrorActionPreference = "Stop"
@@ -10,11 +9,8 @@ $MatrixDir = $PSScriptRoot
 $ProjectRoot = (Resolve-Path (Join-Path $MatrixDir "..\..")).Path
 $DeviceSetSlug = "local_140_118_238"
 $StateDir = Join-Path $MatrixDir "state_$DeviceSetSlug"
-$ResultsRoot = Join-Path $ProjectRoot "results\experiments"
-$RecordDir = Join-Path $ResultsRoot "four_edge_matrix_$DeviceSetSlug\records"
-$LogDir = Join-Path $ProjectRoot "log\four_edge_matrix\$DeviceSetSlug"
-$EdgeResultsRoot = "results/experiments"
-New-Item -ItemType Directory -Force -Path $StateDir, $RecordDir, $LogDir | Out-Null
+$RecordDir = Join-Path $StateDir "records"
+New-Item -ItemType Directory -Force -Path $StateDir, $RecordDir | Out-Null
 Set-Content -LiteralPath (Join-Path $StateDir "orchestrator.pid") -Value $PID -Encoding ascii
 
 $Cloud = [ordered]@{
@@ -37,10 +33,7 @@ $Models = @(
 )
 $Scenarios = @("rainy", "snowy")
 $Methods = @("plank_road", "SURGEON", "CATR", "Ekya")
-if ($SshTimeoutSeconds -lt 1) {
-    throw "SshTimeoutSeconds must be at least 1."
-}
-$SshOptions = @("-o", "BatchMode=yes", "-o", "ConnectTimeout=$SshTimeoutSeconds", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3")
+$SshOptions = @("-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3")
 
 function Assert-SafeToken {
     param([string]$Value)
@@ -153,69 +146,6 @@ function Write-MatrixStatus {
     $Status | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $StateDir "matrix_status.json") -Encoding utf8
 }
 
-function Remove-RunStateFiles {
-    param([string]$RunName)
-
-    $localStateFiles = @(
-        (Join-Path $StateDir "$RunName-edge1.pid"),
-        (Join-Path $StateDir "$RunName-edge1.exit")
-    )
-    foreach ($path in $localStateFiles) {
-        if (Test-Path -LiteralPath $path) {
-            Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
-        }
-    }
-
-    $remoteNodes = @($Edges | Where-Object { $null -ne $_.Host }) + @($Cloud)
-    foreach ($node in $remoteNodes) {
-        $suffix = if ($node.Host -eq $Cloud.Host) { "cloud" } else { "edge$($node.Id)" }
-        $jobName = "$RunName-$suffix"
-        try {
-            $status = Get-RemoteJobStatus -Node $node -Name $jobName
-            if ($status -eq "RUNNING") {
-                Write-Warning "Keeping state for still-running job $jobName on $($node.Host)."
-                continue
-            }
-            Invoke-Remote -HostName $node.Host -Command (
-                "cd $($node.Project) && rm -f " +
-                "scratch/four_edge_matrix/state/$jobName.pid " +
-                "scratch/four_edge_matrix/state/$jobName.exit"
-            ) | Out-Null
-        }
-        catch {
-            Write-Warning "Could not clean state for $jobName on $($node.Host): $_"
-        }
-    }
-}
-
-function Remove-MatrixStateFiles {
-    Get-ChildItem -LiteralPath $StateDir -File -Force -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.Extension -in @(".pid", ".exit") -or
-            $_.Name -in @("matrix_status.json", "orchestrator.pid")
-        } |
-        ForEach-Object {
-            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
-        }
-
-    $remoteNodes = @($Edges | Where-Object { $null -ne $_.Host }) + @($Cloud)
-    foreach ($node in $remoteNodes) {
-        try {
-            Invoke-Remote -HostName $node.Host -Command (
-                "cd $($node.Project) && " +
-                "find scratch/four_edge_matrix/state -maxdepth 1 -type f -name '*.pid' -delete; " +
-                "find scratch/four_edge_matrix/state -maxdepth 1 -type f -name '*.exit' -delete; " +
-                "find scratch/four_edge_matrix/state -maxdepth 1 -type f -name 'matrix_status.json' -delete; " +
-                "find scratch/four_edge_matrix/state -maxdepth 1 -type f -name 'orchestrator.pid' -delete"
-            ) | Out-Null
-        }
-        catch {
-            Write-Warning "Could not clean matrix state on $($node.Host): $_"
-        }
-    }
-}
-
-try {
 foreach ($edge in $Edges) {
     if ($null -eq $edge.Host) {
         if (-not (Test-Path -LiteralPath $edge.Python)) {
@@ -293,7 +223,7 @@ foreach ($model in $Models) {
                         "--scenario", $scenario,
                         "--edge_count", "4",
                         "--repeat", "1",
-                        "--experiment_results_root", $EdgeResultsRoot
+                        "--experiment_results_root", "./cache/experiment_results"
                     )
                     if ($method -eq "plank_road") {
                         $edgeArgs += @("--mode", "main")
@@ -304,8 +234,8 @@ foreach ($model in $Models) {
                     Start-RemoteJob -Node $edge -Name $edgeJob -Entrypoint "edge_client.py" -Arguments $edgeArgs
                 }
 
-                $localStdout = Join-Path $LogDir "$runName-edge1.stdout.log"
-                $localStderr = Join-Path $LogDir "$runName-edge1.stderr.log"
+                $localStdout = Join-Path $StateDir "$runName-edge1.stdout.log"
+                $localStderr = Join-Path $StateDir "$runName-edge1.stderr.log"
                 $localArgs = @(
                     "edge_client.py",
                     "--yaml_path", $model.Config,
@@ -319,7 +249,7 @@ foreach ($model in $Models) {
                     "--scenario", $scenario,
                     "--edge_count", "4",
                     "--repeat", "1",
-                    "--experiment_results_root", $EdgeResultsRoot
+                    "--experiment_results_root", "./cache/experiment_results"
                 )
                 if ($method -eq "plank_road") {
                     $localArgs += @("--mode", "main")
@@ -346,10 +276,6 @@ foreach ($model in $Models) {
                             (Test-Path -LiteralPath $localStderr) -and
                             (Select-String -LiteralPath $localStderr -Pattern "streaming complete|Uploaded .*offline experiment artifact" -Quiet)
                         ) {
-                            # PowerShell can expose a null ExitCode after a
-                            # successfully completed redirected process. The
-                            # edge client writes a completion marker to stderr;
-                            # use it to close the run instead of waiting forever.
                             $localStatus = "0"
                         }
                         else {
@@ -380,9 +306,6 @@ foreach ($model in $Models) {
                     $remoteFailure = @($numericRemote | Where-Object { [int]$_ -ne 0 })
                     if ($localStatus -match '^\d+$' -and [int]$localStatus -ne 0) {
                         throw "Local edge exited with code $localStatus."
-                    }
-                    if ($localStatus -eq "UNKNOWN") {
-                        throw "Local edge exited without a usable exit code or completion marker."
                     }
                     if ($remoteFailure.Count -gt 0) {
                         throw "A remote edge failed: $($remoteStatuses | ConvertTo-Json -Compress)."
@@ -458,7 +381,6 @@ foreach ($model in $Models) {
                     failed_runs = $failedRuns
                     total_runs = 16
                 })
-                Remove-RunStateFiles -RunName $runName
                 Start-Sleep -Seconds 5
             }
         }
@@ -473,7 +395,3 @@ Write-MatrixStatus -Status ([ordered]@{
     failed_runs = $failedRuns
     total_runs = 16
 })
-}
-finally {
-    Remove-MatrixStateFiles
-}

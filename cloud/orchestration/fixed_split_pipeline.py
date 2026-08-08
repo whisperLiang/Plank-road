@@ -541,3 +541,5 @@ class FixedSplitPipeline(
                 if accepted_low_quality_ids_message:
                     detail = f"{detail}; {accepted_low_quality_ids_message}"
                 return False, "", detail
+            finally:
+                self._run_feature_cache_gc(reason="continual_learning")

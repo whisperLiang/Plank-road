@@ -9,7 +9,7 @@ experiment_results:
   enabled: true
   upload_enabled: true
   root_dir: results/experiments
-  local_root_dir: results/experiments
+  local_root_dir: cache/experiment_results
   max_artifact_bytes: 268435456
 baseline:
   enabled: false
@@ -278,8 +278,9 @@ server:
       deep_validate_feature_payload: false
       deep_validate_sample_rate: 0
       feature_rebuild_batch_size: 16
-      gc_enabled: false
-      gc_dry_run: true
+      gc_enabled: true
+      gc_dry_run: false
+      gc_max_live_generations: 3
     proxy_eval_interval_rounds: 10
     proxy_eval_patience: 2
     proxy_eval_min_delta: 0.002

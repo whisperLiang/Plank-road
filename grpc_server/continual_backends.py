@@ -437,6 +437,10 @@ class EdgeWorkerRoutedContinualLearningBackend:
 
     def submit_training_job(self, request) -> message_transmission_pb2.SubmitTrainingJobReply:
         routed_request = self._materialize_payload_bundle(request)
+        routed_bundle_path_value = str(
+            getattr(routed_request, "payload_bundle_path", "") or ""
+        ).strip()
+        routed_bundle_path = Path(routed_bundle_path_value) if routed_bundle_path_value else None
         exclusive_gpu_lease = bool(
             getattr(routed_request, "exclusive_gpu_lease", False)
             or getattr(request, "exclusive_gpu_lease", False)
@@ -449,6 +453,8 @@ class EdgeWorkerRoutedContinualLearningBackend:
             self._submitted_jobs[(int(routed_request.edge_id), str(reply.job_id))] = (
                 _SubmitRequestSnapshot.from_request(routed_request)
             )
+            if routed_bundle_path is not None:
+                routed_bundle_path.unlink(missing_ok=True)
         return reply
 
     def get_training_job_status(

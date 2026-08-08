@@ -1229,7 +1229,7 @@ def test_routed_backend_materializes_uploaded_bundle_for_worker(tmp_path: Path) 
     bundle_path = Path(routed_request.payload_bundle_path)
     assert routed_request.payload_zip == b""
     assert bundle_path.parent.name == "incoming_bundles"
-    assert bundle_path.read_bytes() == b"bundle-bytes"
+    assert not bundle_path.exists()
 
 
 def test_routed_backend_forwards_exclusive_gpu_lease_flag() -> None:

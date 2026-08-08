@@ -17,6 +17,7 @@ from cloud.annotation import (
     TeacherAnnotationWorker,
     TeacherLabelCache,
 )
+from cloud.feature_cache import FeatureCacheGC
 from cloud.orchestration.fixed_split_dependencies import _GLOBAL_TEACHER_ANNOTATION_QUEUE
 from cloud.training.proxy_metadata import normalise_shard_dtype as _normalise_shard_dtype
 from cloud.workers.gpu_lease_manager import LeaseRequest
@@ -37,6 +38,9 @@ class FeatureCacheSettings:
     accepted_storage_formats: tuple[str, ...]
     materialization_mode: str
     view_source: str
+    gc_enabled: bool
+    gc_dry_run: bool
+    gc_max_live_generations: int
 
 
 @dataclass(frozen=True)
@@ -175,6 +179,11 @@ class OrchestrationSettings:
                 )
                 .strip()
                 .lower(),
+                gc_enabled=bool(getattr(feature_cache_cfg, "gc_enabled", False)),
+                gc_dry_run=bool(getattr(feature_cache_cfg, "gc_dry_run", True)),
+                gc_max_live_generations=max(
+                    0, int(getattr(feature_cache_cfg, "gc_max_live_generations", 3))
+                ),
             ),
             teacher_annotation=TeacherAnnotationSettings(
                 async_enabled=bool(getattr(teacher_cfg, "async_enabled", False)),
@@ -362,6 +371,9 @@ class PipelineLifecycleMixin:
         )
         self.feature_cache_gc_enabled = bool(getattr(feature_cache_cfg, "gc_enabled", False))
         self.feature_cache_gc_dry_run = bool(getattr(feature_cache_cfg, "gc_dry_run", True))
+        self.feature_cache_gc_max_live_generations = max(
+            0, int(getattr(feature_cache_cfg, "gc_max_live_generations", 3))
+        )
         removed_cl_fields = {
             "rebuild_batch_size": (
                 "server.continual_learning.rebuild_batch_size has been removed; "
@@ -519,6 +531,32 @@ class PipelineLifecycleMixin:
             "[TeacherAnnotation][Worker] cache diagnostics",
             lambda: {"cache_root": self.teacher_annotation_cache_root},
         )
+
+    def _run_feature_cache_gc(self, *, reason: str) -> None:
+        """Remove feature shards no longer referenced by active training state."""
+        if not self.feature_cache_gc_enabled:
+            return
+        try:
+            result = FeatureCacheGC(
+                store_root_dir=self.feature_cache_store_root_dir,
+                view_root_dir=self.feature_cache_view_root_dir,
+                recent_training_window_root_dir=self.recent_training_window_root,
+                max_live_generations=self.feature_cache_gc_max_live_generations,
+                dry_run=self.feature_cache_gc_dry_run,
+            ).collect()
+            logger.info(
+                "[FeatureCache][GC] reason={} dry_run={} scanned={} retained={} "
+                "deleted={} deleted_bytes={}",
+                reason,
+                result.dry_run,
+                result.scanned_files,
+                result.retained_files,
+                result.deleted_files,
+                result.deleted_bytes,
+            )
+        except Exception as exc:
+            # GC must never make an otherwise successful training request fail.
+            logger.warning("[FeatureCache][GC] reason={} failed: {}", reason, exc)
 
     def close(self) -> None:
         if self.teacher_annotation_worker is not None:

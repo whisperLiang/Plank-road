@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import time
 from collections.abc import Mapping, Sequence
 
@@ -276,6 +277,7 @@ class SampleStageMixin:
         split_config_id: str = "",
     ) -> tuple[bool, str, int]:
         """Append high-quality feature-label samples into the recent training window."""
+        workspace = None
         try:
             if str(sync_type or "") != "HIGH_QUALITY_FEATURE_LABEL_SHARD":
                 raise RuntimeError(f"Unsupported sample sync type: {sync_type!r}")
@@ -369,3 +371,7 @@ class SampleStageMixin:
                 lambda error=exc: {"error": repr(error)},
             )
             return False, str(exc), 0
+        finally:
+            if workspace is not None:
+                shutil.rmtree(workspace, ignore_errors=True)
+            self._run_feature_cache_gc(reason="sample_sync")

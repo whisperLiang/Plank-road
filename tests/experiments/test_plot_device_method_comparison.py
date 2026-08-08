@@ -100,3 +100,4 @@ def test_builds_device_and_scalability_metrics(tmp_path: Path) -> None:
     assert row["worst_device_f1"] == pytest.approx(0.6)
     assert row["total_upload_mib"] == pytest.approx(3.0)
     assert bool(row["complete_device_set"])
+

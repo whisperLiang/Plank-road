@@ -80,6 +80,23 @@ class FeatureCacheGC:
                 for key in ("shard_path", "index_path", "shard_dir"):
                     if ref.get(key):
                         live.add(os.path.abspath(str(ref[key])))
+                index_path = str(ref.get("index_path") or "")
+                if index_path:
+                    try:
+                        index_payload = _read_json(index_path)
+                    except Exception:
+                        index_payload = {}
+                    metadata_path = index_payload.get("metadata_path") or index_payload.get(
+                        "meta_path"
+                    )
+                    if metadata_path:
+                        live.add(os.path.abspath(str(metadata_path)))
+                    elif index_path.endswith(".index.json"):
+                        live.add(
+                            os.path.abspath(
+                                index_path[: -len(".index.json")] + ".meta.json"
+                            )
+                        )
         return live
 
     def collect(

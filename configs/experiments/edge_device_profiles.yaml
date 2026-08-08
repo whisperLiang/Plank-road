@@ -7,3 +7,4 @@ devices:
     label: Jetson Orin NX
     hardware: NVIDIA Jetson Orin NX 8GB
     marker: ^
+
