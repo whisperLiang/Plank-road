@@ -1455,7 +1455,11 @@ def universal_split_retrain(
         all_indices=list(all_indices),
         annotations=annotations,
         batch_size=max(1, int(batch_size)),
-        runtime=runtime,
+        # Keep the full training window on CPU. Preparing every cached batch
+        # for the runtime here moves all boundary tensors to CUDA at once and
+        # makes peak memory scale with the number of training samples instead
+        # of the configured batch size.
+        runtime=None,
         preloaded_records=preloaded_records,
         profile=retrain_profile,
     )
@@ -1471,14 +1475,22 @@ def universal_split_retrain(
             epoch_loss_count = 0
             for _batch_indices, boundary, targets in epoch_batches:
                 started = time.perf_counter()
-                loss = train_split_suffix_batch(
-                    runtime,
+                runtime_boundary = prepare_boundary_for_runtime(
+                    _runtime_from_splitter(runtime),
                     boundary,
-                    targets,
-                    loss_fn,
-                    optimizer,
-                    trusted_runtime_boundary=True,
+                    validate=True,
                 )
+                try:
+                    loss = train_split_suffix_batch(
+                        runtime,
+                        runtime_boundary,
+                        targets,
+                        loss_fn,
+                        optimizer,
+                        trusted_runtime_boundary=True,
+                    )
+                finally:
+                    del runtime_boundary
                 if retrain_profile is not None:
                     retrain_profile.add(
                         "suffix_forward_backward_time",

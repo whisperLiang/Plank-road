@@ -17,7 +17,7 @@ from cloud.workers.edge_worker_pool import (
 )
 from cloud.workers.gpu_lease_manager import GpuLeaseManager, LeaseRequest
 from cloud.workers.lease_service import GpuLeaseService
-from cloud.workers.mps_runtime import MpsEnvironment
+from cloud.workers.mps_runtime import MpsEnvironment, resolve_active_thread_percentage
 from cloud.workers.worker_client import EdgeWorkerClient, GpuLeaseHttpClient
 from cloud.workers.worker_protocol import (
     WORKER_NOT_READY,
@@ -876,6 +876,7 @@ def test_worker_pool_process_env_includes_mps(monkeypatch, tmp_path: Path) -> No
         worker_service_config=SimpleNamespace(request_timeout_sec=1, startup_timeout_sec=1),
         mps_env=MpsEnvironment("0", "/tmp/nvidia-mps", "/tmp/nvidia-mps-log", "50"),
         lease_address="127.0.0.1:55999",
+        teacher_annotation_address="127.0.0.1:55998",
     )
     assignment = EdgeAssignment(
         edge_id=1,
@@ -892,6 +893,8 @@ def test_worker_pool_process_env_includes_mps(monkeypatch, tmp_path: Path) -> No
     assert env["CUDA_MPS_LOG_DIRECTORY"] == "/tmp/nvidia-mps-log"
     assert "--edge_id" in captured["cmd"]
     assert "--run_id" in captured["cmd"]
+    teacher_address_index = captured["cmd"].index("--teacher_annotation_address")
+    assert captured["cmd"][teacher_address_index + 1] == "127.0.0.1:55998"
 
 
 def test_gpu_lease_grant_wait_release() -> None:
@@ -911,6 +914,150 @@ def test_gpu_lease_grant_wait_release() -> None:
         manager.release(lease_1.lease_id, observed_peak_memory_gb=16.4)
         lease_3 = manager.acquire(_lease_request(edge_id=2, job_id="job-3"), timeout_sec=0.1)
         assert {lease_2.edge_id, lease_3.edge_id} == {110, 2}
+    finally:
+        manager.close()
+
+
+def test_gpu_lease_memory_only_admits_all_jobs_that_fit_memory() -> None:
+    manager = GpuLeaseManager(
+        memory_usage_threshold=0.85,
+        reserve_memory_gb=4,
+        max_active_gpu_workers="memory_only",
+        default_estimated_job_memory_gb=4,
+        lease_ttl_sec=10,
+        query_total_memory_gb=lambda: 48,
+    )
+    try:
+        leases = [
+            manager.acquire(
+                _lease_request(
+                    edge_id=edge_id,
+                    job_id=f"job-{edge_id}",
+                    estimated_peak_memory_gb=4,
+                )
+            )
+            for edge_id in range(1, 5)
+        ]
+        snapshot = manager.snapshot()
+        assert len(snapshot["active"]) == 4
+        assert snapshot["max_active_gpu_workers"] is None
+        assert snapshot["admission_policy"] == "memory_only"
+        for lease in leases:
+            manager.release(lease.lease_id)
+    finally:
+        manager.close()
+
+
+def test_memory_only_mps_auto_does_not_impose_a_fixed_thread_quota() -> None:
+    assert (
+        resolve_active_thread_percentage(
+            "auto",
+            max_active_gpu_workers=None,
+        )
+        == "100"
+    )
+
+
+def test_gpu_lease_memory_only_waits_when_estimated_memory_is_insufficient() -> None:
+    manager = GpuLeaseManager(
+        memory_usage_threshold=0.75,
+        reserve_memory_gb=4,
+        max_active_gpu_workers="memory_only",
+        default_estimated_job_memory_gb=6,
+        lease_ttl_sec=10,
+        query_total_memory_gb=lambda: 16,
+    )
+    try:
+        lease = manager.acquire(
+            _lease_request(
+                edge_id=1,
+                job_id="job-1",
+                estimated_peak_memory_gb=6,
+            )
+        )
+        with pytest.raises(TimeoutError):
+            manager.acquire(
+                _lease_request(
+                    edge_id=2,
+                    job_id="job-2",
+                    estimated_peak_memory_gb=6,
+                ),
+                timeout_sec=0.01,
+            )
+        manager.release(lease.lease_id)
+        replacement = manager.acquire(
+            _lease_request(
+                edge_id=2,
+                job_id="job-2",
+                estimated_peak_memory_gb=6,
+            ),
+            timeout_sec=0.1,
+        )
+        manager.release(replacement.lease_id)
+    finally:
+        manager.close()
+
+
+def test_gpu_lease_memory_only_accounts_for_live_free_memory() -> None:
+    manager = GpuLeaseManager(
+        memory_usage_threshold=0.85,
+        reserve_memory_gb=2,
+        max_active_gpu_workers="memory_only",
+        default_estimated_job_memory_gb=7,
+        lease_ttl_sec=10,
+        query_total_memory_gb=lambda: 48,
+        query_free_memory_gb=lambda: 6,
+    )
+    try:
+        with pytest.raises(TimeoutError):
+            manager.acquire(
+                _lease_request(
+                    edge_id=1,
+                    job_id="job-1",
+                    estimated_peak_memory_gb=7,
+                ),
+                timeout_sec=0.01,
+            )
+        assert manager.snapshot()["available_memory_gb"] == pytest.approx(4.0)
+    finally:
+        manager.close()
+
+
+def test_gpu_lease_memory_only_preserves_exclusive_oom_retry() -> None:
+    manager = GpuLeaseManager(
+        max_active_gpu_workers="memory_only",
+        default_estimated_job_memory_gb=4,
+        query_total_memory_gb=lambda: 48,
+    )
+    try:
+        ordinary = manager.acquire(
+            _lease_request(
+                edge_id=1,
+                job_id="ordinary",
+                estimated_peak_memory_gb=4,
+            )
+        )
+        exclusive_request = _lease_request(
+            edge_id=2,
+            job_id="exclusive",
+            estimated_peak_memory_gb=4,
+        )
+        exclusive_request.exclusive = True
+        with pytest.raises(TimeoutError):
+            manager.acquire(exclusive_request, timeout_sec=0.01)
+        manager.release(ordinary.lease_id)
+
+        exclusive = manager.acquire(exclusive_request, timeout_sec=0.1)
+        with pytest.raises(TimeoutError):
+            manager.acquire(
+                _lease_request(edge_id=3, job_id="blocked-by-exclusive"),
+                timeout_sec=0.01,
+            )
+        assert manager.mark_oom(
+            job_id="exclusive",
+            message="CUDA out of memory",
+        )["retry_exclusive"]
+        manager.release(exclusive.lease_id)
     finally:
         manager.close()
 
@@ -1191,6 +1338,8 @@ def test_cloud_server_worker_pool_does_not_create_local_training_objects(
 ) -> None:
     from cloud_server import CloudServer
 
+    captured_pool_kwargs: dict[str, object] = {}
+
     class FakeLeaseManager:
         max_active_gpu_workers = 2
 
@@ -1214,7 +1363,7 @@ def test_cloud_server_worker_pool_does_not_create_local_training_objects(
 
     class FakePool:
         def __init__(self, **kwargs):
-            del kwargs
+            captured_pool_kwargs.update(kwargs)
 
         def close(self):
             pass
@@ -1232,11 +1381,18 @@ def test_cloud_server_worker_pool_does_not_create_local_training_objects(
     config.edge_affine_workers.enabled = True
 
     server = CloudServer(config, yaml_path="./config/config.yaml")
-
-    assert server.large_object_detection is None
-    assert not hasattr(server, "continual_learner")
-    assert not hasattr(server, "training_job_manager")
-    assert isinstance(server.continual_backend, EdgeWorkerRoutedContinualLearningBackend)
+    try:
+        assert server.large_object_detection is not None
+        assert server.large_object_detection._detector is None
+        assert server.shared_teacher_annotation_worker is not None
+        assert captured_pool_kwargs["teacher_annotation_address"] == (
+            server.shared_teacher_rpc_server.listen_address
+        )
+        assert not hasattr(server, "continual_learner")
+        assert not hasattr(server, "training_job_manager")
+        assert isinstance(server.continual_backend, EdgeWorkerRoutedContinualLearningBackend)
+    finally:
+        server.close()
 
 
 def test_cloud_server_baseline_loads_teacher_detector_only(
@@ -1346,10 +1502,84 @@ def test_torchlens_prepare_split_error_message(monkeypatch) -> None:
     assert "cause=RuntimeError: trace failed" in message
 
 
-def _lease_request(*, edge_id: int, job_id: str) -> LeaseRequest:
+def _lease_request(
+    *,
+    edge_id: int,
+    job_id: str,
+    estimated_peak_memory_gb: float = 18,
+) -> LeaseRequest:
     return LeaseRequest(
         edge_id=edge_id,
         worker_id=f"edge_{edge_id}",
         job_id=job_id,
-        estimated_peak_memory_gb=18,
+        estimated_peak_memory_gb=estimated_peak_memory_gb,
     )
+
+
+def test_lazy_teacher_detector_initializes_once_across_threads(monkeypatch) -> None:
+    from cloud.workers.edge_worker_service import LazyObjectDetection
+
+    created: list[object] = []
+
+    class FakeDetector:
+        def __init__(self, _config, *, type):
+            del _config, type
+            time.sleep(0.01)
+            created.append(self)
+
+    monkeypatch.setattr(
+        "model_management.object_detection.Object_Detection",
+        FakeDetector,
+    )
+    lazy_detector = LazyObjectDetection(SimpleNamespace(), "large inference")
+    resolved: list[object] = []
+    threads = [
+        threading.Thread(target=lambda: resolved.append(lazy_detector._ensure()))
+        for _index in range(8)
+    ]
+
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(created) == 1
+    assert resolved == [created[0]] * 8
+
+
+def test_shared_teacher_budget_admits_three_initial_training_workers() -> None:
+    manager = GpuLeaseManager(
+        memory_usage_threshold=0.85,
+        reserve_memory_gb=4,
+        teacher_reserved_memory_gb=5,
+        max_active_gpu_workers="memory_only",
+        default_estimated_job_memory_gb=7.25,
+        query_total_memory_gb=lambda: 36.8,
+    )
+    leases = []
+    try:
+        for edge_id in (1, 2, 3):
+            leases.append(
+                manager.acquire(
+                    _lease_request(
+                        edge_id=edge_id,
+                        job_id=f"job-{edge_id}",
+                        estimated_peak_memory_gb=7.25,
+                    ),
+                    timeout_sec=0,
+                )
+            )
+        assert len(manager.snapshot()["active"]) == 3
+        with pytest.raises(TimeoutError):
+            manager.acquire(
+                _lease_request(
+                    edge_id=4,
+                    job_id="job-4",
+                    estimated_peak_memory_gb=7.25,
+                ),
+                timeout_sec=0,
+            )
+    finally:
+        for lease in leases:
+            manager.release(lease.lease_id)
+        manager.close()

@@ -74,11 +74,21 @@ class GpuLeaseManager:
         lease_ttl_sec: float = 120.0,
         teacher_reserved_memory_gb: float = 0.0,
         query_total_memory_gb=None,
+        query_free_memory_gb=None,
     ) -> None:
         self.memory_usage_threshold = float(memory_usage_threshold)
         self.reserve_memory_gb = float(reserve_memory_gb)
         self.lease_ttl_sec = float(lease_ttl_sec)
         self.teacher_reserved_memory_gb = float(teacher_reserved_memory_gb)
+        # Tests and callers that inject total memory generally do not have a
+        # live GPU to query.  Production instances use the live free-memory
+        # probe unless a caller explicitly supplies a probe (or disables it
+        # with ``query_free_memory_gb=None`` alongside an injected total).
+        self._query_free_memory_gb = (
+            query_free_memory_gb
+            if query_free_memory_gb is not None
+            else (None if query_total_memory_gb is not None else query_gpu_free_memory_gb)
+        )
         self.estimator = GpuMemoryEstimator(
             default_estimated_job_memory_gb=default_estimated_job_memory_gb
         )
@@ -113,6 +123,39 @@ class GpuLeaseManager:
         allowed = self.total_memory_gb * self.memory_usage_threshold
         allowed -= self.reserve_memory_gb + self.teacher_reserved_memory_gb
         return max(0.0, float(allowed))
+
+    @property
+    def available_memory_gb(self) -> float:
+        """Return memory available for one more lease.
+
+        The static budget protects against delayed allocations.  When a live
+        free-memory probe is available, the observed free memory is also used
+        so unrelated GPU processes are accounted for before admitting work.
+        """
+        reserved = self._reserved_memory_locked()
+        configured_available = max(0.0, self.allowed_memory_gb - reserved)
+        query = self._query_free_memory_gb
+        if query is None:
+            return configured_available
+        try:
+            free_memory = float(query())
+        except Exception:
+            return configured_available
+        if not math.isfinite(free_memory) or free_memory < 0.0:
+            return configured_available
+        observed_available = max(
+            0.0,
+            free_memory - self.reserve_memory_gb - self.teacher_reserved_memory_gb,
+        )
+        return min(configured_available, observed_available)
+
+    @property
+    def admission_policy(self) -> str:
+        return (
+            "memory_only"
+            if self.max_active_gpu_workers is None
+            else "count_and_memory"
+        )
 
     def acquire(
         self,
@@ -168,10 +211,11 @@ class GpuLeaseManager:
                         raise TimeoutError("Timed out waiting for GPU lease")
                     logger.info(
                         "[GpuLease] waiting edge={} job={} reason=memory_threshold "
-                        "reserved={:.1f}GB allowed={:.1f}GB exclusive={}",
+                        "reserved={:.1f}GB available={:.1f}GB allowed={:.1f}GB exclusive={}",
                         request.edge_id,
                         request.job_id,
                         self._reserved_memory_locked(),
+                        self.available_memory_gb,
                         self.allowed_memory_gb,
                         bool(request.exclusive),
                     )
@@ -243,7 +287,9 @@ class GpuLeaseManager:
             return {
                 "total_memory_gb": self.total_memory_gb,
                 "allowed_memory_gb": self.allowed_memory_gb,
+                "available_memory_gb": self.available_memory_gb,
                 "max_active_gpu_workers": self.max_active_gpu_workers,
+                "admission_policy": self.admission_policy,
                 "active": [asdict(lease) for lease in self._active.values()],
                 "expired_jobs": dict(self._expired_jobs),
             }
@@ -263,16 +309,19 @@ class GpuLeaseManager:
 
     def _can_grant_locked(self, estimate_gb: float, *, exclusive: bool) -> bool:
         if exclusive:
-            return not self._active
+            return not self._active and float(estimate_gb) <= self.available_memory_gb
         if self._ordinary_paused:
             return False
         if self._exclusive_waiters > 0:
             return False
         if any(lease.exclusive for lease in self._active.values()):
             return False
-        if len(self._active) >= int(self.max_active_gpu_workers):
+        if (
+            self.max_active_gpu_workers is not None
+            and len(self._active) >= int(self.max_active_gpu_workers)
+        ):
             return False
-        return self._reserved_memory_locked() + float(estimate_gb) <= self.allowed_memory_gb
+        return float(estimate_gb) <= self.available_memory_gb
 
     def _reap_expired_leases(self) -> None:
         while True:
@@ -307,8 +356,11 @@ def resolve_max_active_gpu_workers(
     reserve_memory_gb: float,
     default_estimated_job_memory_gb: float,
     configured: int | str,
-) -> int:
-    if str(configured).strip().lower() != "auto":
+) -> int | None:
+    configured_text = str(configured).strip().lower()
+    if configured_text == "memory_only":
+        return None
+    if configured_text != "auto":
         return max(1, int(configured))
     allowed = float(total_memory_gb) * float(memory_usage_threshold) - float(reserve_memory_gb)
     value = math.floor(allowed / float(default_estimated_job_memory_gb))
@@ -346,6 +398,40 @@ def query_gpu_total_memory_gb() -> float:
     except Exception:
         pass
     return 48.0
+
+
+def query_gpu_free_memory_gb() -> float | None:
+    """Return free memory on GPU 0 in GiB, or ``None`` when unavailable."""
+    try:
+        import pynvml  # type: ignore
+
+        pynvml.nvmlInit()
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            return float(info.free) / (1024.0**3)
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception:
+        pass
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if result.returncode == 0:
+            first = result.stdout.strip().splitlines()[0]
+            return float(first.strip()) / 1024.0
+    except Exception:
+        pass
+    return None
 
 
 def dumps_json(payload: Any) -> str:

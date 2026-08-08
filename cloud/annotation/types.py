@@ -68,6 +68,7 @@ def _target_label_mapping_payload(
 
 @dataclass(frozen=True)
 class TeacherLabelCacheKey:
+    edge_id: str
     image_sha1: str
     teacher_model_name: str
     teacher_weights_fingerprint: str
@@ -79,6 +80,7 @@ class TeacherLabelCacheKey:
 
     def payload(self) -> dict[str, object]:
         return {
+            "edge_id": str(self.edge_id),
             "image_sha1": str(self.image_sha1),
             "teacher_model_name": str(self.teacher_model_name),
             "teacher_weights_fingerprint": str(self.teacher_weights_fingerprint),
@@ -115,6 +117,7 @@ class TeacherAnnotationRequest:
 
     def cache_key(self) -> TeacherLabelCacheKey:
         return TeacherLabelCacheKey(
+            edge_id=str(self.edge_id),
             image_sha1=str(self.image_sha1),
             teacher_model_name=str(self.teacher_model_name),
             teacher_weights_fingerprint=str(self.teacher_weights_fingerprint),

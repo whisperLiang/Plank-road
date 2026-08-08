@@ -187,10 +187,16 @@ class TeacherAnnotationMixin:
             )
 
     def _teacher_label_schema(self) -> str:
+        metadata = getattr(self, "teacher_annotation_metadata", {})
+        if isinstance(metadata, Mapping) and metadata.get("teacher_label_schema"):
+            return _normalise_label_schema(metadata.get("teacher_label_schema"))
         teacher_model = getattr(getattr(self, "large_od", None), "model", None)
         return _normalise_label_schema(getattr(teacher_model, "label_schema", "coco_91"))
 
     def _teacher_model_name(self) -> str:
+        metadata = getattr(self, "teacher_annotation_metadata", {})
+        if isinstance(metadata, Mapping) and metadata.get("teacher_model_name"):
+            return str(metadata.get("teacher_model_name"))
         return str(
             getattr(getattr(self, "large_od", None), "model_name", "")
             or getattr(self.config, "golden", "")
@@ -199,6 +205,12 @@ class TeacherAnnotationMixin:
 
     def _teacher_weights_fingerprint(self) -> str:
         if self._teacher_weights_fingerprint_cache:
+            return self._teacher_weights_fingerprint_cache
+        metadata = getattr(self, "teacher_annotation_metadata", {})
+        if isinstance(metadata, Mapping) and metadata.get("teacher_weights_fingerprint"):
+            self._teacher_weights_fingerprint_cache = str(
+                metadata.get("teacher_weights_fingerprint")
+            )
             return self._teacher_weights_fingerprint_cache
         model_name = self._teacher_model_name()
         model_info = model_lib.get(model_name, {})
@@ -230,6 +242,13 @@ class TeacherAnnotationMixin:
         return self._teacher_weights_fingerprint_cache
 
     def _teacher_class_names(self) -> list[str]:
+        metadata = getattr(self, "teacher_annotation_metadata", {})
+        if isinstance(metadata, Mapping):
+            class_names = metadata.get("teacher_class_names")
+            if isinstance(class_names, Mapping):
+                return _class_names_from_metadata({"class_names": class_names})
+            if isinstance(class_names, (list, tuple)):
+                return [str(item) for item in class_names]
         teacher_model = getattr(getattr(self, "large_od", None), "model", None)
         class_names = getattr(teacher_model, "class_names", None)
         if isinstance(class_names, Mapping):
@@ -239,6 +258,11 @@ class TeacherAnnotationMixin:
         return []
 
     def _teacher_num_classes(self) -> int:
+        metadata = getattr(self, "teacher_annotation_metadata", {})
+        if isinstance(metadata, Mapping):
+            value = _coerce_positive_int(metadata.get("teacher_num_classes"))
+            if value is not None:
+                return value
         teacher_model = getattr(getattr(self, "large_od", None), "model", None)
         for attr_name in ("num_classes", "nc"):
             value = _coerce_positive_int(getattr(teacher_model, attr_name, None))

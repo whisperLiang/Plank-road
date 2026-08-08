@@ -4,6 +4,7 @@ import cv2
 import numpy as np
 
 from cloud.annotation import TeacherAnnotationRequest, TeacherAnnotationWorker, TeacherLabelCache
+from cloud.annotation import teacher_worker as teacher_worker_module
 
 
 def _image(tmp_path, name: str) -> str:
@@ -83,9 +84,16 @@ def test_worker_chunks_by_worker_batch_size(tmp_path) -> None:
     assert calls == [4, 4, 2]
 
 
-def test_cuda_oom_halves_batch_size_and_retries(tmp_path) -> None:
+def test_cuda_oom_halves_batch_size_and_retries(monkeypatch, tmp_path) -> None:
     cache = TeacherLabelCache(str(tmp_path / "cache"))
     calls: list[int] = []
+    cleanup_calls: list[None] = []
+
+    monkeypatch.setattr(
+        teacher_worker_module,
+        "_release_cuda_cache_after_oom",
+        lambda: cleanup_calls.append(None),
+    )
 
     def batch(images, threshold):
         del threshold
@@ -107,6 +115,7 @@ def test_cuda_oom_halves_batch_size_and_retries(tmp_path) -> None:
     worker.process_pending_once()
 
     assert calls == [4, 2, 2]
+    assert len(cleanup_calls) == 1
     assert worker.snapshot_stats()["oom_retry_count"] == 1
     assert all(cache.read(request) is not None for request in requests)
 

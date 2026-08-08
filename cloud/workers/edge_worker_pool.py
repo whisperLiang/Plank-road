@@ -70,6 +70,7 @@ class EdgeWorkerPool:
         worker_service_config: object,
         mps_env: MpsEnvironment,
         lease_address: str,
+        teacher_annotation_address: str = "",
         log_internal_ids: bool = False,
     ) -> None:
         self.yaml_path = str(yaml_path)
@@ -80,6 +81,7 @@ class EdgeWorkerPool:
         self.worker_service_config = worker_service_config
         self.mps_env = mps_env
         self.lease_address = str(lease_address)
+        self.teacher_annotation_address = str(teacher_annotation_address or "")
         self.log_internal_ids = bool(log_internal_ids)
         self.request_timeout_sec = float(
             getattr(worker_service_config, "request_timeout_sec", 600.0)
@@ -363,6 +365,10 @@ class EdgeWorkerPool:
             "--lazy_cuda_init",
             "true" if self.lazy_cuda_init else "false",
         ]
+        if self.teacher_annotation_address:
+            cmd.extend(
+                ["--teacher_annotation_address", self.teacher_annotation_address]
+            )
         process = subprocess.Popen(cmd, cwd=str(Path.cwd()), env=env)
         logger.info(
             "[EdgeWorkerPool] starting worker={} edge={} endpoint={} state=STARTING lazy_cuda={}",

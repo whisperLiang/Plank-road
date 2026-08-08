@@ -1,0 +1,307 @@
+experiment_run:
+  experiment_id: suwon5a_weather_yolo26
+  scenario: snowy
+  video_path: ./video_data/snowy.mp4
+  max_count: 5000
+  edge_count: 4
+  repeat: 1
+experiment_results:
+  enabled: true
+  upload_enabled: true
+  root_dir: results/experiments
+  local_root_dir: results/experiments
+  max_artifact_bytes: 268435456
+baseline:
+  enabled: false
+  method: CATR
+  training:
+    batch_size: 16
+    num_epoch: 30
+    learning_rate: 1e-3
+    optimizer_name: adam
+    weight_decay: 0.0
+    training_frame_count: 128
+  SURGEON:
+    training_strategy: surgeon_tta
+    quality_mode: output_only_when_no_boundary
+    trainable_scope: norm_affine
+    mini_batch_size: null
+    train_sample_count: 16
+    num_epoch: 30
+    require_drift: true
+    min_detection_confidence: 0.6
+    min_selected_logit_count: 16
+    max_selected_logit_count: 256
+    min_loss_improvement: 0.0001
+    consistency_weight: 0.0
+    reference_consistency_weight: 0.05
+    guard_sample_count: 8
+    max_foreground_growth_ratio: 2.0
+    max_foreground_fraction_increase: 0.02
+    max_reference_kl: 0.1
+    max_relative_param_delta: 0.02
+    entropy_margin_ratio: 0.4
+    adaptive_entropy_gate: true
+    max_entropy_margin_ratio: 0.7
+  CATR:
+    trigger_window_size: 64
+    agreement_empty_empty_policy: exclude
+    absolute_accuracy_floor: null
+client:
+  source:
+    rtsp:
+      flag: false
+      account: your account
+      password: your password
+      ip_address: you camera ip
+      channel: 1
+    teacher_replay:
+      save_sampled_frames: false
+      jpeg_quality: 90
+      queue_size: 64
+      archive_chunk_max_bytes: 67108864
+  interval: 1
+  feature: edge
+  diff_flag: true
+  diff_thresh: 0.0004
+  local_queue_maxsize: 10
+  strict_sample_collection: false
+  opencv_num_threads: 1
+  flush_every_n_frames: 30
+  performance_log_every_n_frames: 30
+  wait_thresh: 100
+  frame_cache_maxsize: 100
+  lightweight: yolo26n
+  weights_path: ./model_management/models/yolo26n.pt
+  class_names:
+  - unidentified
+  - others
+  - pedestrian
+  - micromobility
+  - car
+  - bus
+  - small truck
+  - truck
+  tinynext_input_size: 640
+  final_detection_threshold: 0.6
+  server_ip: 192.168.66.205:50051
+  edge_id: 1
+  feature_upload:
+    storage_format: safetensors_shard
+    shard_max_samples: 64
+    shard_dtype: null
+    sync_high_quality: false
+    include_index_json: true
+    include_meta_json: true
+  continual_learning:
+    log_internal_ids: false
+  retrain:
+    flag: true
+    status_not_found_grace_sec: 60
+    cache_path: ./cache
+    collect_num: 8
+    raw_jpeg_quality: 82
+    min_low_quality_samples: 80
+  sample_quality:
+    enabled: true
+    output_entropy:
+      window_size: 256
+      percentile: 25.0
+      warmup_samples: 20
+      min_detection_confidence: 0.85
+    boundary_feature_entropy:
+      max_elements: 4096
+      ema_decay: 0.95
+      deviation_threshold: 1.5
+      min_std: 0.0001
+      relative_std_floor: 0.02
+      update_on_anomaly: false
+      warmup_samples: 20
+    teacher_sampling:
+      enabled: true
+      initial_stride: 1
+      base_stride: 4
+      critical_stride: 2
+      critical_confidence: 0.4
+      critical_output_entropy_ratio: 1.5
+      critical_feature_deviation: 6.0
+      retain_empty_predictions: false
+    eps: 1.0e-08
+    persist_debug_stats: false
+  window_drift:
+    window_size: 100
+    min_window_size: 60
+    low_quality_rate_threshold: 0.8
+    persistence_windows: 2
+    evaluation_stride: 50
+    recovery_rate_threshold: 0.65
+    recovery_windows: 2
+    severe_anomaly_rate_threshold: 0.2
+    recovery_severe_anomaly_rate: 0.1
+    critical_confidence: 0.4
+    critical_output_entropy_ratio: 1.5
+    critical_feature_deviation: 6.0
+  resource_aware_trigger:
+    enabled: true
+    bootstrap_without_drift: true
+    probe_interval_sec: 5.0
+    probe_timeout_sec: 3.0
+    bandwidth_probe_size_bytes: 65536
+    V: 10.0
+    K_p: 0.6
+    K_d: 0.2
+    lambda_cloud: 0.5
+    lambda_bw: 0.5
+    w_cloud: 1.0
+    w_bw: 1.0
+    feature_cloud_cost_factor: 0.5
+    min_training_samples: 128
+    min_training_samples_by_model:
+      rfdetr_nano: 64
+    max_training_samples: 128
+    max_training_samples_by_model:
+      rfdetr_nano: 64
+    cooldown_decisions: 75
+    min_training_interval_sec: 180
+    drift_bonus: 0.2
+    upload_time_budget_sec: 5.0
+    bundle_max_bytes: 134217728
+    bundle_min_bytes: 8388608
+    bundle_target_upload_sec: 45.0
+  split_learning:
+    enabled: true
+    fixed_split:
+      privacy_leakage_upper_bound: 1.0e-06
+      max_layer_freezing_ratio: 0.75
+      validate_candidates: true
+      validation_batches:
+      - 1
+      max_boundary_count: 8
+      max_payload_bytes: 33554432
+      inference_num_threads: 12
+      privacy_leakage_epsilon: 1.0e-12
+server:
+  server_id: 0
+  golden: rtdetr_x
+  edge_model_name: yolo26n
+  weights_path: ./model_management/models/yolo26n.pt
+  tinynext_input_size: 640
+  listen_address: '[::]:50051'
+  grpc_max_workers: 16
+  workspace_root: ./cache/server_workspace
+  baselines:
+    Ekya:
+      seed: 42
+      edge_streaming:
+        upload_queue_size: 8
+      cloud_inference:
+        batch_size: 1
+      teacher_labeling:
+        batch_size: 8
+      scheduler:
+        name: ekya_thief_style
+        inference_resource_floor: 0.5
+        microprofile_resource_fraction: 0.25
+        steal_increment: 0.1
+        allow_inference_only_when_no_gain: true
+      retraining:
+        adopt_only_if_improved: true
+        min_map_gain_to_adopt: 0.0
+        drop_training_when_active_same_connection: true
+        training_admission_scope: edge_camera
+  edge_affine_workers:
+    enabled: true
+    mode: edge_affine_single_gpu_mps
+    edge_workers:
+      assignment: one_worker_per_edge
+      lazy_start: true
+      lazy_cuda_init: true
+      max_workers: auto
+      idle_timeout_sec: 900
+      worker_base_port: 56000
+      workspace_root: ./cache/server_workspace/workers
+    mps:
+      enabled: true
+      auto_start: false
+      cuda_visible_devices: '0'
+      pipe_directory: /tmp/nvidia-mps
+      log_directory: /tmp/nvidia-mps-log
+      active_thread_percentage: 100
+    gpu_lease:
+      enabled: true
+      device: cuda:0
+      memory_usage_threshold: 0.85
+      reserve_memory_gb: 4
+      max_active_gpu_workers: memory_only
+      default_estimated_job_memory_gb: 7.25
+      adaptive_peak_memory_estimation: true
+      lease_ttl_sec: 120
+      heartbeat_interval_sec: 10
+      teacher_reserved_memory_gb: 5
+      teacher_gpu_policy: reserved_budget
+    worker:
+      max_concurrent_jobs: 1
+      startup_timeout_sec: 30
+      startup_max_retries: 2
+      request_timeout_sec: 600
+      healthcheck_interval_sec: 10
+  local_queue_maxsize: 10
+  wait_thresh: 10
+  continual_learning:
+    num_epoch: 30
+    trace_batch_size: 1
+    fixed_split_runtime_smoke_validate: false
+    fixed_split_runtime_diagnostics: false
+    log_internal_ids: false
+    batch_size: 16
+    feature_cache_mode: auto
+    feature_cache:
+      view_source: recent_training_window
+      materialization_mode: direct_ref
+      view_root_dir: ./cache/cloud_training_views
+      store_root_dir: ./cache/cloud_feature_shards
+      shard_root_dir: ./cache/cloud_feature_shards
+      storage_format: safetensors_shard
+      accepted_storage_formats:
+      - safetensors_shard
+      - npy_memmap_shard
+      shard_max_samples: 64
+      shard_dtype: null
+      payload_cache_enabled: true
+      payload_cache_scope: active_pool
+      payload_cache_device: cpu
+      payload_cache_max_cpu_bytes: 4294967296
+      payload_cache_max_gpu_bytes: 1073741824
+      pin_memory: true
+      non_blocking_transfer: true
+      validate_refs: true
+      deep_validate_feature_payload: false
+      deep_validate_sample_rate: 0
+      feature_rebuild_batch_size: 16
+      gc_enabled: false
+      gc_dry_run: true
+    proxy_eval_interval_rounds: 10
+    proxy_eval_patience: 2
+    proxy_eval_min_delta: 0.002
+    proxy_eval_max_samples: 128
+    proxy_eval_validation_fraction: 0.2
+    proxy_eval_max_dets: 500
+    training_replay_fraction: 0.0
+    training_replay_fraction_by_model:
+      yolo26n: 0.25
+    training_replay_retention_multiplier: 4
+    training_frame_count_by_model:
+      rfdetr_nano: 64
+    rfdetr_fixed_split_target_steps_per_round: 4
+    max_concurrent_jobs: 1
+    teacher_annotation_threshold: 0.4
+    teacher_annotation:
+      async_enabled: true
+      cache_enabled: true
+      wait_timeout_sec: 30
+      worker_batch_size: 8
+      worker_max_queue_size: 4096
+      worker_max_retries: 2
+      oom_retry_enabled: true
+      min_worker_batch_size: 1
+      cache_root_dir: ./cache/teacher_label_cache

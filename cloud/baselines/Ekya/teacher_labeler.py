@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -24,14 +25,16 @@ class TeacherLabeler:
         self.output_dir = Path(output_dir)
         self.teacher = teacher
         self.runtime_config = runtime_config
+        self._teacher_lock = threading.RLock()
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def label_window(self, window: CompletedFrameWindow) -> tuple[dict[int, dict[str, Any]], float]:
         started = time.perf_counter()
-        teacher = self._ensure_teacher()
         frames = [record.decoded_frame_bgr for record in window.records]
         labels: dict[int, dict[str, Any]] = {}
-        predictions = self._label_frames(teacher, frames)
+        with self._teacher_lock:
+            teacher = self._ensure_teacher()
+            predictions = self._label_frames(teacher, frames)
         for record, prediction in zip(window.records, predictions):
             labels[int(record.frame_idx)] = _prediction_to_labels(prediction)
         self._write_labels(window, labels)

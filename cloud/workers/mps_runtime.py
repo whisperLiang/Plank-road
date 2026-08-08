@@ -24,14 +24,24 @@ class MpsEnvironment:
         }
 
 
-def resolve_active_thread_percentage(value: object, *, max_active_gpu_workers: int) -> str:
+def resolve_active_thread_percentage(
+    value: object,
+    *,
+    max_active_gpu_workers: int | None,
+) -> str:
     text = str(value or "auto").strip().lower()
     if text == "auto":
+        if max_active_gpu_workers is None:
+            return "100"
         return str(max(1, int(100 / max(1, int(max_active_gpu_workers)))))
     return str(int(text))
 
 
-def build_mps_environment(config: object, *, max_active_gpu_workers: int) -> MpsEnvironment:
+def build_mps_environment(
+    config: object,
+    *,
+    max_active_gpu_workers: int | None,
+) -> MpsEnvironment:
     return MpsEnvironment(
         cuda_visible_devices=str(getattr(config, "cuda_visible_devices", "0")),
         pipe_directory=str(getattr(config, "pipe_directory", "/tmp/nvidia-mps")),
@@ -43,7 +53,11 @@ def build_mps_environment(config: object, *, max_active_gpu_workers: int) -> Mps
     )
 
 
-def ensure_mps_runtime(config: object, *, max_active_gpu_workers: int) -> MpsEnvironment:
+def ensure_mps_runtime(
+    config: object,
+    *,
+    max_active_gpu_workers: int | None,
+) -> MpsEnvironment:
     env = build_mps_environment(config, max_active_gpu_workers=max_active_gpu_workers)
     Path(env.pipe_directory).mkdir(parents=True, exist_ok=True)
     Path(env.log_directory).mkdir(parents=True, exist_ok=True)

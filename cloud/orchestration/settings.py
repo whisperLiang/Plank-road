@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -179,7 +180,7 @@ class OrchestrationSettings:
                 async_enabled=bool(getattr(teacher_cfg, "async_enabled", False)),
                 cache_enabled=bool(getattr(teacher_cfg, "cache_enabled", True)),
                 wait_timeout_sec=float(getattr(teacher_cfg, "wait_timeout_sec", 0.5)),
-                worker_batch_size=int(getattr(teacher_cfg, "worker_batch_size", 16)),
+                worker_batch_size=int(getattr(teacher_cfg, "worker_batch_size", 8)),
                 worker_max_queue_size=int(getattr(teacher_cfg, "worker_max_queue_size", 4096)),
                 worker_max_retries=int(getattr(teacher_cfg, "worker_max_retries", 2)),
                 oom_retry_enabled=bool(getattr(teacher_cfg, "oom_retry_enabled", True)),
@@ -199,11 +200,14 @@ class PipelineLifecycleMixin:
         *,
         gpu_lease_client=None,
         worker_id: str = "",
+        teacher_annotation_service=None,
+        teacher_annotation_metadata: Mapping[str, object] | None = None,
     ):
         self.config = config
         self.large_od = large_object_detection
         self.gpu_lease_client = gpu_lease_client
         self.worker_id = str(worker_id or "")
+        self.teacher_annotation_metadata = dict(teacher_annotation_metadata or {})
         self.lazy_cuda_init = bool(gpu_lease_client is not None)
         self.settings = OrchestrationSettings.from_config(config)
         settings = self.settings
@@ -474,7 +478,11 @@ class PipelineLifecycleMixin:
             log_internal_ids=self.log_internal_ids,
         )
         self.teacher_annotation_worker: TeacherAnnotationWorker | None = None
-        if self.teacher_annotation_async_enabled and self.teacher_annotation_cache_enabled:
+        if (
+            teacher_annotation_service is None
+            and self.teacher_annotation_async_enabled
+            and self.teacher_annotation_cache_enabled
+        ):
             self.teacher_annotation_worker = TeacherAnnotationWorker(
                 label_cache=self.teacher_label_cache,
                 batch_inference=getattr(self.large_od, "large_inference_batch", None),
@@ -488,16 +496,21 @@ class PipelineLifecycleMixin:
                 min_worker_batch_size=self.teacher_annotation_min_worker_batch_size,
                 log_internal_ids=self.log_internal_ids,
             )
-        self.teacher_annotation_service = TeacherAnnotationService(
-            label_cache=self.teacher_label_cache,
-            worker=self.teacher_annotation_worker,
-            log_internal_ids=self.log_internal_ids,
+        self.teacher_annotation_service = (
+            teacher_annotation_service
+            if teacher_annotation_service is not None
+            else TeacherAnnotationService(
+                label_cache=self.teacher_label_cache,
+                worker=self.teacher_annotation_worker,
+                log_internal_ids=self.log_internal_ids,
+            )
         )
         logger.info(
-            "[TeacherAnnotation][Worker] async_enabled={} cache_enabled={} worker_batch_size={} "
-            "max_queue_size={}",
+            "[TeacherAnnotation][Worker] async_enabled={} cache_enabled={} shared_service={} "
+            "worker_batch_size={} max_queue_size={}",
             self.teacher_annotation_async_enabled,
             self.teacher_annotation_cache_enabled,
+            teacher_annotation_service is not None,
             self.teacher_annotation_worker_batch_size,
             self.teacher_annotation_worker_max_queue_size,
         )
@@ -637,6 +650,7 @@ class PipelineLifecycleMixin:
             try:
                 if torch.cuda.is_available():
                     self.device = torch.device("cuda")
+                    torch.cuda.empty_cache()
                     torch.cuda.reset_peak_memory_stats()
                 else:
                     self.device = torch.device("cpu")
@@ -656,6 +670,7 @@ class PipelineLifecycleMixin:
                         handle.observed_peak_memory_gb = torch.cuda.max_memory_reserved() / (
                             1024.0**3
                         )
+                        torch.cuda.empty_cache()
                 except Exception:
                     pass
 

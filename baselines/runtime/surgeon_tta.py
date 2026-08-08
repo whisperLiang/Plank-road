@@ -766,7 +766,14 @@ class SurgeonLocalTTAUpdater:
             .strip()
             .lower()
         )
-        self.batch_size = max(1, int(getattr(self.training_cfg, "batch_size", 32)))
+        configured_mini_batch_size = getattr(
+            self.method_cfg,
+            "mini_batch_size",
+            None,
+        )
+        if configured_mini_batch_size is None:
+            configured_mini_batch_size = getattr(self.training_cfg, "batch_size", 32)
+        self.batch_size = max(1, int(configured_mini_batch_size))
         self.learning_rate = float(getattr(self.training_cfg, "learning_rate", 1.0e-3))
         self.weight_decay = float(getattr(self.training_cfg, "weight_decay", 0.0))
         self.optimizer_name = str(getattr(self.training_cfg, "optimizer_name", "adam"))
@@ -908,10 +915,14 @@ class SurgeonLocalTTAUpdater:
             )
             self._running_thread.start()
 
-    def close(self) -> None:
+    def close(self, *, timeout: float = 10.0) -> None:
         self._closed.set()
-        self.wait_for_idle(timeout=10.0)
-        self.try_apply_pending_update()
+        if self.wait_for_idle(timeout=max(0.0, float(timeout))):
+            self.try_apply_pending_update()
+        else:
+            logger.warning(
+                "[SURGEON] close timed out while shadow training was still running"
+            )
 
     def wait_for_idle(self, *, timeout: float = 10.0) -> bool:
         thread = self._running_thread
@@ -1122,6 +1133,8 @@ class SurgeonLocalTTAUpdater:
         )
         with model_lock:
             snapshot = self._snapshot_live_model_locked(detector, live_model)
+        if self._closed.is_set():
+            raise _TTASkip("shutdown")
         self.metrics.record(
             "surgeon_tta_shadow_snapshot_done",
             frame_id=int(trigger_frame_id),
@@ -1132,6 +1145,8 @@ class SurgeonLocalTTAUpdater:
         )
 
         shadow_model = self._build_shadow_training_model(detector, snapshot)
+        if self._closed.is_set():
+            raise _TTASkip("shutdown")
         adapter = TTADetectionAdapter(
             detector,
             model_override=shadow_model,
@@ -1437,6 +1452,8 @@ class SurgeonLocalTTAUpdater:
             int(self.num_epoch),
         )
         try:
+            if self._closed.is_set():
+                raise _TTASkip("shutdown")
             self._select_trainable_parameters(trainable_model)
             trainable_named_params = [
                 (name, param)
@@ -1501,6 +1518,8 @@ class SurgeonLocalTTAUpdater:
             last_rejection_reasons: list[str] = []
             last_training_loss = initial_loss
             for epoch_index in range(self.num_epoch):
+                if self._closed.is_set():
+                    raise _TTASkip("shutdown", trained_epochs=epoch_index)
                 epoch_started = time.perf_counter()
                 epoch = epoch_index + 1
                 epoch_loss_values: list[float] = []

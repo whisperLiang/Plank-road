@@ -44,6 +44,7 @@ from cloud.baselines.Ekya.trainer import (
 from cloud.baselines.Ekya.unified_logger import (
     EkyaUnifiedLogger,
 )
+from cloud.workers.gpu_lease_manager import LeaseRecord, LeaseRequest
 
 METHOD = "Ekya"
 
@@ -100,9 +101,11 @@ class EkyaStyleCloudSchedulingController:
         runtime_config: object | None = None,
         detector: Any | None = None,
         teacher: Any | None = None,
+        gpu_lease_manager=None,
     ) -> None:
         self.config = config
         self.runtime_config = runtime_config
+        self.gpu_lease_manager = gpu_lease_manager
         self.logger = EkyaUnifiedLogger(
             output_dir=config.output_dir,
             run_id=config.run_id,
@@ -148,14 +151,19 @@ class EkyaStyleCloudSchedulingController:
         self._model_version = 0
         self._model_version_by_edge: dict[tuple[int, int], int] = {}
         self._total_teacher_labeling_time_s = 0.0
+        if self.gpu_lease_manager is not None:
+            # CUDA peak counters are process-wide; reset once before any
+            # concurrent training starts rather than once per worker thread.
+            _reset_cuda_peak_memory_stats()
         logger.info(
             "Ekya startup: run_id={} student={} teacher={} "
-            "video={} output_dir={}",
+            "video={} output_dir={} training_admission={}",
             config.run_id,
             config.student_model,
             config.teacher_model,
             config.video_name,
             config.output_dir,
+            "gpu_memory" if self.gpu_lease_manager is not None else "fixed_count",
         )
 
     @property
@@ -427,7 +435,6 @@ class EkyaStyleCloudSchedulingController:
             lease = selected_by_id.get(id(candidate))
             if lease is not None:
                 self.logger.append_scheduler_event(candidate.scheduler_row)
-                self._start_training_candidate_thread(candidate, lease)
                 continue
             reason = dropped_by_id.get(id(candidate), "not_selected_by_global_top_k")
             self.logger.append_scheduler_event(
@@ -444,6 +451,8 @@ class EkyaStyleCloudSchedulingController:
                 microprofile_time_s=candidate.microprofile_time_s,
                 teacher_labeling_time_s=candidate.teacher_labeling_time_s,
             )
+        if selected:
+            self._dispatch_training_candidates(selected)
 
     def _reserve_training_candidates(
         self,
@@ -455,7 +464,12 @@ class EkyaStyleCloudSchedulingController:
         selected: list[tuple[TrainingCandidate, TrainingLease]] = []
         dropped: list[tuple[TrainingCandidate, str]] = []
         with self._training_admission_lock:
-            max_jobs = max(1, int(self.config.retraining.max_concurrent_train_jobs))
+            memory_managed = self.gpu_lease_manager is not None
+            max_jobs = (
+                len(self._active_training_by_key) + len(candidates)
+                if memory_managed
+                else max(1, int(self.config.retraining.max_concurrent_train_jobs))
+            )
             active_count = len(self._active_training_by_key)
             initial_slots = max(0, max_jobs - active_count)
             slots = initial_slots
@@ -484,14 +498,89 @@ class EkyaStyleCloudSchedulingController:
                 slots -= 1
         return selected, dropped
 
+    def _dispatch_training_candidates(
+        self,
+        selected: list[tuple[TrainingCandidate, TrainingLease]],
+    ) -> None:
+        if self.gpu_lease_manager is None:
+            for candidate, lease in selected:
+                self._start_training_candidate_thread(candidate, lease)
+            return
+        thread = threading.Thread(
+            target=self._dispatch_memory_managed_training_candidates,
+            args=(list(selected),),
+            name=f"ekya-gpu-dispatch-{selected[0][0].task_id}",
+            daemon=True,
+        )
+        with self._window_threads_lock:
+            self._background_threads.append(thread)
+        thread.start()
+
+    def _dispatch_memory_managed_training_candidates(
+        self,
+        selected: list[tuple[TrainingCandidate, TrainingLease]],
+    ) -> None:
+        for candidate, lease in selected:
+            try:
+                request = self._gpu_lease_request(candidate)
+                requested_memory = float(
+                    request.estimated_peak_memory_gb
+                    or self.gpu_lease_manager.estimator.default_estimated_job_memory_gb
+                )
+                if requested_memory > float(self.gpu_lease_manager.allowed_memory_gb):
+                    raise RuntimeError(
+                        "Ekya training estimate exceeds the available GPU memory budget: "
+                        f"requested={requested_memory:.2f}GB "
+                        f"allowed={self.gpu_lease_manager.allowed_memory_gb:.2f}GB"
+                    )
+                gpu_lease = self.gpu_lease_manager.acquire(request)
+            except Exception as exc:
+                logger.warning(
+                    "Ekya GPU admission failed: window={} error={}",
+                    candidate.window_id,
+                    exc,
+                )
+                self._end_training(lease)
+                self._record_window_metrics(
+                    window=candidate.window,
+                    frame_scores=candidate.frame_scores,
+                    training_result=None,
+                    adopted=False,
+                    microprofile_time_s=candidate.microprofile_time_s,
+                    teacher_labeling_time_s=candidate.teacher_labeling_time_s,
+                )
+                continue
+            self._start_training_candidate_thread(candidate, lease, gpu_lease)
+
+    def _gpu_lease_request(self, candidate: TrainingCandidate) -> LeaseRequest:
+        training_window = candidate.training_window or candidate.window
+        lease_cfg = getattr(
+            getattr(self.runtime_config, "edge_affine_workers", None),
+            "gpu_lease",
+            None,
+        )
+        estimate = float(getattr(lease_cfg, "default_estimated_job_memory_gb", 0.0) or 0.0)
+        return LeaseRequest(
+            edge_id=int(candidate.edge_id),
+            worker_id="ekya-cloud-controller",
+            job_id=f"ekya:{candidate.edge_id}:{candidate.task_id}:{candidate.window_id}",
+            model_name=str(self.config.student_model),
+            split_key="ekya_retraining",
+            batch_size=int(self.config.fixed_training.train_batch_size),
+            train_samples=len(training_window.records),
+            estimated_peak_memory_gb=estimate,
+            exclusive=False,
+        )
+
     def _start_training_candidate_thread(
         self,
         candidate: TrainingCandidate,
         lease: TrainingLease,
+        gpu_lease: LeaseRecord | None = None,
     ) -> None:
         thread = threading.Thread(
             target=self._run_training_candidate_guarded,
-            args=(candidate, lease),
+            args=(candidate, lease, gpu_lease),
             name=f"ekya-train-{candidate.window_id}",
             daemon=True,
         )
@@ -503,9 +592,15 @@ class EkyaStyleCloudSchedulingController:
         self,
         candidate: TrainingCandidate,
         lease: TrainingLease,
+        gpu_lease: LeaseRecord | None = None,
     ) -> None:
         training_result: TrainingResult | None = None
         adopted = False
+        heartbeat_stop = threading.Event()
+        heartbeat_thread = self._start_gpu_lease_heartbeat(
+            gpu_lease,
+            heartbeat_stop,
+        )
         try:
             training_window = candidate.training_window or candidate.window
             training_labels = candidate.training_teacher_labels or candidate.teacher_labels
@@ -534,6 +629,16 @@ class EkyaStyleCloudSchedulingController:
                 exc,
             )
         finally:
+            heartbeat_stop.set()
+            if heartbeat_thread is not None:
+                heartbeat_thread.join(timeout=1.0)
+            if gpu_lease is not None and self.gpu_lease_manager is not None:
+                observed_peak_memory_gb = _read_cuda_peak_memory_gb()
+                _release_unused_cuda_cache()
+                self.gpu_lease_manager.release(
+                    gpu_lease.lease_id,
+                    observed_peak_memory_gb=observed_peak_memory_gb,
+                )
             self._end_training(lease)
             self._record_window_metrics(
                 window=candidate.window,
@@ -543,6 +648,31 @@ class EkyaStyleCloudSchedulingController:
                 microprofile_time_s=candidate.microprofile_time_s,
                 teacher_labeling_time_s=candidate.teacher_labeling_time_s,
             )
+
+    def _start_gpu_lease_heartbeat(
+        self,
+        gpu_lease: LeaseRecord | None,
+        stop: threading.Event,
+    ) -> threading.Thread | None:
+        if gpu_lease is None or self.gpu_lease_manager is None:
+            return None
+        interval = max(
+            1.0,
+            min(10.0, float(self.gpu_lease_manager.lease_ttl_sec) / 3.0),
+        )
+
+        def heartbeat() -> None:
+            while not stop.wait(interval):
+                if not self.gpu_lease_manager.heartbeat(gpu_lease.lease_id):
+                    return
+
+        thread = threading.Thread(
+            target=heartbeat,
+            name=f"ekya-gpu-heartbeat-{gpu_lease.lease_id}",
+            daemon=True,
+        )
+        thread.start()
+        return thread
 
     def _training_window_and_labels_for(
         self,
@@ -831,6 +961,40 @@ class EkyaStyleCloudSchedulingController:
             args.append(reason)
         logger.info(message, *args)
         return adopted
+
+
+def _release_unused_cuda_cache() -> None:
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        return
+
+
+def _reset_cuda_peak_memory_stats() -> None:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        return
+
+
+def _read_cuda_peak_memory_gb() -> float:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return float(torch.cuda.max_memory_reserved()) / (1024.0**3)
+    except Exception:
+        return 0.0
+    return 0.0
 
 
 def _mean(values) -> float | None:

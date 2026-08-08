@@ -28,6 +28,9 @@ baseline:
   training_strategy: surgeon_tta
   quality_mode: output_only_when_no_boundary
   trainable_scope: norm_affine
+  # Optional method-specific micro-batch override. Leave null to inherit
+  # baseline.training.batch_size; low-memory edge GPUs can set this smaller.
+  mini_batch_size: null
   train_sample_count: 16
   # Train the full local schedule, then apply only the best epoch that passes
   # the detector-independent collapse guards.
@@ -286,6 +289,10 @@ server:
     upload_queue_size: 8
    cloud_inference:
     batch_size: 1
+   # Ekya shares one cloud teacher; bound its transient activations while
+   # memory-managed retraining jobs run concurrently.
+   teacher_labeling:
+    batch_size: 8
    scheduler:
     name: ekya_thief_style
     inference_resource_floor: 0.5
@@ -314,19 +321,29 @@ server:
    cuda_visible_devices: "0"
    pipe_directory: /tmp/nvidia-mps
    log_directory: /tmp/nvidia-mps-log
-   active_thread_percentage: auto
+   # Do not impose a fixed SM quota per worker; MPS shares compute among all
+   # jobs admitted by the GPU-memory lease.
+   active_thread_percentage: 100
   gpu_lease:
    enabled: true
    device: "cuda:0"
    memory_usage_threshold: 0.85
    reserve_memory_gb: 4
-   max_active_gpu_workers: auto
-   default_estimated_job_memory_gb: 18
+   # Admit as many edge jobs as the estimated aggregate GPU-memory budget fits.
+   # Queue only when the next job would exceed the configured memory threshold.
+   max_active_gpu_workers: memory_only
+   # After removing the per-worker teacher (~1 GB resident) and keeping cached
+   # boundary features on CPU (~0.69 GB saved), the measured 8.1 GB low peak
+   # maps to about 6.4 GB per training worker. Keep margin while allowing three
+   # initial workers inside the memory-only budget; observed peaks adapt later.
+   default_estimated_job_memory_gb: 7.25
    adaptive_peak_memory_estimation: true
    lease_ttl_sec: 120
    heartbeat_interval_sec: 10
-   teacher_reserved_memory_gb: 0
-   teacher_gpu_policy: lease
+   # One process-shared RT-DETR-X remains resident for all edge workers.
+   # Reserve its measured batch-8 peak once instead of charging every job.
+   teacher_reserved_memory_gb: 5
+   teacher_gpu_policy: reserved_budget
   worker:
    max_concurrent_jobs: 1
    startup_timeout_sec: 30
@@ -411,7 +428,10 @@ server:
    # A training request must wait for its already-submitted teacher batches. A
    # two-second timeout previously converted a valid request into a redundant retry.
    wait_timeout_sec: 30
-   worker_batch_size: 32
+   # RT-DETR-X teacher batches of 32 reached 17-22 GB per worker and caused
+   # concurrent OOM retries. Eight preserves the same labels and samples while
+   # bounding transient activation memory for multi-edge training.
+   worker_batch_size: 8
    worker_max_queue_size: 4096
    worker_max_retries: 2
    oom_retry_enabled: true

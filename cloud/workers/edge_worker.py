@@ -31,6 +31,7 @@ class EdgeWorkerServiceManager:
         yaml_path: str,
         workspace_root: str,
         lease_address: str,
+        teacher_annotation_address: str = "",
     ) -> None:
         self.edge_id = int(edge_id)
         self.worker_id = str(worker_id)
@@ -38,6 +39,7 @@ class EdgeWorkerServiceManager:
         self.yaml_path = str(yaml_path)
         self.workspace_root = str(workspace_root)
         self.lease_address = str(lease_address)
+        self.teacher_annotation_address = str(teacher_annotation_address or "")
         self._lock = threading.RLock()
         self._state: WorkerState = "STARTING"
         self._message = "edge worker is still starting"
@@ -115,13 +117,18 @@ class EdgeWorkerServiceManager:
             self.edge_id,
         )
         try:
-            service = EdgeWorkerService(
+            service_kwargs = dict(
                 edge_id=self.edge_id,
                 worker_id=self.worker_id,
                 yaml_path=self.yaml_path,
                 workspace_root=self.workspace_root,
                 lease_address=self.lease_address,
             )
+            if self.teacher_annotation_address:
+                service_kwargs["teacher_annotation_address"] = (
+                    self.teacher_annotation_address
+                )
+            service = EdgeWorkerService(**service_kwargs)
         except Exception as exc:
             with self._lock:
                 if self._closing:
@@ -186,6 +193,7 @@ def main() -> None:
     parser.add_argument("--listen_address", required=True)
     parser.add_argument("--workspace_root", required=True)
     parser.add_argument("--lease_address", required=True)
+    parser.add_argument("--teacher_annotation_address", default="")
     parser.add_argument("--lazy_cuda_init", default="true")
     args = parser.parse_args()
 
@@ -198,6 +206,7 @@ def main() -> None:
         yaml_path=args.yaml_path,
         workspace_root=args.workspace_root,
         lease_address=args.lease_address,
+        teacher_annotation_address=args.teacher_annotation_address,
     )
     server = JsonRpcServer(
         listen_address=args.listen_address,

@@ -18,12 +18,16 @@ class CloudFixedSplitOrchestrator:
         *,
         gpu_lease_client=None,
         worker_id: str = "",
+        teacher_annotation_service=None,
+        teacher_annotation_metadata: dict[str, Any] | None = None,
     ):
         self._pipeline = FixedSplitPipeline(
             config,
             large_object_detection,
             gpu_lease_client=gpu_lease_client,
             worker_id=worker_id,
+            teacher_annotation_service=teacher_annotation_service,
+            teacher_annotation_metadata=teacher_annotation_metadata,
         )
         self.config = config
         self.large_od = large_object_detection

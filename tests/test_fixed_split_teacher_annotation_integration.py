@@ -85,6 +85,30 @@ def _write_image(frame_dir, sample_id: str) -> str:
     return str(path)
 
 
+def test_injected_shared_teacher_service_skips_local_teacher_model(tmp_path) -> None:
+    shared_service = SimpleNamespace()
+    learner = CloudContinualLearner(
+        _config(tmp_path, async_enabled=True),
+        None,
+        teacher_annotation_service=shared_service,
+        teacher_annotation_metadata={
+            "teacher_model_name": "rtdetr_x",
+            "teacher_weights_fingerprint": "shared-fingerprint",
+            "teacher_label_schema": "coco_91",
+            "teacher_num_classes": 91,
+            "teacher_class_names": ["person"],
+        },
+    )
+    try:
+        assert learner.teacher_annotation_worker is None
+        assert learner.teacher_annotation_service is shared_service
+        assert learner._teacher_model_name() == "rtdetr_x"
+        assert learner._teacher_weights_fingerprint() == "shared-fingerprint"
+        assert learner._teacher_num_classes() == 91
+    finally:
+        learner.close()
+
+
 def _boundary_and_contract():
     boundary = boundary_payload_from_tensors(
         {"feat": torch.randn(1, 4)},

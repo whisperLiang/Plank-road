@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import gc
 import threading
 import time
 from collections import deque
@@ -54,6 +55,14 @@ def _is_retryable_annotation_error(exc: BaseException) -> bool:
     return bool(getattr(exc, "retryable", False))
 
 
+def _release_cuda_cache_after_oom() -> None:
+    """Release failed-attempt tensors before retrying with a smaller batch."""
+    if not torch.cuda.is_available():
+        return
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 def _default_label_builder(
     request: TeacherAnnotationRequest,
     frame: np.ndarray,
@@ -97,7 +106,7 @@ class TeacherAnnotationWorker:
         label_builder: LabelBuilder | None = None,
         teacher_scope: TeacherScopeFactory | None = None,
         max_queue_size: int = 4096,
-        worker_batch_size: int = 16,
+        worker_batch_size: int = 8,
         max_retries: int = 2,
         oom_retry_enabled: bool = True,
         min_worker_batch_size: int = 1,
@@ -323,6 +332,7 @@ class TeacherAnnotationWorker:
                 if _is_cuda_oom(exc) and self.oom_retry_enabled:
                     with self._condition:
                         self._stats["oom_retry_count"] += 1
+                    _release_cuda_cache_after_oom()
                     if attempt_batch_size > self.min_worker_batch_size:
                         next_size = max(
                             self.min_worker_batch_size,

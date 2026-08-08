@@ -190,13 +190,22 @@ def test_universal_split_retrain_accumulates_low_precision_loss_in_float32(
     monkeypatch,
     tmp_path,
 ) -> None:
+    load_runtime_args = []
+
     def fake_load_cached_split_batches(**_kwargs):
+        load_runtime_args.append(_kwargs.get("runtime"))
         return [
             (["sample-0"], object(), []),
             (["sample-1"], object(), []),
         ]
 
     calls = []
+    prepared_boundaries = []
+
+    def fake_prepare_boundary_for_runtime(_runtime, boundary, *, validate):
+        assert validate
+        prepared_boundaries.append(boundary)
+        return boundary
 
     def fake_train_split_suffix_batch(*_args, **kwargs):
         calls.append(bool(kwargs.get("trusted_runtime_boundary")))
@@ -211,6 +220,11 @@ def test_universal_split_retrain_accumulates_low_precision_loss_in_float32(
         split_module,
         "train_split_suffix_batch",
         fake_train_split_suffix_batch,
+    )
+    monkeypatch.setattr(
+        split_module,
+        "prepare_boundary_for_runtime",
+        fake_prepare_boundary_for_runtime,
     )
 
     losses = split_module.universal_split_retrain(
@@ -227,6 +241,8 @@ def test_universal_split_retrain_accumulates_low_precision_loss_in_float32(
     )
 
     assert losses == [65504.0]
+    assert load_runtime_args == [None]
+    assert len(prepared_boundaries) == 2
     assert calls == [True, True]
 
 

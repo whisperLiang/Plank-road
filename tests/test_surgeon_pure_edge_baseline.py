@@ -269,6 +269,38 @@ def test_pure_edge_surgeon_keeps_transport_none_and_records_frame_decision(tmp_p
         adapter.close()
 
 
+def test_surgeon_method_specific_mini_batch_size_overrides_shared_training(tmp_path) -> None:
+    config = _config(tmp_path)
+    config.baseline.SURGEON.mini_batch_size = 1
+
+    updater = SurgeonLocalTTAUpdater(
+        config,
+        SimpleNamespace(record=lambda *_args, **_kwargs: None),
+    )
+
+    assert updater.batch_size == 1
+
+
+def test_surgeon_close_waits_for_training_thread_to_stop(tmp_path) -> None:
+    updater = SurgeonLocalTTAUpdater(
+        _config(tmp_path),
+        SimpleNamespace(record=lambda *_args, **_kwargs: None),
+    )
+    stopped = threading.Event()
+
+    def training_task() -> None:
+        assert updater._closed.wait(timeout=1.0)
+        stopped.set()
+
+    updater._running_thread = threading.Thread(target=training_task, daemon=False)
+    updater._running_thread.start()
+
+    updater.close()
+
+    assert stopped.is_set()
+    assert updater.wait_for_idle(timeout=0.0)
+
+
 def test_tta_selects_inner_trainable_module_for_detector_wrappers(tmp_path) -> None:
     inner = ToyTTAModel()
     inner.eval()

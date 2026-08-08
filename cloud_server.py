@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import json
 import os
+import threading
 from concurrent import futures
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
@@ -22,11 +23,13 @@ from cloud.annotation import (
     TeacherAnnotationWorker,
     TeacherLabelCache,
 )
+from cloud.annotation.remote_service import SharedTeacherAnnotationRpcServer
 from cloud.edge_registry import EdgeRegistry
 from cloud.experiment_result_repository import (
     CloudExperimentManifestWriter,
     CloudExperimentResultRepository,
 )
+from cloud.orchestration.teacher_stage import TeacherAnnotationMixin
 from cloud.workers.assignment_store import EdgeAssignmentStore
 from cloud.workers.edge_worker_pool import EdgeWorkerPool
 from cloud.workers.gpu_lease_manager import GpuLeaseManager, LeaseRequest
@@ -113,6 +116,37 @@ class BaselineHeavyLaneBusy(RuntimeError):
     retryable = True
 
 
+class _SharedTeacherAnnotationAdapter(TeacherAnnotationMixin):
+    """Reuse the fixed-split label mapping for the process-shared teacher."""
+
+    def __init__(self, config, teacher_detector) -> None:
+        self.config = config
+        self.large_od = teacher_detector
+        self.weight_folder = str(Path(__file__).parent / "model_management" / "models")
+        self.teacher_annotation_metadata: dict[str, object] = {}
+        self._teacher_weights_fingerprint_cache: str | None = None
+        self._metadata_lock = threading.Lock()
+        self._metadata_cache: dict[str, object] | None = None
+
+    def build_labels(self, request, frame, prediction):
+        return self._teacher_labels_from_request_prediction(request, frame, prediction)
+
+    def metadata(self) -> dict[str, object]:
+        if self._metadata_cache is None:
+            with self._metadata_lock:
+                if self._metadata_cache is None:
+                    self._metadata_cache = {
+                        "teacher_model_name": self._teacher_model_name(),
+                        "teacher_weights_fingerprint": (
+                            self._teacher_weights_fingerprint()
+                        ),
+                        "teacher_label_schema": self._teacher_label_schema(),
+                        "teacher_num_classes": self._teacher_num_classes(),
+                        "teacher_class_names": self._teacher_class_names(),
+                    }
+        return dict(self._metadata_cache)
+
+
 def __getattr__(name: str):
     if name == "CloudContinualLearner":
         from cloud.orchestrator import CloudContinualLearner
@@ -148,6 +182,9 @@ class CloudServer:
         self.worker_pool = None
         self.gpu_lease_manager = None
         self.gpu_lease_service = None
+        self.shared_teacher_rpc_server = None
+        self.shared_teacher_annotation_worker = None
+        self.shared_teacher_annotation_service = None
         self.grpc_server = None
         self.experiment_result_repository = None
         self.experiment_manifest_writer = None
@@ -193,9 +230,11 @@ class CloudServer:
                     run_id=resolved_run_id,
                     output_dir=ekya_output_dir,
                 )
+                ekya_gpu_lease_manager = self._init_ekya_gpu_admission()
                 self.baseline_controller = EkyaStyleCloudSchedulingController(
                     ekya_config,
                     runtime_config=config,
+                    gpu_lease_manager=ekya_gpu_lease_manager,
                 )
                 self.baseline_method = method
                 self.run_id = resolved_run_id
@@ -290,6 +329,39 @@ class CloudServer:
             run_id=identity.run_id,
         )
 
+    def _init_ekya_gpu_admission(self):
+        edge_affine = getattr(self.config, "edge_affine_workers", None)
+        if edge_affine is None or not bool(getattr(edge_affine, "enabled", False)):
+            return None
+        lease_cfg = getattr(edge_affine, "gpu_lease", None)
+        if lease_cfg is None or not bool(getattr(lease_cfg, "enabled", True)):
+            return None
+        self.gpu_lease_manager = GpuLeaseManager(
+            memory_usage_threshold=float(lease_cfg.memory_usage_threshold),
+            reserve_memory_gb=float(lease_cfg.reserve_memory_gb),
+            max_active_gpu_workers=lease_cfg.max_active_gpu_workers,
+            default_estimated_job_memory_gb=float(
+                lease_cfg.default_estimated_job_memory_gb
+            ),
+            lease_ttl_sec=float(lease_cfg.lease_ttl_sec),
+            teacher_reserved_memory_gb=float(lease_cfg.teacher_reserved_memory_gb),
+        )
+        mps_env = ensure_mps_runtime(
+            edge_affine.mps,
+            max_active_gpu_workers=self.gpu_lease_manager.max_active_gpu_workers,
+        )
+        if bool(getattr(edge_affine.mps, "enabled", False)):
+            os.environ.update(mps_env.as_env())
+        logger.info(
+            "Ekya GPU admission enabled policy={} allowed_memory_gb={:.2f} "
+            "estimated_job_memory_gb={:.2f} teacher_reserved_memory_gb={:.2f}",
+            self.gpu_lease_manager.admission_policy,
+            self.gpu_lease_manager.allowed_memory_gb,
+            float(lease_cfg.default_estimated_job_memory_gb),
+            float(lease_cfg.teacher_reserved_memory_gb),
+        )
+        return self.gpu_lease_manager
+
     def _init_edge_affine_backend(self, edge_affine, *, run_id: str) -> None:
         run_id = str(run_id or "").strip()
         if not run_id:
@@ -320,6 +392,11 @@ class CloudServer:
             edge_affine.mps,
             max_active_gpu_workers=self.gpu_lease_manager.max_active_gpu_workers,
         )
+        teacher_annotation_address = ""
+        if self.mode != "baseline":
+            if bool(getattr(edge_affine.mps, "enabled", False)):
+                os.environ.update(mps_env.as_env())
+            teacher_annotation_address = self._init_shared_teacher_annotation_backend()
         self.worker_pool = EdgeWorkerPool(
             yaml_path=self.yaml_path,
             run_id=run_id,
@@ -329,6 +406,7 @@ class CloudServer:
             worker_service_config=edge_affine.worker,
             mps_env=mps_env,
             lease_address=self.gpu_lease_service.listen_address,
+            teacher_annotation_address=teacher_annotation_address,
             log_internal_ids=self.log_internal_ids,
         )
         self.continual_backend = EdgeWorkerRoutedContinualLearningBackend(
@@ -351,6 +429,59 @@ class CloudServer:
             self.gpu_lease_manager.max_active_gpu_workers,
             lease_cfg.default_estimated_job_memory_gb,
         )
+
+    def _init_shared_teacher_annotation_backend(self) -> str:
+        cl_cfg = getattr(self.config, "continual_learning", None)
+        teacher_cfg = (
+            getattr(cl_cfg, "teacher_annotation", None) if cl_cfg is not None else None
+        )
+        if not (
+            bool(getattr(teacher_cfg, "async_enabled", True))
+            and bool(getattr(teacher_cfg, "cache_enabled", True))
+        ):
+            return ""
+
+        from cloud.workers.edge_worker_service import LazyObjectDetection
+
+        self.large_object_detection = LazyObjectDetection(self.config, "large inference")
+        adapter = _SharedTeacherAnnotationAdapter(
+            self.config,
+            self.large_object_detection,
+        )
+        cache = TeacherLabelCache(
+            str(getattr(teacher_cfg, "cache_root_dir", "./cache/teacher_label_cache")),
+            enabled=True,
+            log_internal_ids=self.log_internal_ids,
+        )
+        self.shared_teacher_annotation_worker = TeacherAnnotationWorker(
+            label_cache=cache,
+            batch_inference=self.large_object_detection.large_inference_batch,
+            single_inference=self.large_object_detection.large_inference,
+            label_builder=adapter.build_labels,
+            max_queue_size=int(getattr(teacher_cfg, "worker_max_queue_size", 4096)),
+            worker_batch_size=int(getattr(teacher_cfg, "worker_batch_size", 8)),
+            max_retries=int(getattr(teacher_cfg, "worker_max_retries", 2)),
+            oom_retry_enabled=bool(getattr(teacher_cfg, "oom_retry_enabled", True)),
+            min_worker_batch_size=int(getattr(teacher_cfg, "min_worker_batch_size", 1)),
+            log_internal_ids=self.log_internal_ids,
+        )
+        self.shared_teacher_annotation_service = TeacherAnnotationService(
+            label_cache=cache,
+            worker=self.shared_teacher_annotation_worker,
+            log_internal_ids=self.log_internal_ids,
+        )
+        self.shared_teacher_rpc_server = SharedTeacherAnnotationRpcServer(
+            service=self.shared_teacher_annotation_service,
+            metadata_provider=adapter.metadata,
+        )
+        self.shared_teacher_rpc_server.start()
+        logger.info(
+            "shared teacher annotation service enabled endpoint={} model={} batch_size={} ",
+            self.shared_teacher_rpc_server.listen_address,
+            getattr(self.config, "golden", "rtdetr_x"),
+            int(getattr(teacher_cfg, "worker_batch_size", 8)),
+        )
+        return self.shared_teacher_rpc_server.listen_address
 
     def start_server(self):
         listen_address = str(getattr(self.config, "listen_address", "[::]:50051")).strip()
@@ -464,6 +595,12 @@ class CloudServer:
             close_backend()
         if self.worker_pool is not None:
             self.worker_pool.close()
+        if self.shared_teacher_rpc_server is not None:
+            self.shared_teacher_rpc_server.shutdown()
+            self.shared_teacher_rpc_server = None
+        if self.shared_teacher_annotation_worker is not None:
+            self.shared_teacher_annotation_worker.stop()
+            self.shared_teacher_annotation_worker = None
         if self.gpu_lease_service is not None:
             self.gpu_lease_service.shutdown()
         if self.gpu_lease_manager is not None:
@@ -496,7 +633,7 @@ def _build_baseline_teacher_annotator(
         log_internal_ids=bool(log_internal_ids),
     )
     teacher_model_name = str(getattr(config, "golden", "") or "rtdetr_x")
-    worker_batch_size = int(getattr(teacher_cfg, "worker_batch_size", 16))
+    worker_batch_size = int(getattr(teacher_cfg, "worker_batch_size", 8))
 
     @contextmanager
     def teacher_scope(stage_label: str, *, sample_count: int | None = None):

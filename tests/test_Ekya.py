@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import queue
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -241,6 +243,31 @@ class _RecordingTrainer:
         )
 
 
+class _BlockingRecordingTrainer(_RecordingTrainer):
+    def __init__(self, tmp_path: Path) -> None:
+        super().__init__(tmp_path)
+        self._lock = threading.Lock()
+        self.release = threading.Event()
+        self.three_started = threading.Event()
+        self.started_edges: list[int] = []
+        self.active = 0
+        self.max_active = 0
+
+    def train(self, *, window: CompletedFrameWindow, **kwargs) -> TrainingResult:
+        with self._lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            self.started_edges.append(int(window.edge_id))
+            if self.active >= 3:
+                self.three_started.set()
+        try:
+            self.release.wait(timeout=5.0)
+            return super().train(window=window, **kwargs)
+        finally:
+            with self._lock:
+                self.active -= 1
+
+
 def _microprofile_result(task_id: int = 1, *, score: float = 0.1) -> MicroProfileResult:
     preretrain_map = 0.5
     predicted_final_map = preretrain_map + float(score)
@@ -293,6 +320,7 @@ def _controller_for_admission_tests(
     scope: str = "edge_camera",
     drop_when_active: bool = True,
     max_concurrent_train_jobs: int = 1,
+    gpu_lease_manager=None,
 ):
     from cloud.baselines.Ekya.controller import (
         EkyaStyleCloudSchedulingController,
@@ -307,7 +335,9 @@ def _controller_for_admission_tests(
     model = _TinyTrainModelFactory()()
     controller = EkyaStyleCloudSchedulingController(
         cfg,
+        runtime_config=runtime.server,
         detector=SimpleNamespace(model=model),
+        gpu_lease_manager=gpu_lease_manager,
     )
     controller.teacher_labeler = _FakeTeacherLabeler()
     controller.microprofiler = _FakeMicroprofiler()
@@ -685,6 +715,53 @@ def test_ekya_teacher_labeler_batches_window_by_configured_teacher_batch(
     assert teacher.calls == [2, 1]
     assert sorted(labels) == [1, 2, 3]
     assert labels[1]["scores"] == [pytest.approx(0.3)]
+
+
+def test_ekya_teacher_is_shared_but_each_edge_window_is_inferred(
+    tmp_path: Path,
+) -> None:
+    from cloud.baselines.Ekya.teacher_labeler import TeacherLabeler
+
+    class RecordingTeacher:
+        def __init__(self) -> None:
+            self.lock = threading.Lock()
+            self.calls: list[int] = []
+            self.active = 0
+            self.max_active = 0
+
+        def large_inference_batch(self, images, threshold=None):
+            del threshold
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                self.calls.append(len(images))
+            try:
+                time.sleep(0.02)
+                return [([], [], []) for _image in images]
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    runtime = _runtime(tmp_path)
+    runtime.server.baselines.Ekya.teacher_labeling.batch_size = 8
+    cfg = parse_ekya_style_config(runtime, run_id="run")
+    teacher = RecordingTeacher()
+    labeler = TeacherLabeler(cfg, output_dir=tmp_path, teacher=teacher)
+    threads = [
+        threading.Thread(
+            target=labeler.label_window,
+            args=(_decoded_window(edge_id=edge_id),),
+        )
+        for edge_id in (1, 2)
+    ]
+
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert teacher.calls == [3, 3]
+    assert teacher.max_active == 1
 
 
 def test_ekya_cloud_inference_config_passes_final_detection_threshold(
@@ -1319,6 +1396,54 @@ def test_ekya_candidate_pool_selects_global_top_k_by_score(tmp_path: Path) -> No
     )
 
 
+def test_ekya_memory_admission_runs_three_jobs_and_queues_fourth(
+    tmp_path: Path,
+) -> None:
+    from cloud.workers.gpu_lease_manager import GpuLeaseManager
+
+    manager = GpuLeaseManager(
+        memory_usage_threshold=0.85,
+        reserve_memory_gb=4,
+        teacher_reserved_memory_gb=5,
+        max_active_gpu_workers="memory_only",
+        default_estimated_job_memory_gb=7.25,
+        query_total_memory_gb=lambda: 36.8,
+    )
+    controller = _controller_for_admission_tests(
+        tmp_path,
+        max_concurrent_train_jobs=1,
+        gpu_lease_manager=manager,
+    )
+    trainer = _BlockingRecordingTrainer(tmp_path)
+    controller.trainer = trainer
+
+    try:
+        controller._drain_training_candidates(
+            [
+                _training_candidate_for_test(edge_id=1, score=0.08),
+                _training_candidate_for_test(edge_id=2, score=0.15),
+                _training_candidate_for_test(edge_id=3, score=0.03),
+                _training_candidate_for_test(edge_id=4, score=0.11),
+            ]
+        )
+        assert trainer.three_started.wait(timeout=2.0)
+        with trainer._lock:
+            assert trainer.active == 3
+            assert set(trainer.started_edges) == {1, 2, 4}
+        assert len(manager.snapshot()["active"]) == 3
+    finally:
+        trainer.release.set()
+        controller.wait_for_background(timeout=5.0)
+        controller.close()
+        manager.close()
+
+    assert trainer.max_active == 3
+    assert {int(window.edge_id) for window in trainer.calls} == {1, 2, 3, 4}
+    scheduler_rows = read_csv(controller.output_dir / "scheduler_events.csv")
+    assert len(scheduler_rows) == 4
+    assert all(row["selected_hp_id"] for row in scheduler_rows)
+
+
 def test_ekya_launch_window_pipelines_drains_same_task_as_global_top_k_round(
     tmp_path: Path,
 ) -> None:
@@ -1610,6 +1735,77 @@ def test_ekya_cloud_server_uses_dedicated_controller_without_edge_affine(tmp_pat
         / "cloud"
     )
     assert _experiment_method_for("Ekya") == "Ekya"
+
+
+def test_ekya_cloud_server_wires_memory_only_gpu_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cloud.workers.mps_runtime import MpsEnvironment
+    from cloud_server import CloudServer
+
+    captured: dict[str, object] = {}
+
+    class FakeLeaseManager:
+        max_active_gpu_workers = None
+        admission_policy = "memory_only"
+        allowed_memory_gb = 22.28
+
+        def __init__(self, **kwargs):
+            captured["lease_kwargs"] = kwargs
+
+        def close(self):
+            captured["closed"] = True
+
+    class FakeController:
+        def __init__(self, _config, **kwargs):
+            captured["controller_kwargs"] = kwargs
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("cloud_server.GpuLeaseManager", FakeLeaseManager)
+    monkeypatch.setattr(
+        "cloud_server.ensure_mps_runtime",
+        lambda *_args, **_kwargs: MpsEnvironment("0", "/tmp/mps", "/tmp/log", "100"),
+    )
+    monkeypatch.setattr(
+        "cloud.baselines.Ekya.EkyaStyleCloudSchedulingController",
+        FakeController,
+    )
+    runtime = _runtime(tmp_path)
+    config = runtime.server
+    config.server_id = "server-1"
+    config.edge_affine_workers = SimpleNamespace(
+        enabled=True,
+        mps=SimpleNamespace(enabled=True),
+        gpu_lease=SimpleNamespace(
+            enabled=True,
+            memory_usage_threshold=0.85,
+            reserve_memory_gb=4,
+            max_active_gpu_workers="memory_only",
+            default_estimated_job_memory_gb=7.25,
+            lease_ttl_sec=120,
+            teacher_reserved_memory_gb=5,
+        ),
+    )
+    server = CloudServer(
+        config,
+        mode="baseline",
+        baseline_config=SimpleNamespace(method="Ekya"),
+        baseline_method="Ekya",
+        runtime_config=runtime,
+    )
+    try:
+        assert captured["controller_kwargs"]["gpu_lease_manager"] is (
+            server.gpu_lease_manager
+        )
+        assert captured["lease_kwargs"]["max_active_gpu_workers"] == "memory_only"
+        assert captured["lease_kwargs"]["teacher_reserved_memory_gb"] == 5
+    finally:
+        server.close()
+
+    assert captured["closed"] is True
 
 
 def test_ekya_edge_route_archives_before_edge_worker_construction() -> None:

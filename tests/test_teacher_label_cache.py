@@ -31,6 +31,16 @@ def test_cache_key_is_stable_and_ignores_batch_size() -> None:
     assert req_a.cache_key().digest == req_b.cache_key().digest
 
 
+def test_cache_key_is_isolated_by_edge_client(tmp_path) -> None:
+    cache = TeacherLabelCache(str(tmp_path))
+    edge_a = _request(edge_id=1)
+    edge_b = _request(edge_id=2)
+    cache.write(edge_a, {"boxes": [], "labels": []}, source="test")
+
+    assert edge_a.cache_key().digest != edge_b.cache_key().digest
+    assert cache.read(edge_b) is None
+
+
 def test_threshold_change_causes_cache_miss(tmp_path) -> None:
     cache = TeacherLabelCache(str(tmp_path))
     req = _request()

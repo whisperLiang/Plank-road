@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from cloud.annotation.remote_service import RemoteTeacherAnnotationService
 from cloud.orchestrator import CloudFixedSplitOrchestrator
 from cloud.training.strategies import (
     CloudBaselineFreezeTrainingStrategy,
@@ -21,12 +23,18 @@ class LazyObjectDetection:
         self.config = config
         self.detector_type = detector_type
         self._detector = None
+        self._lock = threading.Lock()
 
     def _ensure(self):
         if self._detector is None:
-            from model_management.object_detection import Object_Detection
+            with self._lock:
+                if self._detector is None:
+                    from model_management.object_detection import Object_Detection
 
-            self._detector = Object_Detection(self.config, type=self.detector_type)
+                    self._detector = Object_Detection(
+                        self.config,
+                        type=self.detector_type,
+                    )
         return self._detector
 
     def __getattr__(self, name: str):
@@ -48,6 +56,7 @@ class EdgeWorkerService:
         yaml_path: str,
         workspace_root: str,
         lease_address: str,
+        teacher_annotation_address: str = "",
     ) -> None:
         self.edge_id = int(edge_id)
         self.worker_id = str(worker_id)
@@ -60,12 +69,24 @@ class EdgeWorkerService:
             timeout_sec=float(self.config.edge_affine_workers.worker.request_timeout_sec),
             heartbeat_interval_sec=float(lease_cfg.heartbeat_interval_sec),
         )
-        large_od = LazyObjectDetection(self.config, "large inference")
+        self.teacher_annotation_service = None
+        teacher_annotation_metadata = None
+        if str(teacher_annotation_address or "").strip():
+            self.teacher_annotation_service = RemoteTeacherAnnotationService(
+                str(teacher_annotation_address),
+                timeout_sec=float(self.config.edge_affine_workers.worker.request_timeout_sec),
+            )
+            teacher_annotation_metadata = self.teacher_annotation_service.metadata()
+            large_od = None
+        else:
+            large_od = LazyObjectDetection(self.config, "large inference")
         self.learner = CloudFixedSplitOrchestrator(
             self.config,
             large_od,
             gpu_lease_client=self.lease_client,
             worker_id=self.worker_id,
+            teacher_annotation_service=self.teacher_annotation_service,
+            teacher_annotation_metadata=teacher_annotation_metadata,
         )
         self.training_jobs = TrainingJobManager(
             continual_learner=self.learner,

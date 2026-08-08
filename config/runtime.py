@@ -192,7 +192,7 @@ class TeacherAnnotationConfig(ConfigSection):
     async_enabled: bool = True
     cache_enabled: bool = True
     wait_timeout_sec: float = 0.5
-    worker_batch_size: int = 16
+    worker_batch_size: int = 8
     worker_max_queue_size: int = 4096
     worker_max_retries: int = 2
     oom_retry_enabled: bool = True
