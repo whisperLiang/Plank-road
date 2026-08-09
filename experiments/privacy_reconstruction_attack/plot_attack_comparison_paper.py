@@ -313,21 +313,52 @@ def plot_matrix_overview(panels: list[AttackPanel], output_dir: Path) -> None:
         if panel.split_key not in split_keys:
             split_keys.append(panel.split_key)
     split_labels = {
-        panel.split_key: panel.split_label if panel.split_is_score else "first\ncompute"
+        panel.split_key: panel.split_label if panel.split_is_score else "first compute"
         for panel in panels
     }
-    fig = plt.figure(figsize=(7.15, 3.25), constrained_layout=False)
+    row_height_ratios: list[float] = []
+    for model in models:
+        row_panels = [by_key[(model, split_key)] for split_key in split_keys]
+        image_paths = [row_panels[0].reference_path]
+        image_paths.extend(panel.drag_path for panel in row_panels)
+        image_paths.extend(panel.whitebox_path for panel in row_panels)
+        image_aspects: list[float] = []
+        for image_path in image_paths:
+            with Image.open(image_path) as image:
+                width, height = image.size
+            image_aspects.append(float(height) / float(width))
+        row_height_ratios.append(max(image_aspects))
+
+    # Keep the qualitative matrix compact at two-column publication width.  The
+    # row heights follow the source aspect ratios so landscape inputs do not
+    # create artificial white bands. Images remain uncropped and unstretched.
+    figure_width = 7.15
+    header_height_ratio = 0.30
+    width_ratios = (0.72, 1.04, *([1.0] * (len(split_keys) * 2)))
+    height_ratios = (header_height_ratio, *row_height_ratios)
+    hspace = 0.015
+    left, right, top, bottom = 0.028, 0.998, 0.995, 0.012
+    column_unit = figure_width * (right - left) / sum(width_ratios)
+    row_count = len(height_ratios)
+    spacing_factor = 1.0 + hspace * (row_count - 1) / row_count
+    figure_height = (
+        column_unit * sum(height_ratios) * spacing_factor / (top - bottom)
+    )
+    fig = plt.figure(
+        figsize=(figure_width, figure_height),
+        constrained_layout=False,
+    )
     grid = fig.add_gridspec(
         len(models) + 1,
         2 + len(split_keys) * 2,
-        height_ratios=(0.34, *([1.0] * len(models))),
-        width_ratios=(0.9, 1.12, *([1.0] * (len(split_keys) * 2))),
-        hspace=0.16,
-        wspace=0.08,
-        left=0.035,
-        right=0.995,
-        top=0.985,
-        bottom=0.035,
+        height_ratios=height_ratios,
+        width_ratios=width_ratios,
+        hspace=hspace,
+        wspace=0.025,
+        left=left,
+        right=right,
+        top=top,
+        bottom=bottom,
     )
 
     header_ref = fig.add_subplot(grid[0, 1])
@@ -347,7 +378,7 @@ def plot_matrix_overview(panels: list[AttackPanel], output_dir: Path) -> None:
         header.axis("off")
         header.text(
             0.5,
-            0.82,
+            0.76,
             label,
             ha="center",
             va="center",
@@ -358,7 +389,7 @@ def plot_matrix_overview(panels: list[AttackPanel], output_dir: Path) -> None:
         for index, split_key in enumerate(split_keys):
             header.text(
                 (index + 0.5) / len(split_keys),
-                0.18,
+                0.15,
                 split_labels[split_key],
                 ha="center",
                 va="center",
