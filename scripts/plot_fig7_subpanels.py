@@ -149,7 +149,7 @@ def plot_panel_a(
             mean_f1,
             color=METHOD_COLORS[method],
             linestyle=METHOD_LINESTYLES[method],
-            linewidth=1.55 if method == "plank_road" else 1.2,
+            linewidth=1.55 if method == "recap" else 1.2,
             solid_capstyle="round",
         )
     accuracy_axis.set_ylabel("Teacher-supervised F1")
@@ -289,7 +289,7 @@ def plot_panel_b(components: dict[str, dict[str, float]]) -> plt.Figure:
             position,
             f"{totals[method]:.1f} s",
             fontsize=6,
-            fontweight="bold" if method == "plank_road" else "normal",
+            fontweight="bold" if method == "recap" else "normal",
             color=METHOD_COLORS[method],
             ha="left",
             va="center",

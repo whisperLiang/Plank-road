@@ -1,4 +1,4 @@
-"""Compact two-row candidate for the multi-edge scalability figure.
+"""Generate Figure 8 of the manuscript: multi-edge scalability.
 
 Row (a) shows the accuracy--communication trade-off. Row (b) merges tail
 latency and fairness into a second trade-off plane, avoiding a crowded dual
@@ -14,21 +14,111 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from matplotlib.lines import Line2D
 
-from plot_multi_edge_scalability_pareto import (
-    BLOCKS,
-    COLORS,
-    DISPLAY,
-    METHODS,
-    N_MARKERS,
-    plot_pareto,
-    series,
-    style_axis,
+
+plt.rcParams.update(
+    {
+        "font.family": "sans-serif",
+        "font.sans-serif": ["Arial", "DejaVu Sans", "Liberation Sans"],
+        "svg.fonttype": "none",
+        "pdf.fonttype": 42,
+        "font.size": 7.2,
+        "axes.spines.right": False,
+        "axes.spines.top": False,
+        "axes.linewidth": 0.65,
+        "xtick.major.width": 0.6,
+        "ytick.major.width": 0.6,
+        "legend.frameon": False,
+    }
 )
+
+METHODS = ["recap", "SURGEON", "CATR", "Ekya"]
+DISPLAY = {
+    "recap": "RECAP",
+    "SURGEON": "SURGEON",
+    "CATR": "CATR",
+    "Ekya": "Ekya",
+}
+COLORS = {
+    "recap": "#155A99",
+    "SURGEON": "#B84B49",
+    "CATR": "#3B8F93",
+    "Ekya": "#87529A",
+}
+N_MARKERS = {1: "o", 2: "s", 4: "D"}
+BLOCKS = [
+    ("rainy", "rfdetr_nano", "Rainy · RF-DETR Nano"),
+    ("snowy", "rfdetr_nano", "Snowy · RF-DETR Nano"),
+    ("rainy", "yolo26n", "Rainy · YOLO26n"),
+    ("snowy", "yolo26n", "Snowy · YOLO26n"),
+]
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA = ROOT / "Chencang" / "tmc" / "figs" / "fig8_multi_edge_scalability_data.csv"
+DATA = (
+    ROOT
+    / "results"
+    / "experiments"
+    / "device_method_comparison_n1_n2_n4_cloud"
+    / "figures"
+    / "source_data"
+    / "scalability_metrics.csv"
+)
 OUT = ROOT / "Chencang" / "tmc" / "figs" / "fig8_multi_edge_scalability"
+
+
+def style_axis(ax):
+    ax.grid(axis="y", color="#D9DDE2", linewidth=0.5, zorder=0)
+    ax.set_axisbelow(True)
+    ax.tick_params(axis="both", labelsize=6.5, length=2.8, pad=2)
+    ax.spines["left"].set_color("#252525")
+    ax.spines["bottom"].set_color("#252525")
+    ax.spines["left"].set_linewidth(0.65)
+    ax.spines["bottom"].set_linewidth(0.65)
+
+
+def series(df, block, method):
+    scenario, model, _ = block
+    return (
+        df[
+            (df["scenario_name"] == scenario)
+            & (df["student_model"] == model)
+            & (df["method"] == method)
+        ]
+        .sort_values("edge_count")
+    )
+
+
+def plot_pareto(ax, block, df):
+    for method in METHODS:
+        sub = series(df, block, method)
+        ax.plot(
+            sub["total_upload_mib"],
+            sub["mean_f1"],
+            color=COLORS[method],
+            linewidth=1.15,
+            alpha=0.9,
+            zorder=2,
+        )
+        for _, row in sub.iterrows():
+            ax.plot(
+                row["total_upload_mib"],
+                row["mean_f1"],
+                marker=N_MARKERS[int(row["edge_count"])],
+                markersize=4.0,
+                color=COLORS[method],
+                markeredgecolor="white",
+                markeredgewidth=0.45,
+                linestyle="None",
+                zorder=3,
+            )
+    style_axis(ax)
+    ax.set_xscale("symlog", linthresh=10, linscale=0.8)
+    ax.set_xlim(-20, 6500)
+    ax.set_xticks([0, 10, 100, 1000, 5000])
+    ax.set_xticklabels(["0", "10", "100", "1k", "5k"])
+    ax.set_ylim(0.0, 1.03)
+    ax.set_yticks([0.0, 0.5, 1.0])
+    ax.set_yticklabels(["0", "0.5", "1.0"])
 
 
 def plot_latency_fairness(ax, block, df):
@@ -66,6 +156,8 @@ def plot_latency_fairness(ax, block, df):
 
 def main():
     df = pd.read_csv(DATA)
+    df = df.loc[df["complete_device_set"].astype(str).str.lower().eq("true")].copy()
+    df["method"] = df["method"].replace({"plank_road": "recap"})
     fig, axes = plt.subplots(
         2,
         4,

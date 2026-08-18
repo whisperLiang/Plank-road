@@ -61,10 +61,10 @@ def test_replay_frame_archiver_writes_chunked_zip(tmp_path: Path) -> None:
         },
     )()
     artifacts = collect_edge_artifacts(
-        method="plank_road",
-        run_id="plank_road_camera_001",
+        method="recap",
+        run_id="recap_camera_001",
         edge_id=1,
-        experiment_id="exp_camera_plankroad_vs_baselines_001",
+        experiment_id="exp_camera_recap_vs_baselines_001",
         scenario_slug="camera",
         edge_count=1,
         repeat=1,

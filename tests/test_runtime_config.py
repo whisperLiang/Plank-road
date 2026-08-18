@@ -192,17 +192,17 @@ server:
     ("env_name", "attribute_path", "expected"),
     [
         (
-            "PLANK_ROAD__BASELINE__SURGEON__TRAIN_SAMPLE_COUNT",
+            "RECAP__BASELINE__SURGEON__TRAIN_SAMPLE_COUNT",
             "baseline.SURGEON.train_sample_count",
             3,
         ),
         (
-            "PLANK_ROAD__BASELINE__CATR__TRIGGER_WINDOW_SIZE",
+            "RECAP__BASELINE__CATR__TRIGGER_WINDOW_SIZE",
             "baseline.CATR.trigger_window_size",
             7,
         ),
         (
-            "PLANK_ROAD__SERVER__BASELINES__EKYA__WINDOW_SIZE",
+            "RECAP__SERVER__BASELINES__EKYA__WINDOW_SIZE",
             "server.baselines.Ekya.window_size",
             9,
         ),

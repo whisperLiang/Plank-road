@@ -608,7 +608,7 @@ def _dropped_display_count(raw_dir: Path) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Convert Ekya raw results to existing Plank-road plot inputs."
+        description="Convert Ekya raw results to existing RECAP plot inputs."
     )
     parser.add_argument("--run_id", required=True)
     parser.add_argument("--result_dir", default="./results/cloud", type=Path)

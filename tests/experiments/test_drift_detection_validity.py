@@ -234,7 +234,7 @@ def test_harmful_event_extraction_trigger_cooldown_and_matching() -> None:
 
     triggers = replay_triggers(
         rows,
-        method="plank_road_full",
+        method="recap_full",
         signal_column="mean_full_drift_score_z",
         threshold=1.0,
         trigger_consecutive_windows=1,
@@ -245,7 +245,7 @@ def test_harmful_event_extraction_trigger_cooldown_and_matching() -> None:
 
     edge_triggers = replay_triggers(
         rows,
-        method="plank_road_full",
+        method="recap_full",
         signal_column="mean_full_drift_score_z",
         threshold=1.0,
         trigger_consecutive_windows=1,

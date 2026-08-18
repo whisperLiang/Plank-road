@@ -25,7 +25,7 @@ from tools.experiments.experiment_common import (
     read_csv,
     write_csv,
 )
-from tools.experiments.plot_plank_road_baseline_figures import plot_figures
+from tools.experiments.plot_recap_baseline_figures import plot_figures
 
 
 def _raw_ekya_dir(tmp_path: Path) -> Path:
@@ -46,8 +46,8 @@ def _header(path: Path) -> list[str]:
 
 def _write_existing_normalized_fixture(output_dir: Path) -> None:
     comparison_id = "existing-normalized"
-    run_id = "plank-road-run"
-    method = "plank_road"
+    run_id = "recap-run"
+    method = "recap"
     common = {
         "comparison_id": comparison_id,
         "run_id": run_id,
@@ -936,7 +936,7 @@ def test_ekya_schema_contract_appends_to_existing_normalized_and_plots(
     for filename, fields in CSV_SCHEMAS.items():
         assert _header(combined / filename) == fields
     summary_rows = read_csv(combined / "summary.csv")
-    assert any(row["method"] == "plank_road" for row in summary_rows)
+    assert any(row["method"] == "recap" for row in summary_rows)
     assert any(row["method"] == EKYA_METHOD for row in summary_rows)
 
     report = plot_figures(combined, figures)

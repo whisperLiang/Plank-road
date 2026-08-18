@@ -10,12 +10,12 @@ from typing import Any
 
 ArtifactContent = bytes | str | Path
 
-PLANK_ROAD_METHOD = "plank_road"
+RECAP_METHOD = "recap"
 SURGEON_METHOD = "SURGEON"
 CATR_METHOD = "CATR"
 EKYA_METHOD = "Ekya"
 EXPERIMENT_METHODS: tuple[str, ...] = (
-    PLANK_ROAD_METHOD,
+    RECAP_METHOD,
     SURGEON_METHOD,
     CATR_METHOD,
 )
@@ -413,7 +413,7 @@ def collect_edge_artifacts(
             True,
         ),
         (
-            "metrics.jsonl" if resolved_method != PLANK_ROAD_METHOD else "edge_metrics.jsonl",
+            "metrics.jsonl" if resolved_method != RECAP_METHOD else "edge_metrics.jsonl",
             Path(baseline_metrics_path) if baseline_metrics_path is not None else None,
             True,
         ),

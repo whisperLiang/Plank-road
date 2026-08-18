@@ -1,6 +1,6 @@
-# Plank-Road
+# RECAP
 
-Plank-Road is a multi-edge edge-cloud video analytics system for drift-aware continual learning under resource constraints. It targets low-latency edge inference and on-demand cloud adaptation when bandwidth, edge compute, and privacy-constrained cloud training resources are limited.
+RECAP is a multi-edge edge-cloud video analytics system for drift-aware continual learning under resource constraints. It targets low-latency edge inference and on-demand cloud adaptation when bandwidth, edge compute, and privacy-constrained cloud training resources are limited.
 
 The implementation combines startup-time fixed split planning, structured edge sample caching, a Lyapunov resource-aware trigger, gRPC training bundles, shard-backed feature cache, and split-tail cloud retraining.
 
@@ -86,7 +86,7 @@ Core areas: [grpc_server/training_jobs.py](./grpc_server/training_jobs.py), [grp
 ## Project Structure
 
 ```text
-Plank-road/
+RECAP/
 |-- edge_client.py              # Real edge-device client entry point
 |-- cloud_server.py             # Cloud gRPC server entry point
 |-- config/                     # Runtime YAML/config loaders
@@ -208,7 +208,7 @@ server:
         min_map_gain_to_adopt: 0.0
 ```
 
-The baseline inherits shared experiment settings from the main Plank-Road
+The baseline inherits shared experiment settings from the main RECAP
 configuration: `server.edge_model_name`, `server.golden`, `experiment_run`,
 `server.continual_learning`, `baseline.training`, and
 `baseline.CATR`.
@@ -244,7 +244,7 @@ Useful edge overrides:
 
 ### Real Multi-Device Deployment
 
-The supported Plank-Road topology is one cloud server plus one `edge_client.py` process on each physical edge device. The cloud uses the edge-affine worker pool: every `edge_id` gets a sticky isolated worker process, while GPU admission is controlled by `GpuLeaseManager` using the configured memory threshold, reserve budget, estimated peak memory, active leases, and lease heartbeat TTL. Worker processes bind their local JSON-RPC port before initializing heavy model/runtime objects, and `/health` reports `STARTING`, `READY`, `FAILED`, or `STOPPING` so the cloud can wait, retry on a new endpoint, or shut down cleanly without treating worker startup as a training result.
+The supported RECAP topology is one cloud server plus one `edge_client.py` process on each physical edge device. The cloud uses the edge-affine worker pool: every `edge_id` gets a sticky isolated worker process, while GPU admission is controlled by `GpuLeaseManager` using the configured memory threshold, reserve budget, estimated peak memory, active leases, and lease heartbeat TTL. Worker processes bind their local JSON-RPC port before initializing heavy model/runtime objects, and `/health` reports `STARTING`, `READY`, `FAILED`, or `STOPPING` so the cloud can wait, retry on a new endpoint, or shut down cleanly without treating worker startup as a training result.
 
 All edge devices connect to the same cloud gRPC address, and every edge device must use a unique `edge_id`. Reusing an `edge_id` across physical devices is invalid because the cloud identifies edge state, jobs, worker assignment, and model updates by `edge_id`.
 
@@ -301,7 +301,7 @@ echo quit | nvidia-cuda-mps-control
 
 ### Distributed Baseline Deployment
 
-Baselines are deployed using the same physical edge-cloud topology as Plank-Road, but they are separate comparison methods. Plank-Road itself is not registered as a `baseline_method`.
+Baselines are deployed using the same physical edge-cloud topology as RECAP, but they are separate comparison methods. RECAP itself is not registered as a `baseline_method`.
 
 Before launching a formal experiment, choose one shared run identity for the
 cloud and every edge device. It can be configured once at the top of
@@ -447,12 +447,12 @@ python tools/convert_Ekya_results_to_plot_schema.py --run_id road_n1_r01_Ekya --
 
 ## Experiment Post-processing and Figures
 
-The baseline figure pipeline compares `plank_road`,
+The baseline figure pipeline compares `recap`,
 `SURGEON`, `CATR`, and
 `Ekya`.
 
 Start from
-[configs/experiments/plank_road_baselines_manifest.example.yaml](./configs/experiments/plank_road_baselines_manifest.example.yaml).
+[configs/experiments/recap_baselines_manifest.example.yaml](./configs/experiments/recap_baselines_manifest.example.yaml).
 The formal setup is Rainy/Snowy, all four methods, and 3 to 5 repeats with
 matching frame ranges per scenario.
 
@@ -477,9 +477,9 @@ stages result files locally after shutdown and skips cloud artifact upload.
 Build teacher-supervised F1, normalize logs, and plot:
 
 ```shell
-python tools/experiments/evaluate_plank_road_baseline_teacher_accuracy.py --comparison_dir results/experiments/{experiment_id} --manifest results/experiments/{experiment_id}/manifest.yaml --teacher_model rtdetr_x --device cuda:0 --update_manifest
-python tools/experiments/normalize_plank_road_baseline_logs.py --comparison_dir results/experiments/{experiment_id} --manifest results/experiments/{experiment_id}/manifest.yaml
-python tools/experiments/plot_plank_road_baseline_figures.py --normalized_dir results/experiments/{experiment_id}/normalized --figure_dir results/experiments/{experiment_id}/figures
+python tools/experiments/evaluate_recap_baseline_teacher_accuracy.py --comparison_dir results/experiments/{experiment_id} --manifest results/experiments/{experiment_id}/manifest.yaml --teacher_model rtdetr_x --device cuda:0 --update_manifest
+python tools/experiments/normalize_recap_baseline_logs.py --comparison_dir results/experiments/{experiment_id} --manifest results/experiments/{experiment_id}/manifest.yaml
+python tools/experiments/plot_recap_baseline_figures.py --normalized_dir results/experiments/{experiment_id}/normalized --figure_dir results/experiments/{experiment_id}/figures
 ```
 
 After replacing files under `raw_logs/`, rerun the same three commands. Add
@@ -510,13 +510,13 @@ and is excluded from default plots. Use this only for measurements generated
 outside this repository. Import it explicitly with:
 
 ```shell
-python tools/experiments/merge_external_ekya_results.py --plank_road_summary results/experiments/{experiment_id}/normalized/summary.csv --ekya_csv path/to/external_ekya_results.csv --output results/experiments/{experiment_id}/normalized/summary_with_external_ekya.csv
+python tools/experiments/merge_external_ekya_results.py --recap_summary results/experiments/{experiment_id}/normalized/summary.csv --ekya_csv path/to/external_ekya_results.csv --output results/experiments/{experiment_id}/normalized/summary_with_external_ekya.csv
 ```
 
 Detailed specifications:
 
-- [Experiment design](./docs/experiments/plank_road_baselines_experiment_design.md)
-- [Figure specification](./docs/experiments/plank_road_baselines_plot_spec.md)
+- [Experiment design](./docs/experiments/recap_baselines_experiment_design.md)
+- [Figure specification](./docs/experiments/recap_baselines_plot_spec.md)
 - [External Ekya schema](./docs/experiments/external_ekya_data_schema.md)
 
 ## Testing

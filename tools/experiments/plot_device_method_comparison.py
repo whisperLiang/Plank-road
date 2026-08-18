@@ -18,21 +18,21 @@ import yaml  # noqa: E402
 from matplotlib.lines import Line2D  # noqa: E402
 from matplotlib.patches import Patch  # noqa: E402
 
-METHOD_ORDER = ("plank_road", "SURGEON", "CATR", "Ekya")
+METHOD_ORDER = ("recap", "SURGEON", "CATR", "Ekya")
 METHOD_LABELS = {
-    "plank_road": "Ours",
+    "recap": "Ours",
     "SURGEON": "SURGEON",
     "CATR": "CATR",
     "Ekya": "Ekya",
 }
 METHOD_COLORS = {
-    "plank_road": "#0F4D92",
+    "recap": "#0F4D92",
     "SURGEON": "#B64342",
     "CATR": "#338B8E",
     "Ekya": "#87549A",
 }
 METHOD_MARKERS = {
-    "plank_road": "D",
+    "recap": "D",
     "SURGEON": "o",
     "CATR": "s",
     "Ekya": "^",
@@ -945,7 +945,7 @@ def plot_device_comparison(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Plot device-level and multi-edge comparison figures for Plank-road baselines."
+        description="Plot device-level and multi-edge comparison figures for RECAP baselines."
     )
     parser.add_argument(
         "--experiment_dir",

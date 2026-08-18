@@ -23,11 +23,14 @@ OUT = ROOT / "Chencang" / "tmc" / "figs" / "fig2_split_tail_cost"
 BUCKETS = ["Early25%", "Middle50%", "Late75%"]
 BUCKET_LABELS = ["Early 25%", "Middle 50%", "Late 75%"]
 MODES = ["raw_freeze", "freeze", "split_rebuild", "split_cached"]
+# Keys match the `mode` column of the source CSV; labels use the manuscript's
+# name for the training mode (Partition train), while "split" stays reserved
+# for the boundary position.
 MODE_LABELS = {
     "raw_freeze": "Raw freeze",
     "freeze": "TorchLens freeze",
-    "split_rebuild": "Split rebuild",
-    "split_cached": "Split cached",
+    "split_rebuild": "Partition rebuild",
+    "split_cached": "Partition cached",
 }
 FACES = {
     "raw_freeze": "#F2C1BE",

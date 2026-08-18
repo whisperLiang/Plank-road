@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-root="/home/whisperliang/Plank-road"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+root="${RECAP_PROJECT_ROOT:-$(cd -- "$script_dir/.." && pwd)}"
 edge2_host="nvidia@192.168.66.140"
 cloud_host="whisperliang@192.168.66.205"
-edge2_root="/home/nvidia/Plank-road"
-cloud_root="/home/whisperliang/Plank-road"
+edge2_root="${RECAP_EDGE2_ROOT:-/home/nvidia/Plank-road}"
+cloud_root="${RECAP_CLOUD_ROOT:-$root}"
 ts="20260809"
 total=0
 failed=0
@@ -80,7 +81,7 @@ run_one() {
   local edge1_job="n2_yolo26n_${scenario}_${method_slug}_edge1"
   local edge2_job="n2_yolo26n_${scenario}_${method_slug}_edge2"
   local args="--mode baseline --baseline_method $method"
-  if [[ "$method" == "plank_road" ]]; then args="--mode main"; fi
+  if [[ "$method" == "recap" ]]; then args="--mode main"; fi
   local exp="weather_model_comparison_yolo26n"
   local config="scratch/four_edge_matrix/config_yolo26n.yaml"
   local run_id="${scenario}_n2_r01_${method}"
@@ -182,7 +183,7 @@ run_one() {
 }
 
 run_one rainy Ekya
-run_one snowy plank_road
+run_one snowy recap
 run_one snowy SURGEON
 run_one snowy CATR
 run_one snowy Ekya

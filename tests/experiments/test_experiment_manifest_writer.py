@@ -18,7 +18,7 @@ def test_manifest_writer_merges_methods_edges_and_preserves_notes(tmp_path: Path
     )
     summary = {"video_source": "road.mp4"}
     writer.upsert_edge_run(
-        method="plank_road",
+        method="recap",
         scenario_slug="road",
         edge_count=2,
         repeat=1,
@@ -34,7 +34,7 @@ def test_manifest_writer_merges_methods_edges_and_preserves_notes(tmp_path: Path
         encoding="utf-8",
     )
     writer.upsert_edge_run(
-        method="plank_road",
+        method="recap",
         scenario_slug="road",
         edge_count=2,
         repeat=1,
@@ -68,7 +68,7 @@ def test_manifest_writer_merges_methods_edges_and_preserves_notes(tmp_path: Path
     assert result["repeats"] == [1]
     assert result["edge_ids_by_count"] == {"2": [1, 2]}
     assert result["methods"] == [
-        "plank_road",
+        "recap",
         "SURGEON",
         "CATR",
     ]
@@ -88,7 +88,7 @@ def test_manifest_writer_redacts_remote_video_credentials(tmp_path: Path) -> Non
         log_timezone="UTC",
     )
     writer.upsert_edge_run(
-        method="plank_road",
+        method="recap",
         scenario_slug="north-gate",
         edge_count=1,
         repeat=1,
@@ -117,11 +117,11 @@ def test_manifest_writer_rejects_edge_ids_above_declared_edge_count(
 
     with pytest.raises(ValueError, match="edge_id must be <= edge_count"):
         writer.upsert_edge_run(
-            method="plank_road",
+            method="recap",
             scenario_slug="road",
             edge_count=1,
             repeat=1,
-            run_id="road_n1_r01_plank_road",
+            run_id="road_n1_r01_recap",
             edge_id=2,
             summary={"video_source": "road.mp4"},
         )

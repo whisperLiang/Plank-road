@@ -185,7 +185,7 @@ class EdgeWorkerServiceManager:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Plank-Road edge-affine cloud worker")
+    parser = argparse.ArgumentParser(description="RECAP edge-affine cloud worker")
     parser.add_argument("--edge_id", type=int, required=True)
     parser.add_argument("--worker_id", required=True)
     parser.add_argument("--run_id", default="")
@@ -197,8 +197,8 @@ def main() -> None:
     parser.add_argument("--lazy_cuda_init", default="true")
     args = parser.parse_args()
 
-    os.environ.setdefault("PLANK_ROAD_EDGE_WORKER_ID", str(args.worker_id))
-    os.environ.setdefault("PLANK_ROAD_EDGE_ID", str(args.edge_id))
+    os.environ.setdefault("RECAP_EDGE_WORKER_ID", str(args.worker_id))
+    os.environ.setdefault("RECAP_EDGE_ID", str(args.edge_id))
     manager = EdgeWorkerServiceManager(
         edge_id=args.edge_id,
         worker_id=args.worker_id,

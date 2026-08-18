@@ -1,1 +1,1 @@
-"""Post-processing utilities for Plank-Road experiment results."""
+"""Post-processing utilities for RECAP experiment results."""

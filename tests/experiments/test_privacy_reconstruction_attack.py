@@ -4,7 +4,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from PIL import Image
 
 import model_management.object_detection as object_detection_runtime
 from experiments.privacy_reconstruction_attack.attack_dataset import (
@@ -30,10 +29,6 @@ from experiments.privacy_reconstruction_attack.evaluate_privacy_score import (
 from experiments.privacy_reconstruction_attack.feature_inversion_attack import (
     _optimise_feature_inversion,
     _payload_feature_loss,
-)
-from experiments.privacy_reconstruction_attack.plot_privacy_reconstruction import (
-    plot_compact_reconstruction_grid,
-    plot_reconstruction_grid,
 )
 from experiments.privacy_reconstruction_attack.reconstruction_metrics import object_metrics
 
@@ -289,46 +284,6 @@ def test_evaluate_accepts_generic_attack_dir_and_keeps_drag_csv_alias(tmp_path) 
     assert (output_dir / "per_sample.csv").exists()
     assert (output_dir / "drag_per_sample.csv").exists()
     assert "whitebox_feature_inversion" in (output_dir / "summary_by_score.csv").read_text()
-
-
-def test_plot_reconstruction_grid_reports_empty_inputs(tmp_path) -> None:
-    with pytest.raises(RuntimeError, match="No reconstruction metrics"):
-        plot_reconstruction_grid(tmp_path / "missing_drag", [], tmp_path / "figures")
-
-
-def test_compact_plot_uses_feature_inversion_filename(tmp_path) -> None:
-    attack_dir = tmp_path / "attack"
-    sample_dir = attack_dir / "split_score_0_8" / "sample_a"
-    sample_dir.mkdir(parents=True)
-    write_json(
-        attack_dir / "manifest.json",
-        {
-            "method": "whitebox_feature_inversion",
-            "edge_prefix_parameters": {"model_name": "toy_model"},
-        },
-    )
-    write_json(
-        sample_dir / "metrics.json",
-        {
-            "method": "whitebox_feature_inversion",
-            "split_name": "split_score_0_8",
-            "privacy_leakage_score": 0.8,
-            "SSIM": 0.5,
-            "L_actual": 0.25,
-        },
-    )
-    Image.new("RGB", (8, 8), "white").save(sample_dir / "model_input_reference.png")
-    Image.new("RGB", (8, 8), "gray").save(sample_dir / "recon.png")
-
-    output_dir = tmp_path / "figures"
-    plot_compact_reconstruction_grid(attack_dir, [], output_dir)
-
-    assert (
-        output_dir / "privacy_reconstruction_whitebox_feature_inversion_toy_model.png"
-    ).exists()
-    assert (
-        output_dir / "privacy_reconstruction_whitebox_feature_inversion_toy_model.pdf"
-    ).exists()
 
 
 def test_auto_split_resolver_picks_unique_nearest_candidates() -> None:

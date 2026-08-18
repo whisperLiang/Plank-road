@@ -39,7 +39,7 @@ def _schema_for_tensors(
         schema[str(label)] = BoundaryTensorSpec(
             canonical_id=str(label),
             torchlens_label=str(label),
-            module_path="plank_road_adapter",
+            module_path="recap_adapter",
             op_type="tensor",
             shape=symbolic_shape,
             dtype=tensor.dtype,

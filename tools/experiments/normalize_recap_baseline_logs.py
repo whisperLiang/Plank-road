@@ -1270,7 +1270,7 @@ def _adaptation_event_coalesce_identity(
 ) -> str:
     identity = job_id or window_id
     if (
-        str(row.get("method", "")) == "plank_road"
+        str(row.get("method", "")) == "recap"
         and str(row.get("event_name", "")) == "trigger_decision"
         and identity
     ):
@@ -1482,7 +1482,7 @@ def _derive_adaptation_latency(
             ("trigger_decision", "bundle_built", "feature_rebuild_ms"),
             ("bundle_upload_started", "bundle_upload_done", "upload_ms"),
         ]
-        if method == "plank_road" and not has_explicit_teacher_annotation:
+        if method == "recap" and not has_explicit_teacher_annotation:
             stage_pairs.append(
                 (
                     "bundle_upload_done",
@@ -1969,7 +1969,7 @@ def normalize(comparison_dir: Path, manifest_path: Path | None = None) -> dict[s
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Normalize Plank-road and existing baseline experiment logs."
+        description="Normalize RECAP and existing baseline experiment logs."
     )
     parser.add_argument(
         "--comparison_dir",

@@ -12,7 +12,7 @@ from tools.experiments.experiment_common import (
     read_csv,
     write_csv,
 )
-from tools.experiments.plot_plank_road_baseline_figures import (
+from tools.experiments.plot_recap_baseline_figures import (
     EXPORT_SUFFIXES,
     SCENARIO_ORDER,
     _aggregate_runs_in_frame_bins,
@@ -20,7 +20,7 @@ from tools.experiments.plot_plank_road_baseline_figures import (
 )
 
 METHODS = (
-    "plank_road",
+    "recap",
     "SURGEON",
     "CATR",
     "Ekya",
@@ -298,7 +298,7 @@ def test_fig1_omits_unpaired_trigger_markers(tmp_path: Path) -> None:
             ADAPTATION_FIELDS,
             comparison_id="c",
             run_id="rainy-0-r1",
-            method="plank_road",
+            method="recap",
             edge_id=1,
             scenario_name="Rainy",
             video_slug="rainy",
@@ -336,7 +336,7 @@ def test_fig1_omits_markers_with_conflicting_shared_identities(tmp_path: Path) -
     for row in event_rows:
         if (
             row["scenario_name"] == "Rainy"
-            and row["method"] == "plank_road"
+            and row["method"] == "recap"
             and row["run_id"] == "rainy-0-r1"
             and row["event_name"] == "model_update_applied"
         ):
@@ -362,7 +362,7 @@ def test_fig2_uses_summary_mean_f1_and_mean_training_time(tmp_path: Path) -> Non
     _write_complete_normalized(normalized, repeats=1)
     summary_rows = read_csv(normalized / "summary.csv")
     for row in summary_rows:
-        if row["scenario_name"] == "Snowy" and row["method"] == "plank_road":
+        if row["scenario_name"] == "Snowy" and row["method"] == "recap":
             row["mean_f1"] = "0.91"
             row["mean_training_ms"] = "42000"
             row["mean_adaptation_ms"] = "999000"
@@ -408,7 +408,7 @@ def test_fig3_averages_repeated_component_observations_instead_of_summing(
             LATENCY_FIELDS,
             comparison_id="c",
             run_id="rainy-0-r1",
-            method="plank_road",
+            method="recap",
             edge_id=1,
             scenario_name="Rainy",
             video_slug="rainy",
@@ -434,7 +434,7 @@ def test_fig3_omits_missing_inference_latency_without_skipping_breakdown(
     _write_complete_normalized(normalized, repeats=1)
     summary_rows = read_csv(normalized / "summary.csv")
     for row in summary_rows:
-        if row["scenario_name"] == "Rainy" and row["method"] == "plank_road":
+        if row["scenario_name"] == "Rainy" and row["method"] == "recap":
             row["mean_latency_ms"] = ""
     write_csv(normalized / "summary.csv", SUMMARY_FIELDS, summary_rows)
 

@@ -625,7 +625,7 @@ def test_ekya_summary_records_encoded_upload_bytes(tmp_path: Path) -> None:
     assert summary["source_window_count"] == 2
 
 
-def test_ekya_config_inherits_shared_plank_road_settings() -> None:
+def test_ekya_config_inherits_shared_recap_settings() -> None:
     from config.runtime import RuntimeConfig
 
     runtime = RuntimeConfig()

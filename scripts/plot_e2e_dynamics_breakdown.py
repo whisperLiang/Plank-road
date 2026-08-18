@@ -15,7 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools.experiments.experiment_common import read_csv  # noqa: E402
-from tools.experiments.plot_plank_road_baseline_figures import (  # noqa: E402
+from tools.experiments.plot_recap_baseline_figures import (  # noqa: E402
     _aggregate_runs_in_frame_bins,
     _component_specs,
     _frame_series_by_run,
@@ -37,21 +37,21 @@ BASE_DATA_DIR = (
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "figures"
 SCENARIO = "Rainy"
 MODEL = "RF-DETR Nano"
-METHOD_ORDER = ("plank_road", "SURGEON", "CATR", "Ekya")
+METHOD_ORDER = ("recap", "SURGEON", "CATR", "Ekya")
 METHOD_LABELS = {
-    "plank_road": "Plank-road",
+    "recap": "RECAP",
     "SURGEON": "SURGEON",
     "CATR": "CATR",
     "Ekya": "Ekya",
 }
 METHOD_COLORS = {
-    "plank_road": "#0F4D92",
+    "recap": "#0F4D92",
     "SURGEON": "#8C8C8C",
     "CATR": "#D97706",
     "Ekya": "#8E5AA9",
 }
 METHOD_LINESTYLES = {
-    "plank_road": "-",
+    "recap": "-",
     "SURGEON": (0, (4.0, 2.0)),
     "CATR": (0, (1.5, 1.25)),
     "Ekya": (0, (5.0, 1.5, 1.0, 1.5)),
@@ -72,7 +72,7 @@ COMPONENT_COLORS = {
     "update": "#88B6B0",
 }
 DATA_DIRS = {
-    "plank_road": BASE_DATA_DIR,
+    "recap": BASE_DATA_DIR,
     "SURGEON": BASE_DATA_DIR,
     "CATR": BASE_DATA_DIR,
     "Ekya": BASE_DATA_DIR,
@@ -315,7 +315,7 @@ def plot_figure(
             mean_f1,
             color=METHOD_COLORS[method],
             linestyle=METHOD_LINESTYLES[method],
-            linewidth=1.55 if method == "plank_road" else 1.2,
+            linewidth=1.55 if method == "recap" else 1.2,
             solid_capstyle="round",
         )
     accuracy_axis.set_title(f"{SCENARIO} · {MODEL}", fontweight="bold", pad=4)
@@ -472,7 +472,7 @@ def plot_figure(
             position,
             f"{totals[method]:.1f} s",
             fontsize=6,
-            fontweight="bold" if method == "plank_road" else "normal",
+            fontweight="bold" if method == "recap" else "normal",
             color=METHOD_COLORS[method],
             ha="left",
             va="center",

@@ -16,15 +16,15 @@ Set-Content -LiteralPath (Join-Path $StateDir "orchestrator.pid") -Value $PID -E
 $Cloud = [ordered]@{
     Host = "whisperliang@192.168.66.205"
     Address = "192.168.66.205"
-    Project = "/home/whisperliang/Plank-road"
+    Project = "/home/whisperliang/RECAP"
     Python = ".venv/bin/python"
 }
 
 $Edges = @(
     [ordered]@{ Id = 1; Host = $null; Project = $ProjectRoot; Python = (Join-Path $ProjectRoot ".venv\Scripts\python.exe") },
-    [ordered]@{ Id = 2; Host = "nvidia@192.168.66.140"; Project = "/home/nvidia/Plank-road"; Python = ".venv/bin/python" },
-    [ordered]@{ Id = 3; Host = "nvidia@192.168.66.118"; Project = "/home/nvidia/Plank-road"; Python = ".venv/bin/python" },
-    [ordered]@{ Id = 4; Host = "nvidia@192.168.66.238"; Project = "/home/nvidia/Plank-road"; Python = ".venv/bin/python" }
+    [ordered]@{ Id = 2; Host = "nvidia@192.168.66.140"; Project = "/home/nvidia/RECAP"; Python = ".venv/bin/python" },
+    [ordered]@{ Id = 3; Host = "nvidia@192.168.66.118"; Project = "/home/nvidia/RECAP"; Python = ".venv/bin/python" },
+    [ordered]@{ Id = 4; Host = "nvidia@192.168.66.238"; Project = "/home/nvidia/RECAP"; Python = ".venv/bin/python" }
 )
 
 $Models = @(
@@ -32,7 +32,7 @@ $Models = @(
     [ordered]@{ Name = "rfdetr_nano"; Config = "scratch/four_edge_matrix/config_rfdetr_nano.yaml"; Experiment = "weather_model_comparison_rfdetr_nano_$DeviceSetSlug" }
 )
 $Scenarios = @("rainy", "snowy")
-$Methods = @("plank_road", "SURGEON", "CATR", "Ekya")
+$Methods = @("recap", "SURGEON", "CATR", "Ekya")
 $SshOptions = @("-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3")
 
 function Assert-SafeToken {
@@ -195,7 +195,7 @@ foreach ($model in $Models) {
                 "--experiment_results_root", "results/experiments",
                 "--workspace_root", "./cache/server_workspace/n4/$runName"
             )
-            if ($method -eq "plank_road") {
+            if ($method -eq "recap") {
                 $cloudArgs = $commonCloudArgs + @("--mode", "main")
             }
             else {
@@ -225,7 +225,7 @@ foreach ($model in $Models) {
                         "--repeat", "1",
                         "--experiment_results_root", "./cache/experiment_results"
                     )
-                    if ($method -eq "plank_road") {
+                    if ($method -eq "recap") {
                         $edgeArgs += @("--mode", "main")
                     }
                     else {
@@ -251,7 +251,7 @@ foreach ($model in $Models) {
                     "--repeat", "1",
                     "--experiment_results_root", "./cache/experiment_results"
                 )
-                if ($method -eq "plank_road") {
+                if ($method -eq "recap") {
                     $localArgs += @("--mode", "main")
                 }
                 else {

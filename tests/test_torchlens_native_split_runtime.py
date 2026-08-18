@@ -153,7 +153,7 @@ def _poison_trace_graph_deepcopy(runtime) -> None:
     node = next(iter(runtime.trace_graph.nodes.values()))
     setattr(
         node.layer,
-        "_plank_road_nonleaf_deepcopy_probe",
+        "_recap_nonleaf_deepcopy_probe",
         torch.ones(2, requires_grad=True) * 2,
     )
 

@@ -55,19 +55,19 @@ DEFAULT_VIDEO_PATHS = {
 }
 FRAME_BIN_SIZE = 50
 METHOD_COLORS = {
-    "plank_road": "#0F4D92",
+    "recap": "#0F4D92",
     "SURGEON": "#767676",
     "CATR": "#B64342",
     "Ekya": "#42949E",
 }
 METHOD_MARKERS = {
-    "plank_road": "D",
+    "recap": "D",
     "SURGEON": "o",
     "CATR": "s",
     "Ekya": "^",
 }
 METHOD_LINESTYLES = {
-    "plank_road": "-",
+    "recap": "-",
     "SURGEON": (0, (4.0, 2.0)),
     "CATR": (0, (1.5, 1.25)),
     "Ekya": (0, (5.0, 1.5, 1.0, 1.5)),
@@ -82,7 +82,7 @@ COMPONENT_COLORS = {
     "apply": "#88B6B0",
 }
 FIG3_METHOD_TICK_LABELS = {
-    "plank_road": "Ours",
+    "recap": "Ours",
     "SURGEON": "SURGEON",
     "CATR": "CATR",
     "Ekya": "Ekya",
@@ -959,7 +959,7 @@ def _mean_positive_fields_ms(
 
 
 def _component_specs(method: str) -> list[tuple[str, str, str, tuple[str, ...]]]:
-    if method == "plank_road":
+    if method == "recap":
         return [
             ("transmit", "Ours-Transmit", "transmit", ("upload_ms",)),
             ("label", "Ours-Label", "label", ("teacher_annotation_ms",)),
@@ -1453,7 +1453,7 @@ def plot_figures(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Plot the three Plank-road baseline figures.")
+    parser = argparse.ArgumentParser(description="Plot the three RECAP baseline figures.")
     parser.add_argument("--normalized_dir", required=True, type=Path)
     parser.add_argument("--figure_dir", required=True, type=Path)
     return parser

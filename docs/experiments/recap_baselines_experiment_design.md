@@ -1,4 +1,4 @@
-# Plank-road Baseline Experiment Design
+# RECAP Baseline Experiment Design
 
 Preflight HEAD recorded before this refactor:
 
@@ -10,7 +10,7 @@ Preflight HEAD recorded before this refactor:
 
 The baseline comparison uses four methods:
 
-1. `plank_road` (Ours)
+1. `recap` (Ours)
 2. `SURGEON`
 3. `CATR`
 4. `Ekya`
@@ -74,7 +74,7 @@ Teacher replay accuracy is the preferred accuracy source for these figures.
 Run the evaluator before normalization:
 
 ```bash
-python tools/experiments/evaluate_plank_road_baseline_teacher_accuracy.py \
+python tools/experiments/evaluate_recap_baseline_teacher_accuracy.py \
   --comparison_dir results/experiments/{experiment_id} \
   --manifest results/experiments/{experiment_id}/manifest.yaml \
   --teacher_model rtdetr_x \
@@ -90,11 +90,11 @@ real measured values; detection counts and confidence are not accuracy.
 ## Normalize And Plot
 
 ```bash
-python tools/experiments/normalize_plank_road_baseline_logs.py \
+python tools/experiments/normalize_recap_baseline_logs.py \
   --comparison_dir results/experiments/{experiment_id} \
   --manifest results/experiments/{experiment_id}/manifest.yaml
 
-python tools/experiments/plot_plank_road_baseline_figures.py \
+python tools/experiments/plot_recap_baseline_figures.py \
   --normalized_dir results/experiments/{experiment_id}/normalized \
   --figure_dir results/experiments/{experiment_id}/figures
 ```
@@ -126,7 +126,7 @@ Fig. 3, Average Time Cost for Retraining Breakdown, shows averaged stacked
 retraining-time components on a seconds-scale left axis and mean online
 inference latency from `summary.mean_latency_ms` as right-axis lollipop markers.
 Component definitions are documented in
-`docs/experiments/plank_road_baselines_plot_spec.md`. Unmeasured components or
+`docs/experiments/recap_baselines_plot_spec.md`. Unmeasured components or
 missing inference-latency values are omitted and reported; missing latency or
 accuracy values are not invented.
 
@@ -141,7 +141,7 @@ accuracy values are not invented.
 
 ## Centralized Result Repository
 
-The archive RPC remains separate from Plank-road sample bundles and baseline
+The archive RPC remains separate from RECAP sample bundles and baseline
 frame/window RPCs. It runs only during shutdown, never populates the sample
 pool, never invokes the teacher or training pipeline, and is excluded from
 normalized method communication costs. SURGEON may archive JSON/JSONL result

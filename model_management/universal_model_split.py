@@ -577,7 +577,7 @@ def prepare_exact_split_runtime(
 
 
 class UniversalModelSplitter:
-    """Thin Plank-road facade over TorchLens native SplitRuntime."""
+    """Thin RECAP facade over TorchLens native SplitRuntime."""
 
     def __init__(self, *, device: str | torch.device = "cpu") -> None:
         self.device = torch.device(device)

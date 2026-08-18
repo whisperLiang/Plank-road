@@ -2,7 +2,7 @@ experiment_id: suwon5a_weather
 log_timezone: Asia/Shanghai
 
 methods:
-  - plank_road
+  - recap
   - SURGEON
   - CATR
   - Ekya

@@ -30,8 +30,8 @@ def test_builds_device_and_scalability_metrics(tmp_path: Path) -> None:
     base = {
         "experiment_id": "exp",
         "comparison_id": "exp",
-        "run_id": "rainy_n2_r01_plank_road",
-        "method": "plank_road",
+        "run_id": "rainy_n2_r01_recap",
+        "method": "recap",
         "scenario_name": "rainy",
         "scenario_slug": "rainy",
         "video_slug": "rainy",

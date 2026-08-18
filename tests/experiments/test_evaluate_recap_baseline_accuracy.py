@@ -6,14 +6,14 @@ from pathlib import Path
 import pytest
 import yaml
 
-from tools.experiments.evaluate_plank_road_baseline_accuracy import evaluate_accuracy
+from tools.experiments.evaluate_recap_baseline_accuracy import evaluate_accuracy
 
 METHODS = [
-    "plank_road",
+    "recap",
     "SURGEON",
     "CATR",
 ]
-PLANK_RUN_ID = "road_n1_r01_plank_road"
+PLANK_RUN_ID = "road_n1_r01_recap"
 
 
 def _raw_dir(method: str, kind: str) -> Path:
@@ -166,7 +166,7 @@ def test_evaluator_reports_unlabelled_frames_without_synthesizing_values(
     tmp_path: Path,
 ) -> None:
     comparison_dir = tmp_path / "comparison"
-    edge_path = comparison_dir / _raw_dir("plank_road", "edge_1")
+    edge_path = comparison_dir / _raw_dir("recap", "edge_1")
     edge_path.mkdir(parents=True)
     (edge_path / "latest_inference_results.jsonl").write_text(
         json.dumps(

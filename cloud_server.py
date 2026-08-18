@@ -39,7 +39,7 @@ from cloud.workers.worker_client import GpuLeaseHttpClient
 from cloud.workers.worker_protocol import JsonRpcError
 from common.experiment_results import (
     EKYA_METHOD,
-    PLANK_ROAD_METHOD,
+    RECAP_METHOD,
     ExperimentIdentity,
     cloud_run_dir,
     normalize_scenario_slug,
@@ -59,7 +59,7 @@ def _experiment_method_for(method: str) -> str:
     normalized = str(method or "").strip()
     if normalized == EKYA_METHOD:
         return EKYA_METHOD
-    return normalized or PLANK_ROAD_METHOD
+    return normalized or RECAP_METHOD
 
 
 def _runtime_source(runtime_config) -> object | None:
@@ -285,13 +285,13 @@ class CloudServer:
                     "server.edge_affine_workers.enabled=true; the fixed-split "
                         "runtime path is no longer supported."
                 )
-            self.baseline_method = PLANK_ROAD_METHOD
+            self.baseline_method = RECAP_METHOD
             self.experiment_identity = _create_experiment_identity(
                 experiment_id=experiment_id,
                 scenario=scenario,
                 edge_count=edge_count,
                 repeat=repeat,
-                method=PLANK_ROAD_METHOD,
+                method=RECAP_METHOD,
                 runtime_config=runtime_config,
             )
             self.run_id = self.experiment_identity.run_id
@@ -300,7 +300,7 @@ class CloudServer:
         method = (
             str(getattr(self, "baseline_method", "") or "")
             if self.mode == "baseline"
-            else PLANK_ROAD_METHOD
+            else RECAP_METHOD
         )
         self._init_experiment_results_if_enabled(method=method)
 
@@ -518,7 +518,7 @@ class CloudServer:
                 getattr(identity, "repeat", ""),
                 getattr(experiment_config, "root_dir", ""),
                 self.mode,
-                getattr(self, "baseline_method", PLANK_ROAD_METHOD),
+                getattr(self, "baseline_method", RECAP_METHOD),
                 getattr(self, "run_id", ""),
             )
         log_diagnostic_debug(
@@ -527,7 +527,7 @@ class CloudServer:
             lambda: {"workspace_root": workspace_root},
         )
         experiment_method = _experiment_method_for(
-            getattr(self, "baseline_method", PLANK_ROAD_METHOD)
+            getattr(self, "baseline_method", RECAP_METHOD)
         )
         server = grpc.server(
             futures.ThreadPoolExecutor(max_workers=grpc_max_workers),

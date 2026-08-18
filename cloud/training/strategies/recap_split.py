@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 
-class PlankRoadSplitTrainingStrategy:
-    name = "plank_road_split"
+class RECAPSplitTrainingStrategy:
+    name = "recap_split"
 
     def __init__(self, continual_learner) -> None:
         self.continual_learner = continual_learner

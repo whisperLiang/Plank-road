@@ -8,11 +8,11 @@ import numpy as np
 import pytest
 import yaml
 
-from tools.experiments import evaluate_plank_road_baseline_teacher_accuracy as evaluator
+from tools.experiments import evaluate_recap_baseline_teacher_accuracy as evaluator
 from tools.experiments.experiment_common import ACCURACY_FIELDS
 
 METHOD_RUNS = (
-    ("plank_road", "road-night-rain_n1_r01_plank_road"),
+    ("recap", "road-night-rain_n1_r01_recap"),
     ("SURGEON", "road-night-rain_n1_r01_SURGEON"),
     (
         "CATR",
@@ -119,7 +119,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path]:
             encoding="utf-8",
         )
     manifest = {
-        "experiment_id": "exp_road_night_rain_plankroad_vs_baselines_001",
+        "experiment_id": "exp_road_night_rain_recap_vs_baselines_001",
         "log_timezone": "UTC",
         "methods": [method for method, _run_id in METHOD_RUNS],
         "student_model": "custom-student",

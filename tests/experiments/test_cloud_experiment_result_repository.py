@@ -12,7 +12,7 @@ from cloud.experiment_result_repository import (
 )
 from grpc_server import message_transmission_pb2
 from tools.experiments.experiment_common import read_csv
-from tools.experiments.normalize_plank_road_baseline_logs import normalize
+from tools.experiments.normalize_recap_baseline_logs import normalize
 
 
 def _request(
@@ -22,7 +22,7 @@ def _request(
     edge_count: int = 1,
     repeat: int = 1,
     run_id: str = "run-1",
-    method: str = "plank_road",
+    method: str = "recap",
     edge_id: int = 1,
     relative_path: str = "latest_inference_results.jsonl",
     content: bytes = b'{"frame_index": 1}\n',
@@ -57,7 +57,7 @@ def _request(
 @pytest.mark.parametrize(
     "method",
     [
-        "plank_road",
+        "recap",
         "SURGEON",
         "CATR",
         "Ekya",
@@ -128,7 +128,7 @@ def test_repository_preserves_skipped_metadata_from_client_manifest(
         tmp_path
         / "comparison"
         / "raw_logs"
-        / "road_n1_r01_plank_road"
+        / "road_n1_r01_recap"
         / "edge_1"
         / "uploaded_artifacts_manifest.json"
     )
@@ -201,7 +201,7 @@ def test_repository_uses_edge_summary_to_update_manifest(tmp_path: Path) -> None
     manifest = writer.manifest_path.read_text(encoding="utf-8")
     assert "scenario_name: road" in manifest
     assert "edge_ids_by_count:" in manifest
-    assert "method=plank_road" not in manifest
+    assert "method=recap" not in manifest
 
 
 def test_auto_repository_layout_normalizes_without_manual_log_copy(
@@ -219,7 +219,7 @@ def test_auto_repository_layout_normalizes_without_manual_log_copy(
         manifest_writer=writer,
     )
     runs = (
-        ("plank_road", "main-r1"),
+        ("recap", "main-r1"),
         ("SURGEON", "pure-r1"),
         ("CATR", "accuracy-r1"),
     )

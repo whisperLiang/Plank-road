@@ -168,7 +168,7 @@ def _draw_timeline(
         _float(row.get("frame"))
         for row in trigger_rows
         if str(row.get("sequence_name")) == REAL_WEATHER_SEQUENCE
-        and str(row.get("method")) == "plank_road_full"
+        and str(row.get("method")) == "recap_full"
         and str(row.get("kind")) != "missed"
     ]
     for trigger in triggers:
@@ -206,7 +206,7 @@ def _draw_timeline(
 
 
 def _draw_trigger_metric_bars(ax: Any, summary_rows: Sequence[Mapping[str, Any]]) -> None:
-    rows = sorted(summary_rows, key=lambda row: str(row.get("method")) == "plank_road_full")
+    rows = sorted(summary_rows, key=lambda row: str(row.get("method")) == "recap_full")
     methods = [_method_label(row.get("method")) for row in rows]
     y = np.arange(len(rows))
     height = 0.22

@@ -1,14 +1,14 @@
 # Privacy Reconstruction Attack Offline Experiment
 
 This directory contains an isolated offline experiment for measuring whether
-Plank-road privacy leakage scores correspond to actual reconstruction leakage.
+RECAP privacy leakage scores correspond to actual reconstruction leakage.
 It does not modify online inference, continual-learning training, or baseline
 scheduling.
 
 The experiment evaluates split points with target privacy leakage scores
 `0.8`, `0.6`, `0.4`, and `0.2`. When a split point is set to `auto`, the target
 collector enumerates TorchLens split candidates and selects the nearest unique
-candidate using Plank-road's existing score definition:
+candidate using RECAP's existing score definition:
 
 ```text
 privacy_leakage_score = 1 - edge_parameter_ratio
@@ -79,11 +79,10 @@ python experiments/privacy_reconstruction_attack/evaluate_privacy_score.py \
   --attack_dir ./outputs/privacy_reconstruction/feature_inversion \
   --output_dir ./outputs/privacy_reconstruction/results
 
-# 4. Plot figures
-python experiments/privacy_reconstruction_attack/plot_privacy_reconstruction.py \
-  --results_dir ./outputs/privacy_reconstruction/results \
-  --attack_dir ./outputs/privacy_reconstruction/feature_inversion \
-  --output_dir ./outputs/privacy_reconstruction/figures
+# 4. Plot the manuscript figure (Figure 9)
+python experiments/privacy_reconstruction_attack/plot_attack_comparison_paper.py \
+  --results-root ./outputs/privacy_reconstruction \
+  --output-dir ./outputs/privacy_reconstruction/figures
 ```
 
 ## Outputs

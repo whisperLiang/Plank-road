@@ -1,2 +1,2 @@
-"""Offline experiment modules for Plank-road."""
+"""Offline experiment modules for RECAP."""
 

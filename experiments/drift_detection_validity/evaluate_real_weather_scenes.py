@@ -585,7 +585,7 @@ def _save_drift_detection_plot(
         marker="o",
         markersize=4,
         linewidth=1.6,
-        label="Plank-road full score (z)",
+        label="RECAP full score (z)",
     )
     score_ax.axhline(
         threshold,
@@ -677,7 +677,7 @@ def _write_html_report(
                 ".note{color:#5a626d;font-size:14px;line-height:1.5}",
                 "</style></head><body>",
                 "<h1>Suwon #5a real weather scene test</h1>",
-                "<p class=\"note\">All frames are sampled from real videos. Detection metrics compare the student detector against teacher pseudo-labels at IoU=0.5. Drift metrics use the rainy scene as the clean baseline, label harmful windows by teacher-pseudo-label F1 drop, and evaluate Plank-road signals without using teacher predictions at trigger time.</p>",
+                "<p class=\"note\">All frames are sampled from real videos. Detection metrics compare the student detector against teacher pseudo-labels at IoU=0.5. Drift metrics use the rainy scene as the clean baseline, label harmful windows by teacher-pseudo-label F1 drop, and evaluate RECAP signals without using teacher predictions at trigger time.</p>",
                 f"<img src=\"{html.escape(relative(summary_plot))}\" alt=\"summary plot\">",
                 (
                     f"<img src=\"{html.escape(relative(drift_plot))}\" alt=\"drift detection plot\">"

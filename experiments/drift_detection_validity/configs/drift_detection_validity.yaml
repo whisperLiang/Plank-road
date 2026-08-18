@@ -34,7 +34,7 @@ models:
 split_boundary:
   enabled: true
   split_point: null
-  require_plank_road_split_runtime: true
+  require_recap_split_runtime: true
 
 window:
   size: 8

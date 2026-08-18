@@ -739,7 +739,7 @@ def _validate_candidate(
     splitter: UniversalModelSplitter,
     sample_input: Any,
 ) -> bool:
-    """Validate a candidate through the Plank-road split facade."""
+    """Validate a candidate through the RECAP split facade."""
     del sample_input
     if not hasattr(splitter, "validate_candidate"):
         return True

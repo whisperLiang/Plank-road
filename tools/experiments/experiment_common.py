@@ -14,7 +14,7 @@ import yaml
 from common.experiment_results import (
     CATR_METHOD,
     EKYA_METHOD,
-    PLANK_ROAD_METHOD,
+    RECAP_METHOD,
     SURGEON_METHOD,
     ExperimentIdentity,
     normalize_edge_count,
@@ -30,20 +30,21 @@ from config.baseline import (
 )
 
 METHODS = (
-    PLANK_ROAD_METHOD,
+    RECAP_METHOD,
     SURGEON_METHOD,
     CATR_METHOD,
 )
+LEGACY_RECAP_METHOD = "plank_road"
 OPTIONAL_METHODS = (EKYA_METHOD,)
 SUPPORTED_METHODS = (*METHODS, *OPTIONAL_METHODS)
 METHOD_ORDER = (
-    PLANK_ROAD_METHOD,
+    RECAP_METHOD,
     SURGEON_METHOD,
     CATR_METHOD,
     EKYA_METHOD,
 )
 METHOD_LABELS = {
-    PLANK_ROAD_METHOD: "Ours",
+    RECAP_METHOD: "Ours",
     **{method: baseline_method_label(method) for method in ALLOWED_BASELINE_METHODS},
 }
 
@@ -344,19 +345,21 @@ def load_manifest(path: Path) -> dict[str, Any]:
     manifest["log_timezone"] = log_timezone
     raw_methods = list(manifest.get("methods") or [])
     methods: list[str] = []
+    storage_methods: list[str] = []
     try:
         for method in raw_methods:
             value = str(method or "").strip()
-            methods.append(
-                PLANK_ROAD_METHOD
-                if value == PLANK_ROAD_METHOD
-                else validate_baseline_method(value)
-            )
+            if value in {RECAP_METHOD, LEGACY_RECAP_METHOD}:
+                methods.append(RECAP_METHOD)
+                storage_methods.append(value)
+            else:
+                methods.append(validate_baseline_method(value))
+                storage_methods.append(value)
     except ValueError as exc:
         raise ManifestError(str(exc)) from exc
     if not methods or len(set(methods)) != len(methods):
         raise ManifestError(
-            "methods must be unique and use: plank_road, SURGEON, CATR, or Ekya"
+            "methods must be unique and use: recap, SURGEON, CATR, or Ekya"
         )
     manifest["methods"] = methods
     scenarios = manifest.get("scenarios")
@@ -452,7 +455,15 @@ def load_manifest(path: Path) -> dict[str, Any]:
         for edge_count in edge_counts:
             edge_ids = edge_ids_by_count[str(edge_count)]
             for repeat in repeats:
-                for method in methods:
+                for method, storage_method in zip(
+                    methods,
+                    storage_methods,
+                    strict=True,
+                ):
+                    storage_run_id = (
+                        f"{scenario['scenario_slug']}_n{edge_count}_"
+                        f"r{repeat:02d}_{storage_method}"
+                    )
                     try:
                         identity = ExperimentIdentity.create(
                             experiment_id=experiment_id,
@@ -460,6 +471,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
                             edge_count=edge_count,
                             repeat=repeat,
                             method=method,
+                            run_id=storage_run_id,
                         )
                     except ValueError as exc:
                         raise ManifestError(str(exc)) from exc
@@ -467,7 +479,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
                         raise ManifestError(
                             f"generated run_id is not unique: {identity.run_id!r}"
                         )
-                    raw_base = identity.raw_logs_relative_dir().as_posix()
+                    raw_base = (Path("raw_logs") / identity.run_id).as_posix()
                     edge_paths = {
                         str(edge_id): f"{raw_base}/edge_{edge_id}" for edge_id in edge_ids
                     }

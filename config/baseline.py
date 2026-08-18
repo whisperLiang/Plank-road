@@ -18,17 +18,17 @@ BASELINE_METHOD_LABELS: dict[str, str] = {
     EKYA_METHOD: "Ekya",
 }
 
-_PLANK_ROAD_BASELINE_METHOD = "plank_road" + "_multi_device"
-PLANK_ROAD_BASELINE_ERROR = (
-    f"{_PLANK_ROAD_BASELINE_METHOD} is not a baseline method. "
-    "Use the main Plank-Road distributed deployment path instead."
+_RECAP_BASELINE_METHOD = "recap" + "_multi_device"
+RECAP_BASELINE_ERROR = (
+    f"{_RECAP_BASELINE_METHOD} is not a baseline method. "
+    "Use the main RECAP distributed deployment path instead."
 )
 
 
 def validate_baseline_method(method: str) -> str:
     value = str(method or "").strip()
-    if value == _PLANK_ROAD_BASELINE_METHOD:
-        raise ValueError(PLANK_ROAD_BASELINE_ERROR)
+    if value == _RECAP_BASELINE_METHOD:
+        raise ValueError(RECAP_BASELINE_ERROR)
     if value not in ALLOWED_BASELINE_METHODS:
         raise ValueError(
             f"Unknown baseline method {value!r}. "

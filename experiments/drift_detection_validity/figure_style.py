@@ -31,14 +31,14 @@ METHOD_LABELS = {
     "confidence_only": "Confidence",
     "ema_entropy": "EMA entropy",
     "ema_feature_deviation": "Feature EMA",
-    "plank_road_full": "Plank-road full",
+    "recap_full": "RECAP full",
 }
 
 METHOD_COLORS = {
     "confidence_only": "#B4C0E4",
     "ema_entropy": "#7884B4",
     "ema_feature_deviation": "#42949E",
-    "plank_road_full": "#0F4D92",
+    "recap_full": "#0F4D92",
 }
 
 SIGNAL_LABELS = {

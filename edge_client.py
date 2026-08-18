@@ -20,7 +20,7 @@ from baselines.runtime import BaselineEdgeAdapter
 from baselines.runtime.upload_client import encode_frame_for_raw_upload
 from common.experiment_results import (
     EKYA_METHOD,
-    PLANK_ROAD_METHOD,
+    RECAP_METHOD,
     SURGEON_METHOD,
     ExperimentIdentity,
     ExperimentJsonlWriter,
@@ -1234,7 +1234,7 @@ if __name__ == "__main__":
     method = (
         _experiment_method_for_runtime(baseline_method)
         if args.mode == "baseline"
-        else PLANK_ROAD_METHOD
+        else RECAP_METHOD
     )
     video_identity = _resolve_video_identity(config)
     experiment_identity = _create_experiment_identity(
@@ -1392,7 +1392,7 @@ if __name__ == "__main__":
     result_path = run_dir / "latest_inference_results.jsonl"
     experiment_metrics = (
         ExperimentJsonlWriter(run_dir / "edge_metrics.jsonl")
-        if method == PLANK_ROAD_METHOD and bool(experiment_results.enabled)
+        if method == RECAP_METHOD and bool(experiment_results.enabled)
         else None
     )
     config.experiment_metrics_writer = experiment_metrics

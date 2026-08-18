@@ -171,7 +171,7 @@ class BaselineEdgeAdapter:
                 self.training_strategy,
                 self.trainable_param_ratio,
             )
-        logger.info("[EdgeVideo] using shared Plank-Road inference/display loop")
+        logger.info("[EdgeVideo] using shared RECAP inference/display loop")
 
     def on_sampled_inference_result(
         self,

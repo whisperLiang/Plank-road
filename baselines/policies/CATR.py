@@ -6,8 +6,8 @@ from baselines.policies.base_policy import BaseBaselinePolicy, BaselineFrameDeci
 class AccuracyTriggerCloudRetrainingPolicy(BaseBaselinePolicy):
     def __init__(self, config: object | None = None) -> None:
         super().__init__("CATR", config)
-        self.reuse_plank_road_frame_filter = bool(
-            getattr(config, "reuse_plank_road_frame_filter", True)
+        self.reuse_recap_frame_filter = bool(
+            getattr(config, "reuse_recap_frame_filter", True)
         )
         self.upload_keyframes_only = bool(getattr(config, "upload_keyframes_only", True))
         self.trigger_on_cloud_comparison = bool(
@@ -18,7 +18,7 @@ class AccuracyTriggerCloudRetrainingPolicy(BaseBaselinePolicy):
 
     @property
     def frame_filter_enabled(self) -> bool:
-        return self.reuse_plank_road_frame_filter
+        return self.reuse_recap_frame_filter
 
     @property
     def training_strategy(self) -> str:

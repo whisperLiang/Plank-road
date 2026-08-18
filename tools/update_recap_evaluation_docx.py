@@ -1,4 +1,4 @@
-"""Rebuild the evaluation section of ``plank-road.docx`` from measured results.
+"""Rebuild the evaluation section of ``recap.docx`` from measured results.
 
 The script preserves the source document and writes a separate revised DOCX.
 It intentionally reports single-run and case-study limitations instead of
@@ -18,8 +18,8 @@ from docx.oxml.ns import qn
 from docx.shared import Inches, Pt
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = ROOT / "plank-road.docx"
-OUTPUT = ROOT / "plank-road-evaluation-revised.docx"
+SOURCE = ROOT / "recap.docx"
+OUTPUT = ROOT / "recap-evaluation-revised.docx"
 
 RAINY_TRADEOFF = (
     ROOT
@@ -174,11 +174,11 @@ def _add_main_results_table(document: Document, anchor) -> None:
 
     headers = ("场景", "方法", "F1↑", "训练(s)↓", "延迟(ms)↓")
     rows = (
-        ("雨天", "Plank-road", "0.702", "71.13", "206.61"),
+        ("雨天", "RECAP", "0.702", "71.13", "206.61"),
         ("雨天", "SURGEON", "0.474", "769.33", "342.93"),
         ("雨天", "CATR", "0.648", "262.86", "327.20"),
         ("雨天", "Ekya", "0.680", "206.26", "247.64"),
-        ("雪天", "Plank-road", "0.693", "69.12", "81.65"),
+        ("雪天", "RECAP", "0.693", "69.12", "81.65"),
         ("雪天", "SURGEON", "0.621", "350.82", "412.69"),
         ("雪天", "CATR", "0.623", "176.10", "85.93"),
         ("雪天", "Ekya", "0.638", "134.77", "243.71"),
@@ -223,13 +223,13 @@ def _add_main_results_table(document: Document, anchor) -> None:
             cell.width = width
             cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
             _set_cell_margins(cell)
-            if value == "Plank-road":
+            if value == "RECAP":
                 _shade_cell(cell, "EDF5FB")
             paragraph = cell.paragraphs[0]
             paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
             paragraph.paragraph_format.space_after = Pt(0)
             run = paragraph.add_run(value)
-            _set_run_font(run, 6.7, bold=(value == "Plank-road"))
+            _set_run_font(run, 6.7, bold=(value == "RECAP"))
 
     _set_table_borders(table)
     _move_before(table._tbl, anchor)
@@ -267,12 +267,12 @@ def build() -> Path:
     _add_paragraph(
         document,
         discussion,
-        "表XX汇总了端到端主实验。在雨天场景中，Plank-road 的教师监督 F1 为 0.702，分别比 Ekya、CATR 和 SURGEON 高 0.021、0.054 和 0.228。其平均训练时间为 71.13 s，相比三种基线分别减少 65.5%、72.9% 和 90.8%；平均在线推理时延为 206.61 ms，分别降低 16.6%、36.9% 和 39.8%。因此，在该次雨天运行中，Plank-road 位于更高 F1 和更低训练时间构成的优势区域。",
+        "表XX汇总了端到端主实验。在雨天场景中，RECAP 的教师监督 F1 为 0.702，分别比 Ekya、CATR 和 SURGEON 高 0.021、0.054 和 0.228。其平均训练时间为 71.13 s，相比三种基线分别减少 65.5%、72.9% 和 90.8%；平均在线推理时延为 206.61 ms，分别降低 16.6%、36.9% 和 39.8%。因此，在该次雨天运行中，RECAP 位于更高 F1 和更低训练时间构成的优势区域。",
     )
     _add_paragraph(
         document,
         discussion,
-        "雪天场景呈现相同趋势。Plank-road 的教师监督 F1 为 0.693，比 Ekya、CATR 和 SURGEON 分别高 0.055、0.071 和 0.072；平均训练时间为 69.12 s，分别减少 48.7%、60.7% 和 80.3%。其平均在线推理时延为 81.65 ms，是四种方法中的最低值，相比 CATR、Ekya 和 SURGEON 分别降低 5.0%、66.5% 和 80.2%。这些结果表明，在两个已完成的真实天气运行中，切分尾部训练能够以较短的更新周期维持较高的教师一致性。",
+        "雪天场景呈现相同趋势。RECAP 的教师监督 F1 为 0.693，比 Ekya、CATR 和 SURGEON 分别高 0.055、0.071 和 0.072；平均训练时间为 69.12 s，分别减少 48.7%、60.7% 和 80.3%。其平均在线推理时延为 81.65 ms，是四种方法中的最低值，相比 CATR、Ekya 和 SURGEON 分别降低 5.0%、66.5% 和 80.2%。这些结果表明，在两个已完成的真实天气运行中，切分尾部训练能够以较短的更新周期维持较高的教师一致性。",
     )
     _add_main_results_table(document, discussion)
     _add_picture(
@@ -290,14 +290,14 @@ def build() -> Path:
     _add_paragraph(
         document,
         discussion,
-        "通信与数据暴露结果进一步刻画了这种权衡。雨天运行中，Plank-road 的平均上传量为 6.80 MB，低于 CATR 的 13.10 MB 和 Ekya 的 14.73 MB；雪天运行中相应数值为 3.83、4.01 和 10.27 MB。Plank-road 的原始帧暴露比例在雨天和雪天分别为 0.933 和 0.889，低于两个云端基线的 1.0，但仍接近完全暴露。这说明系统减少了部分原始帧传输，却没有消除教师标注所需的原始数据；隐私收益应与后续重建攻击实验结合解释。",
+        "通信与数据暴露结果进一步刻画了这种权衡。雨天运行中，RECAP 的平均上传量为 6.80 MB，低于 CATR 的 13.10 MB 和 Ekya 的 14.73 MB；雪天运行中相应数值为 3.83、4.01 和 10.27 MB。RECAP 的原始帧暴露比例在雨天和雪天分别为 0.933 和 0.889，低于两个云端基线的 1.0，但仍接近完全暴露。这说明系统减少了部分原始帧传输，却没有消除教师标注所需的原始数据；隐私收益应与后续重建攻击实验结合解释。",
     )
 
     _add_paragraph(document, discussion, "动态适应与资源触发行为", "Heading 2")
     _add_paragraph(
         document,
         discussion,
-        "在雨天运行中，Plank-road 记录了 14 次触发决策、17 个训练作业和 12 次已应用模型更新；雪天运行中相应为 8、13 和 6。用于绘图的事件配对规则仅保留能够与后续模型更新对应的触发，其中两个场景均有 2 次未配对触发被明确报告而未绘制。相比之下，CATR 在雨天/雪天分别应用 4/2 次更新，Ekya 为 1/1 次，SURGEON 为 1/1 次。该结果显示 Plank-road 采用了更细粒度的尾部更新，并能够延后或取消部分尚未形成更新闭环的触发；但现有结果没有包含去除 Lyapunov 队列的端到端消融，因此不能仅凭这些计数将全部收益归因于资源队列控制。",
+        "在雨天运行中，RECAP 记录了 14 次触发决策、17 个训练作业和 12 次已应用模型更新；雪天运行中相应为 8、13 和 6。用于绘图的事件配对规则仅保留能够与后续模型更新对应的触发，其中两个场景均有 2 次未配对触发被明确报告而未绘制。相比之下，CATR 在雨天/雪天分别应用 4/2 次更新，Ekya 为 1/1 次，SURGEON 为 1/1 次。该结果显示 RECAP 采用了更细粒度的尾部更新，并能够延后或取消部分尚未形成更新闭环的触发；但现有结果没有包含去除 Lyapunov 队列的端到端消融，因此不能仅凭这些计数将全部收益归因于资源队列控制。",
     )
 
     _add_paragraph(document, discussion, "切分尾部训练消融", "Heading 2")
@@ -322,7 +322,7 @@ def build() -> Path:
     _add_paragraph(
         document,
         discussion,
-        "漂移有效性实验从晴天、雨天和雪天视频中各均匀采样 24 帧，并使用同帧 RT-DETR-X 伪标签进行离线评价。学生—教师微平均 F1 从晴天的 0.795 降至雨天的 0.562 和雪天的 0.497，表明恶劣天气造成了可观测的检测一致性退化。在 9 个窗口上，完整无标签漂移分数与 F1 下降的 Pearson 和 Spearman 相关系数分别为 0.948 和 0.812；输出熵、边界特征偏移及其指数滑动统计在该组窗口上的 ROC-AUC 和 PR-AUC 均为 1.0。在线回放中，完整 Plank-road 信号检测到唯一的有害漂移事件，未出现误触发，并在配置的容忍窗口内实现 0 帧延迟；仅使用置信度的基线虽然召回该事件，但产生 1 次误触发，触发 F1 为 0.667。",
+        "漂移有效性实验从晴天、雨天和雪天视频中各均匀采样 24 帧，并使用同帧 RT-DETR-X 伪标签进行离线评价。学生—教师微平均 F1 从晴天的 0.795 降至雨天的 0.562 和雪天的 0.497，表明恶劣天气造成了可观测的检测一致性退化。在 9 个窗口上，完整无标签漂移分数与 F1 下降的 Pearson 和 Spearman 相关系数分别为 0.948 和 0.812；输出熵、边界特征偏移及其指数滑动统计在该组窗口上的 ROC-AUC 和 PR-AUC 均为 1.0。在线回放中，完整 RECAP 信号检测到唯一的有害漂移事件，未出现误触发，并在配置的容忍窗口内实现 0 帧延迟；仅使用置信度的基线虽然召回该事件，但产生 1 次误触发，触发 F1 为 0.667。",
     )
     _add_picture(
         document,
@@ -363,7 +363,7 @@ def build() -> Path:
     _add_paragraph(
         document,
         discussion,
-        "综合现有结果，Plank-road 在雨天和雪天的单次端到端运行中同时获得了最高教师监督 F1、最短平均训练时间和较低在线推理时延；五次重复的尾部训练消融进一步表明，缓存边界特征能够在大体保持代理 mAP 增量的同时缩短训练时间。漂移回放和重建攻击则分别验证了无标签漂移信号与有害性能下降的对应关系，以及深层特征降低可恢复语义的可行性。当前证据尚未覆盖主对比的多次重复、多摄像头并发、不同带宽/云端负载下的 Lyapunov 参数消融，也未形成大样本隐私攻击统计；这些结果应在后续实验中补充后再用于显著性、可扩展性或普遍隐私保证的结论。",
+        "综合现有结果，RECAP 在雨天和雪天的单次端到端运行中同时获得了最高教师监督 F1、最短平均训练时间和较低在线推理时延；五次重复的尾部训练消融进一步表明，缓存边界特征能够在大体保持代理 mAP 增量的同时缩短训练时间。漂移回放和重建攻击则分别验证了无标签漂移信号与有害性能下降的对应关系，以及深层特征降低可恢复语义的可行性。当前证据尚未覆盖主对比的多次重复、多摄像头并发、不同带宽/云端负载下的 Lyapunov 参数消融，也未形成大样本隐私攻击统计；这些结果应在后续实验中补充后再用于显著性、可扩展性或普遍隐私保证的结论。",
     )
 
     document.core_properties.modified = datetime.now()

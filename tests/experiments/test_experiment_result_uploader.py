@@ -113,7 +113,7 @@ def test_uploader_sends_client_manifest_when_it_contains_skipped_metadata(
     assert uploader.upload_run_artifacts(
         **IDENTITY,
         run_id="run-1",
-        method="plank_road",
+        method="recap",
         edge_id=1,
         artifacts={
             "edge_summary.json": b"{}\n",
@@ -152,7 +152,7 @@ def test_uploader_failure_is_reported_without_raising(monkeypatch) -> None:
     assert not uploader.upload_run_artifacts(
         **IDENTITY,
         run_id="run-1",
-        method="plank_road",
+        method="recap",
         edge_id=1,
         artifacts={"latest_inference_results.jsonl": b"{}\n"},
     )
@@ -193,7 +193,7 @@ def test_uploader_reads_path_backed_artifact_when_it_is_sent(
     assert uploader.upload_run_artifacts(
         **IDENTITY,
         run_id="run-1",
-        method="plank_road",
+        method="recap",
         edge_id=1,
         artifacts={archive.name: archive},
     )
@@ -209,7 +209,7 @@ def test_collect_artifacts_records_oversized_file_without_uploading_it(
     inference.write_bytes(b"12345")
     (run_dir / "edge_summary.json").write_text("{}", encoding="utf-8")
     artifacts = collect_edge_artifacts(
-        method="plank_road",
+        method="recap",
         run_id="run-1",
         edge_id=1,
         **IDENTITY,

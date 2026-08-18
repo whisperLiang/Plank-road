@@ -306,7 +306,7 @@ class PureEdgeBaselineConfig(ConfigSection):
 
 @dataclass
 class AccuracyTriggerBaselineConfig(ConfigSection):
-    reuse_plank_road_frame_filter: bool = True
+    reuse_recap_frame_filter: bool = True
     upload_keyframes_only: bool = True
     trigger_on_cloud_comparison: bool = True
     training_strategy: str = "freeze"
@@ -740,7 +740,7 @@ def _section(section_cls, value: Mapping[str, Any] | None):
 
 def _apply_env_overrides(raw_config: Mapping[str, Any]) -> dict[str, Any]:
     merged = copy.deepcopy(dict(raw_config))
-    prefix = "PLANK_ROAD__"
+    prefix = "RECAP__"
     for env_name, raw_value in os.environ.items():
         if not env_name.startswith(prefix):
             continue

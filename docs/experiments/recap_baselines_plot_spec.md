@@ -1,9 +1,9 @@
-# Plank-road Baseline Plot Specification
+# RECAP Baseline Plot Specification
 
 The main paper baseline plotting command emits exactly three figure sets, each
 as SVG, PDF, TIFF, and PNG. The figures compare the same method order:
 
-1. `plank_road` (Ours)
+1. `recap` (Ours)
 2. `SURGEON`
 3. `CATR`
 4. `Ekya`
@@ -43,7 +43,7 @@ they do not obscure the accuracy curves. The plotter pairs each
 `model_update_applied` event to a preceding `trigger_decision`, connects the
 pair as one adaptation interval, then draws the trigger with a triangle marker
 and the update with a star marker. Unpaired trigger or update events are omitted
-from the marker layer and reported as partial data. For Plank-road, repeated
+from the marker layer and reported as partial data. For RECAP, repeated
 `trigger_decision=True` rows are not shown unless they are paired to a later
 model update.
 

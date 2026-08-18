@@ -54,7 +54,7 @@ baseline:
   max_entropy_margin_ratio: 0.7
  CATR:
   # Engineering variant for this refactor: this reuses the existing
-  # Plank-Road frame filter as the keyframe selector, while training
+  # RECAP frame filter as the keyframe selector, while training
   # trigger decisions are strictly cloud-side CATR decisions.
   # Number of source video frames per fixed trigger window.
   # Filtering only affects how many keyframes are uploaded inside this

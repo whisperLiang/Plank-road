@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-root="/home/whisperliang/Plank-road"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+root="${RECAP_PROJECT_ROOT:-$(cd -- "$script_dir/.." && pwd)}"
 edge2_host="nvidia@192.168.66.140"
 cloud_host="whisperliang@192.168.66.205"
-edge2_root="/home/nvidia/Plank-road"
-cloud_root="/home/whisperliang/Plank-road"
+edge2_root="${RECAP_EDGE2_ROOT:-/home/nvidia/Plank-road}"
+cloud_root="${RECAP_CLOUD_ROOT:-$root}"
 ts="20260808"
 total=0
 failed=0
@@ -59,7 +60,7 @@ run_one() {
   local edge2_job="n2_${model}_${scenario}_${method_slug}_edge2"
   local exp="weather_model_comparison_${model}"
   local baseline_args=("--mode" "baseline" "--baseline_method" "$method")
-  if [[ "$method" == "plank_road" ]]; then
+  if [[ "$method" == "recap" ]]; then
     baseline_args=("--mode" "main")
   fi
 
@@ -167,16 +168,16 @@ run_one() {
 
 run_one rfdetr_nano rainy CATR scratch/four_edge_matrix/config_rfdetr_nano.yaml
 run_one rfdetr_nano rainy Ekya scratch/four_edge_matrix/config_rfdetr_nano.yaml
-run_one rfdetr_nano snowy plank_road scratch/four_edge_matrix/config_rfdetr_nano.yaml
+run_one rfdetr_nano snowy recap scratch/four_edge_matrix/config_rfdetr_nano.yaml
 run_one rfdetr_nano snowy SURGEON scratch/four_edge_matrix/config_rfdetr_nano.yaml
 run_one rfdetr_nano snowy CATR scratch/four_edge_matrix/config_rfdetr_nano.yaml
 run_one rfdetr_nano snowy Ekya scratch/four_edge_matrix/config_rfdetr_nano.yaml
 
-run_one yolo26n rainy plank_road scratch/four_edge_matrix/config_yolo26n.yaml
+run_one yolo26n rainy recap scratch/four_edge_matrix/config_yolo26n.yaml
 run_one yolo26n rainy SURGEON scratch/four_edge_matrix/config_yolo26n.yaml
 run_one yolo26n rainy CATR scratch/four_edge_matrix/config_yolo26n.yaml
 run_one yolo26n rainy Ekya scratch/four_edge_matrix/config_yolo26n.yaml
-run_one yolo26n snowy plank_road scratch/four_edge_matrix/config_yolo26n.yaml
+run_one yolo26n snowy recap scratch/four_edge_matrix/config_yolo26n.yaml
 run_one yolo26n snowy SURGEON scratch/four_edge_matrix/config_yolo26n.yaml
 run_one yolo26n snowy CATR scratch/four_edge_matrix/config_yolo26n.yaml
 run_one yolo26n snowy Ekya scratch/four_edge_matrix/config_yolo26n.yaml

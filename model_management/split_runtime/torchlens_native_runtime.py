@@ -75,7 +75,7 @@ def make_split_spec(
     model_family: str | None = None,
     mode: str = DEFAULT_SPLIT_MODE,
 ) -> SplitSpec:
-    """Build a TorchLens native SplitSpec for Plank-road split runtimes."""
+    """Build a TorchLens native SplitSpec for RECAP split runtimes."""
 
     del model_family
     if isinstance(boundary, SplitRuntimeConfig):
@@ -172,7 +172,7 @@ def resolve_split_candidate_metadata(
     """Resolve candidate split ids without constructing SplitRuntime objects.
 
     This is the only remaining TorchLens plan-metadata path in the adapter. It
-    preserves Plank-road's existing candidate selection semantics while keeping
+    preserves RECAP's existing candidate selection semantics while keeping
     final selected runtime construction on the public ``tl.prepare_split`` API.
     It intentionally does not lower executable prefix/suffix segments.
     """

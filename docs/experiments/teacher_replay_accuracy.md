@@ -14,7 +14,7 @@ Run all methods with the same `experiment_run` identity:
 
 ```yaml
 experiment_run:
-  experiment_id: exp_road_plankroad_vs_baselines_001
+  experiment_id: exp_road_recap_vs_baselines_001
   scenario: road
   video_path: ./video_data/road.mp4
   max_count: 2000
@@ -37,8 +37,8 @@ Method-specific `run_id` values are generated automatically. After all artifacts
 are present:
 
 ```bash
-python tools/experiments/evaluate_plank_road_baseline_teacher_accuracy.py \
-  --comparison_dir results/experiments/exp_road_plankroad_vs_baselines_001 \
+python tools/experiments/evaluate_recap_baseline_teacher_accuracy.py \
+  --comparison_dir results/experiments/exp_road_recap_vs_baselines_001 \
   --teacher_model rtdetr_x \
   --yaml_path ./config/config.yaml \
   --device cuda:0 \
@@ -46,12 +46,12 @@ python tools/experiments/evaluate_plank_road_baseline_teacher_accuracy.py \
   --student_score_threshold 0.6 \
   --update_manifest
 
-python tools/experiments/normalize_plank_road_baseline_logs.py \
-  --comparison_dir results/experiments/exp_road_plankroad_vs_baselines_001
+python tools/experiments/normalize_recap_baseline_logs.py \
+  --comparison_dir results/experiments/exp_road_recap_vs_baselines_001
 
-python tools/experiments/plot_plank_road_baseline_figures.py \
-  --normalized_dir results/experiments/exp_road_plankroad_vs_baselines_001/normalized \
-  --figure_dir results/experiments/exp_road_plankroad_vs_baselines_001/figures
+python tools/experiments/plot_recap_baseline_figures.py \
+  --normalized_dir results/experiments/exp_road_recap_vs_baselines_001/normalized \
+  --figure_dir results/experiments/exp_road_recap_vs_baselines_001/figures
 ```
 
 The evaluator writes `teacher_accuracy_<video_slug>.jsonl`, its report, and a

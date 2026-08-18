@@ -28,7 +28,7 @@ METHOD_COLUMNS = {
     "confidence_only": "mean_confidence_drop_z",
     "ema_entropy": "mean_ema_output_entropy_z",
     "ema_feature_deviation": "mean_ema_boundary_feature_deviation_z",
-    "plank_road_full": "mean_full_drift_score_z",
+    "recap_full": "mean_full_drift_score_z",
 }
 
 SEQUENCE_SUMMARY_FIELDS = [
@@ -293,7 +293,7 @@ def _method_thresholds(config: Mapping[str, Any]) -> dict[str, float]:
             "ema_feature_deviation_z",
             context="trigger.thresholds",
         ),
-        "plank_road_full": require_float(
+        "recap_full": require_float(
             thresholds,
             "full_score_z",
             context="trigger.thresholds",

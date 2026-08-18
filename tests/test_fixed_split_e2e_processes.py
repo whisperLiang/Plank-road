@@ -16,9 +16,9 @@ import yaml
 from common.logging_sanitizer import find_forbidden_log_content
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-RUN_E2E_ENV = "PLANK_ROAD_RUN_YOLO26N_E2E"
-RUN_FULL_RETRAIN_ENV = "PLANK_ROAD_RUN_YOLO26N_E2E_FULL_RETRAIN"
-E2E_EDGE_MODEL_ENV = "PLANK_ROAD_E2E_EDGE_MODEL"
+RUN_E2E_ENV = "RECAP_RUN_YOLO26N_E2E"
+RUN_FULL_RETRAIN_ENV = "RECAP_RUN_YOLO26N_E2E_FULL_RETRAIN"
+E2E_EDGE_MODEL_ENV = "RECAP_E2E_EDGE_MODEL"
 E2E_MODEL_ARTIFACTS = {
     "yolo26n": PROJECT_ROOT / "model_management" / "models" / "yolo26n.pt",
     "rfdetr_nano": (
@@ -305,7 +305,7 @@ def test_fixed_split_continual_learning_process_e2e(tmp_path: Path) -> None:
     )
     cloud_env = _base_env()
     cloud_env["CUDA_VISIBLE_DEVICES"] = os.environ.get(
-        "PLANK_ROAD_E2E_CUDA_VISIBLE_DEVICES",
+        "RECAP_E2E_CUDA_VISIBLE_DEVICES",
         "0",
     )
     edge_env = _base_env()

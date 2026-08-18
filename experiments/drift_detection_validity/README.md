@@ -1,6 +1,6 @@
-# Plank-road Real Weather Drift Detection Test
+# RECAP Real Weather Drift Detection Test
 
-This offline experiment evaluates whether Plank-road's unlabeled drift signals
+This offline experiment evaluates whether RECAP's unlabeled drift signals
 detect harmful real-weather shifts on exactly two weather-named videos:
 
 - `rainy.mp4`: rainy
@@ -18,14 +18,14 @@ class-aware matching.
 
 The rainy scene defines the clean baseline. Snowy windows are labeled
 as harmful drift only when their teacher-pseudo-label F1 drops beyond
-`window.harmful_f1_drop_threshold`. Plank-road drift scores are computed from
+`window.harmful_f1_drop_threshold`. RECAP drift scores are computed from
 student-side unlabeled signals and evaluated against those harmful-window
 labels. Online trigger replay uses only the unlabeled signal values; teacher
 pseudo-labels are used only for offline evaluation.
 
 The reported detection precision, recall, and F1 are student-vs-teacher
 pseudo-label consistency metrics, not human-ground-truth accuracy. The drift
-metrics report whether Plank-road detects the harmful consistency drop.
+metrics report whether RECAP detects the harmful consistency drop.
 
 ## Run
 
@@ -44,7 +44,7 @@ Outputs are written under `results/drift_detection_validity/<run_id>/`:
 - `records/real_weather_scene_summary.csv`: scene-level micro and mean metrics.
 - `records/real_weather_predictions.json`: normalized student and teacher
   predictions for sampled frames.
-- `records/frame_signals.csv`: frame-level Plank-road drift signals.
+- `records/frame_signals.csv`: frame-level RECAP drift signals.
 - `records/window_metrics.csv`: window-level harmful-drift labels and signal
   summaries.
 - `analysis/signal_validity_summary.csv`: correlation/AUC/best-threshold
@@ -53,7 +53,7 @@ Outputs are written under `results/drift_detection_validity/<run_id>/`:
   recall, trigger-F1, misses, false triggers, and delay.
 - `figures/real_weather_scene_metric_summary.png`: scene-level metric bar plot.
 - `figures/real_weather_drift_detection_effectiveness.png`: F1 drop and
-  Plank-road drift-score overlay.
+  RECAP drift-score overlay.
 - `figures/*_student_teacher_examples.png`: visual examples for each scene.
 - `plots/figure_signal_validity_summary.{png,svg,pdf}`: Signal validity summary.
 - `plots/figure_online_trigger_summary.{png,svg,pdf}`: Online trigger summary.

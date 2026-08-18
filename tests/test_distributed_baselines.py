@@ -15,7 +15,7 @@ from baselines.runtime import BaselineEdgeAdapter, stable_window_id
 from common.experiment_results import ExperimentIdentity, collect_edge_artifacts
 from common.video_identity import VideoIdentity
 from config.baseline import (
-    PLANK_ROAD_BASELINE_ERROR,
+    RECAP_BASELINE_ERROR,
     baseline_method_label,
     validate_baseline_method,
 )
@@ -55,7 +55,7 @@ def _config(tmp_path: Path) -> SimpleNamespace:
                 use_cloud_teacher=False,
             ),
             CATR=SimpleNamespace(
-                reuse_plank_road_frame_filter=True,
+                reuse_recap_frame_filter=True,
                 upload_keyframes_only=True,
                 trigger_on_cloud_comparison=True,
                 training_strategy="freeze",
@@ -220,7 +220,7 @@ def test_legacy_baseline_files_are_removed() -> None:
         "config/experiment.py",
         "config/experiment.yaml",
         "config/baselines_real_advantage.yaml",
-        "baselines/plank_road" + "_multi_device.py",
+        "baselines/recap" + "_multi_device.py",
         "multi" + "_edge",
         "baselines/distributed/edge_runtime.py",
     ]
@@ -237,8 +237,8 @@ def test_native_baseline_methods_are_registered() -> None:
     with pytest.raises(ValueError, match="does not use the edge policy factory"):
         create_policy("Ekya")
     with pytest.raises(ValueError, match="not a baseline method"):
-        create_policy("plank_road" + "_multi_device")
-    assert str(PLANK_ROAD_BASELINE_ERROR).startswith("plank_road" + "_multi_device")
+        create_policy("recap" + "_multi_device")
+    assert str(RECAP_BASELINE_ERROR).startswith("recap" + "_multi_device")
 
 
 def test_baseline_method_identifiers_are_used_directly() -> None:
@@ -438,7 +438,7 @@ def test_create_experiment_identity_preserves_explicit_zero_values(
             scenario=None,
             edge_count=edge_count,
             repeat=repeat,
-            method="plank_road",
+            method="recap",
             video_identity=video_identity,
         )
 
@@ -517,7 +517,7 @@ def test_cloud_create_experiment_identity_preserves_explicit_zero_values(
             scenario=None,
             edge_count=edge_count,
             repeat=repeat,
-            method="plank_road",
+            method="recap",
             runtime_config=runtime_config,
         )
 

@@ -81,8 +81,8 @@ def test_write_task_result_includes_latency_and_timing() -> None:
             "video_slug": "road",
             "scenario_name": "road",
             "edge_id": 1,
-            "run_id": "plank_road_road_001",
-            "method": "plank_road",
+            "run_id": "recap_road_001",
+            "method": "recap",
             "frame_replayable": True,
             "label_schema": "zero_based",
             "class_names": ["car"],
@@ -100,7 +100,7 @@ def test_write_task_result_includes_latency_and_timing() -> None:
     assert payload["model_version"] == "2"
     assert payload["timestamp_ms"] == 10000
     assert payload["video_slug"] == "road"
-    assert payload["run_id"] == "plank_road_road_001"
+    assert payload["run_id"] == "recap_road_001"
     assert payload["frame_replayable"] is True
     assert payload["result"] == {
         "labels": [5],

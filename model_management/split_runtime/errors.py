@@ -6,7 +6,7 @@ import torch
 
 
 class SplitRuntimeError(RuntimeError):
-    """Base class for Plank-road split orchestration failures."""
+    """Base class for RECAP split orchestration failures."""
 
 
 class BatchPrefixError(SplitRuntimeError):
