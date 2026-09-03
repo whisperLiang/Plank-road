@@ -8,10 +8,12 @@ edge devices and remains compatible with future four-edge experiments.
 ```powershell
 .\.venv\Scripts\python.exe tools\experiments\plot_device_method_comparison.py `
   --experiment_dir results\experiments\weather_model_comparison_rfdetr_nano `
+  --experiment_dir results\experiments\weather_model_comparison_rfdetr_nano_local_140_118_238 `
   --experiment_dir results\experiments\weather_model_comparison_yolo26n `
-  --device_profiles configs\experiments\edge_device_profiles.yaml `
-  --edge_count 2 `
-  --figure_dir results\experiments\device_method_comparison\figures
+  --experiment_dir results\experiments\weather_model_comparison_yolo26n_local_140_118_238 `
+  --device_profiles results\experiments\device_method_comparison_n1_n2_n4_cloud\edge_device_profiles_n4.yaml `
+  --edge_count 4 `
+  --figure_dir results\experiments\device_method_comparison_n1_n2_n4_cloud\figures
 ```
 
 The command writes four figure sets in SVG, PDF, TIFF, and PNG, along with
@@ -27,8 +29,8 @@ The command writes four figure sets in SVG, PDF, TIFF, and PNG, along with
   latency. Method is encoded by color, device by marker, and total upload by
   bubble area. The dashed line marks the two-dimensional accuracy-latency
   Pareto frontier.
-- `fig_multi_edge_scalability`: macro mean F1, worst-device P95 latency, total
-  upload, and Jain fairness versus edge count. New N=4 rows are included
+- `fig_multi_edge_scalability`: macro mean F1 versus worst-device P95 latency,
+  together with total upload versus edge count. New N=4 rows are included
   automatically after normalization.
 - `fig_adaptation_stage_breakdown`: mean positive duration of upload, label,
   microprofile, feature rebuild, training, and model-update stages for each
@@ -38,6 +40,10 @@ Communication is summed across windows and devices. Accuracy is macro-averaged
 across devices for scalability plots. Tail latency is the maximum device-level
 P95 within a run, so the slowest device remains visible. SURGEON's zero cloud
 upload is treated as a structural zero, not missing data.
+
+The original Rainy·RF-DETR Nano Ekya N=2 trace was interrupted. It is excluded
+along with the subsequent interrupted retry; the multi-edge figure uses the
+complete rerun `rainy_n2_r03_Ekya`, which covers all 10,000 expected frames.
 
 ## Add two more edge devices
 

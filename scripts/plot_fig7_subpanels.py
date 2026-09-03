@@ -16,16 +16,12 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
-from matplotlib.patches import Patch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.plot_e2e_dynamics_breakdown import (  # noqa: E402
-    COMPONENT_COLORS,
-    COMPONENT_LABELS,
-    COMPONENT_ORDER,
     METHOD_COLORS,
     METHOD_LABELS,
     METHOD_LINESTYLES,
@@ -35,6 +31,14 @@ from scripts.plot_e2e_dynamics_breakdown import (  # noqa: E402
 
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "Chencang" / "tmc" / "figs"
 SOURCE_DIR = DEFAULT_OUTPUT_DIR
+SUMMARY_PATH = (
+    PROJECT_ROOT
+    / "results"
+    / "experiments"
+    / "weather_model_comparison_rfdetr_nano"
+    / "normalized"
+    / "summary.csv"
+)
 
 plt.rcParams.update(
     {
@@ -74,12 +78,10 @@ def save_figure(figure: plt.Figure, output_dir: Path, stem: str) -> None:
 def load_cached_data() -> tuple[
     dict[str, tuple[list[float], list[float]]],
     dict[str, list[tuple[float, float]]],
-    dict[str, dict[str, float]],
 ]:
-    """Load the exact source data used for the existing combined Fig. 7."""
+    """Load the exact curve and event data used for Fig. 7(a)."""
     curves: dict[str, tuple[list[float], list[float]]] = {}
     events: dict[str, list[tuple[float, float]]] = defaultdict(list)
-    components: dict[str, dict[str, float]] = defaultdict(dict)
 
     with (SOURCE_DIR / "fig7_adaptation_dynamics_breakdown_curves.csv").open(
         newline="", encoding="utf-8"
@@ -103,27 +105,71 @@ def load_cached_data() -> tuple[
                 (float(row["trigger_frame"]), float(row["update_frame"]))
             )
 
-    component_keys = {
-        "Upload / transmit": "transmit",
-        "Label": "label",
-        "Profile": "profile",
-        "Retrain / rebuild": "retrain",
-        "Update / apply": "update",
-    }
-    with (
-        SOURCE_DIR / "fig7_adaptation_dynamics_breakdown_components.csv"
-    ).open(newline="", encoding="utf-8") as stream:
-        for row in csv.DictReader(stream):
-            method = next(
-                key for key, value in METHOD_LABELS.items() if value == row["method"]
-            )
-            components[method][component_keys[row["component"]]] = float(
-                row["seconds"]
-            )
-
-    if set(curves) != set(METHOD_ORDER) or set(components) != set(METHOD_ORDER):
+    if set(curves) != set(METHOD_ORDER):
         raise ValueError("Cached Fig. 7 source data are incomplete.")
-    return curves, events, components
+    return curves, events
+
+
+def load_tradeoff_data() -> dict[str, tuple[float, float]]:
+    """Load single-edge rainy RF-DETR Nano training and inference costs."""
+    method_ids = {
+        "plank_road": "recap",
+        "SURGEON": "SURGEON",
+        "CATR": "CATR",
+        "Ekya": "Ekya",
+    }
+    tradeoff: dict[str, tuple[float, float]] = {}
+    with SUMMARY_PATH.open(newline="", encoding="utf-8") as stream:
+        for row in csv.DictReader(stream):
+            if str(row.get("scenario_name", "")).lower() != "rainy":
+                continue
+            if int(row.get("edge_count", 0) or 0) != 1:
+                continue
+            if int(row.get("repeat", 0) or 0) != 1:
+                continue
+            if str(row.get("student_model", "")).lower() != "rfdetr_nano":
+                continue
+            method = method_ids.get(str(row.get("method", "")))
+            if method is None:
+                continue
+            training_seconds = float(row["mean_training_ms"]) / 1000.0
+            inference_ms = float(row["mean_latency_ms"])
+            tradeoff[method] = (training_seconds, inference_ms)
+    if set(tradeoff) != set(METHOD_ORDER):
+        raise ValueError("Fig. 7(b) training/inference source data are incomplete.")
+    return tradeoff
+
+
+def write_tradeoff_source_data(
+    tradeoff: dict[str, tuple[float, float]], output_dir: Path
+) -> None:
+    path = output_dir / "fig7b_training_inference_tradeoff_source_data.csv"
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(
+            [
+                "weather",
+                "model",
+                "method",
+                "mean_training_time_seconds",
+                "mean_online_inference_latency_ms",
+                "formal_runs",
+                "source_file",
+            ]
+        )
+        for method in METHOD_ORDER:
+            training_seconds, inference_ms = tradeoff[method]
+            writer.writerow(
+                [
+                    "Rainy",
+                    "RF-DETR Nano",
+                    METHOD_LABELS[method],
+                    training_seconds,
+                    inference_ms,
+                    1,
+                    "normalized/summary.csv",
+                ]
+            )
 
 
 def plot_panel_a(
@@ -135,7 +181,7 @@ def plot_panel_a(
         2,
         1,
         height_ratios=(4.6, 0.82),
-        hspace=0.05,
+        hspace=0.16,
     )
     accuracy_axis = figure.add_subplot(grid[0, 0])
     event_axis = figure.add_subplot(grid[1, 0], sharex=accuracy_axis)
@@ -167,36 +213,12 @@ def plot_panel_a(
         )
         for method in METHOD_ORDER
     ]
-    legend_handles.extend(
-        [
-            Line2D(
-                [0],
-                [0],
-                color="none",
-                marker="^",
-                markerfacecolor="#555555",
-                markeredgecolor="none",
-                markersize=4,
-                label="Trigger",
-            ),
-            Line2D(
-                [0],
-                [0],
-                color="none",
-                marker="*",
-                markerfacecolor="#555555",
-                markeredgecolor="none",
-                markersize=5,
-                label="Update",
-            ),
-        ]
-    )
     accuracy_axis.legend(
         handles=legend_handles,
         loc="upper center",
         bbox_to_anchor=(0.5, 1.06),
-        ncol=6,
-        columnspacing=0.65,
+        ncol=4,
+        columnspacing=0.9,
         handlelength=1.5,
         handletextpad=0.25,
         fontsize=5.5,
@@ -242,6 +264,49 @@ def plot_panel_a(
     event_axis.set_ylim(-0.65, len(METHOD_ORDER) - 0.35)
     event_axis.set_yticks([])
     event_axis.set_xlabel("Frame ID")
+    event_axis.text(
+        0.0,
+        1.03,
+        "Trigger-to-update cycles",
+        transform=event_axis.transAxes,
+        fontsize=5.8,
+        fontweight="bold",
+        color="#4D4D4D",
+        ha="left",
+        va="bottom",
+    )
+    event_axis.legend(
+        handles=[
+            Line2D(
+                [0],
+                [0],
+                color="none",
+                marker="^",
+                markerfacecolor="#555555",
+                markeredgecolor="none",
+                markersize=4,
+                label="Trigger",
+            ),
+            Line2D(
+                [0],
+                [0],
+                color="none",
+                marker="*",
+                markerfacecolor="#555555",
+                markeredgecolor="none",
+                markersize=5,
+                label="Update",
+            ),
+        ],
+        loc="lower right",
+        bbox_to_anchor=(1.0, 1.01),
+        ncol=2,
+        columnspacing=0.8,
+        handlelength=0.7,
+        handletextpad=0.25,
+        borderaxespad=0,
+        fontsize=5.5,
+    )
     event_axis.tick_params(axis="y", length=0)
     event_axis.tick_params(axis="x", width=0.75, length=3)
     for spine in ("left", "right", "top"):
@@ -250,70 +315,56 @@ def plot_panel_a(
     return figure
 
 
-def plot_panel_b(components: dict[str, dict[str, float]]) -> plt.Figure:
-    figure, component_axis = plt.subplots(figsize=(2.62, 3.85))
-    positions = [0.0, 0.82, 1.64, 2.46]
-    left_by_method = defaultdict(float)
-    component_handles: list[Patch] = []
-    totals = {method: sum(components[method].values()) for method in METHOD_ORDER}
-
-    for component in COMPONENT_ORDER:
-        shares = [
-            100.0 * components[method].get(component, 0.0) / totals[method]
-            for method in METHOD_ORDER
-        ]
-        if not any(shares):
-            continue
-        component_axis.barh(
-            positions,
-            shares,
-            left=[left_by_method[method] for method in METHOD_ORDER],
-            height=0.60,
-            color=COMPONENT_COLORS[component],
+def plot_panel_b(tradeoff: dict[str, tuple[float, float]]) -> plt.Figure:
+    figure, tradeoff_axis = plt.subplots(figsize=(2.62, 3.12))
+    label_offsets = {
+        "recap": (6, 7, "left"),
+        "SURGEON": (-6, 7, "right"),
+        "CATR": (6, -10, "left"),
+        "Ekya": (6, 7, "left"),
+    }
+    for method in METHOD_ORDER:
+        training_seconds, inference_ms = tradeoff[method]
+        tradeoff_axis.scatter(
+            training_seconds,
+            inference_ms,
+            s=54 if method == "recap" else 42,
+            color=METHOD_COLORS[method],
             edgecolor="white",
-            linewidth=0.55,
+            linewidth=0.7,
+            zorder=3,
         )
-        component_handles.append(
-            Patch(
-                facecolor=COMPONENT_COLORS[component],
-                edgecolor="white",
-                label=COMPONENT_LABELS[component],
-            )
-        )
-        for method, share in zip(METHOD_ORDER, shares):
-            left_by_method[method] += share
-
-    for position, method in zip(positions, METHOD_ORDER):
-        component_axis.text(
-            101.5,
-            position,
-            f"{totals[method]:.1f} s",
+        x_offset, y_offset, horizontal_alignment = label_offsets[method]
+        tradeoff_axis.annotate(
+            METHOD_LABELS[method],
+            (training_seconds, inference_ms),
+            xytext=(x_offset, y_offset),
+            textcoords="offset points",
             fontsize=6,
             fontweight="bold" if method == "recap" else "normal",
             color=METHOD_COLORS[method],
-            ha="left",
-            va="center",
+            ha=horizontal_alignment,
+            va="bottom" if y_offset >= 0 else "top",
         )
-    component_axis.set_xlabel("Share of measured time (%)")
-    component_axis.set_xlim(0, 119)
-    component_axis.set_xticks([0, 25, 50, 75, 100])
-    component_axis.set_yticks(
-        positions,
-        [METHOD_LABELS[method] for method in METHOD_ORDER],
+    tradeoff_axis.set_xlabel("Mean training time (s)")
+    tradeoff_axis.set_ylabel("Mean online inference latency (ms)")
+    tradeoff_axis.set_xlim(0, 380)
+    tradeoff_axis.set_xticks([0, 100, 200, 300])
+    tradeoff_axis.set_ylim(130, 225)
+    tradeoff_axis.set_yticks([140, 160, 180, 200, 220])
+    tradeoff_axis.annotate(
+        "lower is better",
+        xy=(0.08, 0.08),
+        xytext=(0.48, 0.23),
+        xycoords="axes fraction",
+        textcoords="axes fraction",
+        fontsize=5.4,
+        color="#666666",
+        ha="center",
+        arrowprops={"arrowstyle": "->", "color": "#777777", "linewidth": 0.7},
     )
-    component_axis.invert_yaxis()
-    component_axis.tick_params(axis="y", length=0, pad=3)
-    style_axis(component_axis, "x")
-    component_axis.legend(
-        handles=component_handles,
-        loc="lower center",
-        bbox_to_anchor=(0.5, 1.015),
-        ncol=3,
-        columnspacing=0.42,
-        handlelength=1.0,
-        fontsize=5.2,
-    )
-    figure.subplots_adjust(left=0.27, right=0.98, top=0.83, bottom=0.22)
+    style_axis(tradeoff_axis, "both")
+    figure.subplots_adjust(left=0.26, right=0.97, top=0.96, bottom=0.18)
     return figure
 
 
@@ -322,17 +373,19 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     arguments = parser.parse_args()
 
-    curves, event_pairs, components = load_cached_data()
+    curves, event_pairs = load_cached_data()
+    tradeoff = load_tradeoff_data()
     save_figure(
         plot_panel_a(curves, event_pairs),
         arguments.output_dir,
         "fig7a_adaptation_dynamics",
     )
     save_figure(
-        plot_panel_b(components),
+        plot_panel_b(tradeoff),
         arguments.output_dir,
-        "fig7b_adaptation_time_composition",
+        "fig7b_training_inference_tradeoff",
     )
+    write_tradeoff_source_data(tradeoff, arguments.output_dir)
     return 0
 
 

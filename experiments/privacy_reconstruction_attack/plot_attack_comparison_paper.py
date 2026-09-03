@@ -184,9 +184,8 @@ def _metric(metrics: dict[str, object], key: str) -> float:
 
 
 def _metric_text(metrics: dict[str, object]) -> str:
-    ssim = _metric(metrics, "SSIM")
     leakage = _metric(metrics, "L_actual")
-    return f"SSIM {ssim:.3f}\nL {leakage:.3f}"
+    return f"L {leakage:.3f}"
 
 
 def _row_split_label(panel: AttackPanel) -> str:
@@ -366,14 +365,17 @@ def plot_matrix_overview(panels: list[AttackPanel], output_dir: Path) -> None:
     header_ref.text(
         0.5,
         0.78,
-        "Model input",
+        "CATR/Ekya",
         ha="center",
         va="center",
         fontsize=7.6,
         fontweight="bold",
         color="#20262E",
     )
-    for start_col, label in ((2, "DRAG"), (2 + len(split_keys), "White-box inversion")):
+    for start_col, label in (
+        (2, "RECAP + DRAG"),
+        (2 + len(split_keys), "RECAP + White-box inversion"),
+    ):
         header = fig.add_subplot(grid[0, start_col : start_col + len(split_keys)])
         header.axis("off")
         header.text(

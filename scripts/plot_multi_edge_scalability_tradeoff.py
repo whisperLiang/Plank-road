@@ -1,8 +1,10 @@
 """Generate Figure 8 of the manuscript: multi-edge scalability.
 
-Row (a) shows the accuracy--communication trade-off. Row (b) merges tail
-latency and fairness into a second trade-off plane, avoiding a crowded dual
-y-axis chart while preserving both measurements.
+Row (a) shows the accuracy--tail-latency trade-off. Row (b) shows how aggregate
+edge-to-cloud upload changes as the number of edge devices increases.
+
+The original Rainy·RF-DETR Nano Ekya N=2 trace was interrupted; the figure uses
+the complete rerun (rainy_n2_r03_Ekya) and excludes the two incomplete traces.
 """
 
 from pathlib import Path
@@ -51,6 +53,10 @@ BLOCKS = [
     ("rainy", "yolo26n", "Rainy · YOLO26n"),
     ("snowy", "yolo26n", "Snowy · YOLO26n"),
 ]
+EXCLUDED_RUNS = {
+    ("weather_model_comparison_rfdetr_nano", "rainy_n2_r01_Ekya"),
+    ("weather_model_comparison_rfdetr_nano", "rainy_n2_r02_Ekya"),
+}
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -88,11 +94,11 @@ def series(df, block, method):
     )
 
 
-def plot_pareto(ax, block, df):
+def plot_accuracy_latency(ax, block, df):
     for method in METHODS:
         sub = series(df, block, method)
         ax.plot(
-            sub["total_upload_mib"],
+            sub["worst_p95_latency_ms"],
             sub["mean_f1"],
             color=COLORS[method],
             linewidth=1.15,
@@ -101,7 +107,7 @@ def plot_pareto(ax, block, df):
         )
         for _, row in sub.iterrows():
             ax.plot(
-                row["total_upload_mib"],
+                row["worst_p95_latency_ms"],
                 row["mean_f1"],
                 marker=N_MARKERS[int(row["edge_count"])],
                 markersize=4.0,
@@ -112,21 +118,21 @@ def plot_pareto(ax, block, df):
                 zorder=3,
             )
     style_axis(ax)
-    ax.set_xscale("symlog", linthresh=10, linscale=0.8)
-    ax.set_xlim(-20, 6500)
-    ax.set_xticks([0, 10, 100, 1000, 5000])
-    ax.set_xticklabels(["0", "10", "100", "1k", "5k"])
+    ax.set_xscale("log")
+    ax.set_xlim(90, 7000)
+    ax.set_xticks([100, 300, 1000, 3000, 6000])
+    ax.set_xticklabels(["100", "300", "1k", "3k", "6k"])
     ax.set_ylim(0.0, 1.03)
     ax.set_yticks([0.0, 0.5, 1.0])
     ax.set_yticklabels(["0", "0.5", "1.0"])
 
 
-def plot_latency_fairness(ax, block, df):
+def plot_upload_scaling(ax, block, df):
     for method in METHODS:
         sub = series(df, block, method)
         ax.plot(
-            sub["jain_throughput_fairness"],
-            sub["worst_p95_latency_ms"],
+            sub["edge_count"],
+            sub["total_upload_mib"],
             color=COLORS[method],
             linewidth=1.15,
             alpha=0.9,
@@ -134,8 +140,8 @@ def plot_latency_fairness(ax, block, df):
         )
         for _, row in sub.iterrows():
             ax.plot(
-                row["jain_throughput_fairness"],
-                row["worst_p95_latency_ms"],
+                row["edge_count"],
+                row["total_upload_mib"],
                 marker=N_MARKERS[int(row["edge_count"])],
                 markersize=4.0,
                 color=COLORS[method],
@@ -145,18 +151,21 @@ def plot_latency_fairness(ax, block, df):
                 zorder=3,
             )
     style_axis(ax)
-    ax.set_xlim(0.55, 1.025)
-    ax.set_xticks([0.6, 0.8, 1.0])
-    ax.set_xticklabels(["0.6", "0.8", "1.0"])
-    ax.set_yscale("log")
-    ax.set_ylim(70, 7000)
-    ax.set_yticks([100, 300, 1000, 3000, 6000])
-    ax.set_yticklabels(["100", "300", "1k", "3k", "6k"])
+    ax.set_xlim(0.75, 4.25)
+    ax.set_xticks([1, 2, 4])
+    ax.set_xticklabels(["1", "2", "4"])
+    ax.set_yscale("symlog", linthresh=10, linscale=0.8)
+    ax.set_ylim(-20, 6500)
+    ax.set_yticks([0, 10, 100, 1000, 5000])
+    ax.set_yticklabels(["0", "10", "100", "1k", "5k"])
 
 
 def main():
     df = pd.read_csv(DATA)
     df = df.loc[df["complete_device_set"].astype(str).str.lower().eq("true")].copy()
+    excluded = pd.MultiIndex.from_tuples(EXCLUDED_RUNS)
+    run_keys = pd.MultiIndex.from_frame(df[["experiment_id", "run_id"]])
+    df = df.loc[~run_keys.isin(excluded)].copy()
     df["method"] = df["method"].replace({"plank_road": "recap"})
     fig, axes = plt.subplots(
         2,
@@ -167,16 +176,16 @@ def main():
     fig.patch.set_facecolor("white")
 
     for col, block in enumerate(BLOCKS):
-        plot_pareto(axes[0, col], block, df)
-        plot_latency_fairness(axes[1, col], block, df)
+        plot_accuracy_latency(axes[0, col], block, df)
+        plot_upload_scaling(axes[1, col], block, df)
         axes[0, col].set_title(
             block[2], fontsize=7.4, fontweight="bold", color="#242424", pad=7
         )
-        axes[0, col].set_xlabel("Total upload (MiB; symlog)", fontsize=6.5, labelpad=3)
-        axes[1, col].set_xlabel("Jain fairness", fontsize=6.5, labelpad=3)
+        axes[0, col].set_xlabel("Worst P95 latency (ms)", fontsize=6.5, labelpad=3)
+        axes[1, col].set_xlabel("Edge devices, N", fontsize=6.5, labelpad=3)
 
     axes[0, 0].set_ylabel("(a) Mean F1", fontsize=7.0, labelpad=7)
-    axes[1, 0].set_ylabel("(b) P95 latency (ms)", fontsize=7.0, labelpad=7)
+    axes[1, 0].set_ylabel("(b) Total upload (MiB)", fontsize=7.0, labelpad=7)
     for row in range(2):
         for col in range(1, 4):
             axes[row, col].tick_params(labelleft=False)
